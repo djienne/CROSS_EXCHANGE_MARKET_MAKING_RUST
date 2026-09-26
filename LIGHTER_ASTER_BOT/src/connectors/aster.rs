@@ -46,20 +46,23 @@ struct DepthMsg<'a> {
     asks: Vec<[&'a str; 2]>,
 }
 
+/// Also the taker's (`taker::aster::ws`), which orders it against depth by the update id `u`.
 #[derive(Deserialize)]
-struct BookTickerMsg<'a> {
+pub(crate) struct BookTickerMsg<'a> {
     #[serde(rename = "E", default)]
-    event_time: i64,
+    pub(crate) event_time: i64,
     #[serde(rename = "T", default)]
-    trade_time: i64,
+    pub(crate) trade_time: i64,
+    #[serde(default)]
+    pub(crate) u: u64,
     #[serde(rename = "b")]
-    bid_px: &'a str,
+    pub(crate) bid_px: &'a str,
     #[serde(rename = "B")]
-    bid_qty: &'a str,
+    pub(crate) bid_qty: &'a str,
     #[serde(rename = "a")]
-    ask_px: &'a str,
+    pub(crate) ask_px: &'a str,
     #[serde(rename = "A")]
-    ask_qty: &'a str,
+    pub(crate) ask_qty: &'a str,
 }
 
 impl<'a> BookTickerMsg<'a> {

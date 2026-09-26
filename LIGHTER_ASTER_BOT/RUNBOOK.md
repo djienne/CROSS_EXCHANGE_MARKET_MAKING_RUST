@@ -314,7 +314,9 @@ reverse). A clip trades only when the depth-weighted edge clears both taker fees
 margin, both books hold `liquidity_multiple` times the clip within `max_levels` and are
 fresher than `max_book_staleness_ms`, and the edge passes the entry gate: the greater of the
 90th percentile of recent samples and the required edge plus `min_extra_bps`, blocking during
-history warmup. Aster orders are bounded IOC limits; Lighter uses its native market/IOC path.
+history warmup. Its Aster book is the `depth20@100ms` snapshot with the newer `bookTicker` top
+laid over it (by update id): depth alone lags the top by up to 100 ms. Aster orders are bounded
+IOC limits; Lighter uses its native market/IOC path.
 Under a lease, execution is reduce-only and capped at both existing positions.
 
 An unknown submission outcome keeps its order and client ids: a missing order row or a flat
