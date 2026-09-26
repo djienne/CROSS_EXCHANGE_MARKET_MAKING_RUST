@@ -242,7 +242,8 @@ impl Recording {
         let a = cfg.costs(&pair.left, tier);
         let l = cfg.costs(&pair.right, tier);
         let tail = a.taker_ms.max(l.taker_ms).max(a.notice_ms + l.taker_ms).max(l.notice_ms + a.taker_ms);
-        ensure!(tail * latency <= self.tail_ms as f64 && a.quote_age_ms.max(l.quote_age_ms) * latency <= self.preroll_ms as f64,
+        let before = (a.quote_age_ms * latency + a.print_delay_ms).max(l.quote_age_ms * latency + l.print_delay_ms);
+        ensure!(tail * latency <= self.tail_ms as f64 && before <= self.preroll_ms as f64,
             "{}: latency x{latency} exceeds recorded {} ms before / {} ms after; lower --latency or score newer data", pair.name, self.preroll_ms, self.tail_ms);
         Ok(())
     }

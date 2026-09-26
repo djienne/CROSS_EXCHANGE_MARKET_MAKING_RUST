@@ -104,7 +104,9 @@ or trading connector is imported.
   p99): Aster book 145 / 239 ms, Lighter trades 214 / 568 ms, Hyperliquid bbo 361 / 682 ms. So a
   Hyperliquid leg is ~0.2 s staler than an Aster one, whatever the host. Two connections can also
   receive the same Hyperliquid frame up to seconds apart. Small Hyperliquid taker edges may be
-  partly this lag. The fills at the latency charge for it only in part.
+  partly this lag. The fills at the latency charge for it only in part. Aster also sends each trade
+  ~150 ms after the book change it made (Lighter and Hyperliquid send them together), so the
+  report moves Aster prints back by `aster_print_delay_ms` before pricing and hedging XEMM fills.
 - **XEMM fills.** XEMM ignores queue position (a fill needs a trade *through* the quote) and our
   own market impact.
 - **Stablecoin parity.** USD-equivalent results assume USDT/USDC parity and omit conversion costs.

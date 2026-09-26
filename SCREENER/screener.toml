@@ -20,6 +20,10 @@ lighter_rtt_ms = 8
 # A maker fill reaches the bot after the venue's private stream latency ([dry_run] mid-range).
 aster_fill_notice_ms   = 30
 lighter_fill_notice_ms = 15
+# Aster publishes a trade ~186 ms after it (aggTrade E - T), a book change ~26 ms after (bookTicker):
+# its prints arrive ~150 ms after the book change they made (median; 10 coins, 2026-09-26). The
+# report moves them back. Lighter and Hyperliquid prints arrive with their book changes.
+aster_print_delay_ms   = 150
 
 # Aster fee schedule (docs.asterdex.com, perpetual fees, 2026-09-26). The Group B list overrides
 # the RWA rule (SKHYNIX is both).

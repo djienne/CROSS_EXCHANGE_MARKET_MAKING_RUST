@@ -33,6 +33,7 @@ pub struct Report {
     pub lighter_rtt_ms: f64,
     pub aster_fill_notice_ms: f64,
     pub lighter_fill_notice_ms: f64,
+    pub aster_print_delay_ms: f64,
     pub aster: AsterFees,
     pub lighter: LighterTiers,
     pub hyperliquid: Hyperliquid,
@@ -57,6 +58,8 @@ pub struct Costs {
     pub taker_ms: f64,
     pub notice_ms: f64,
     pub quote_age_ms: f64,
+    /// How much later a print arrives than the book change it made.
+    pub print_delay_ms: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,7 +127,7 @@ impl Report {
         self.lighter()?;
         let h = &self.hyperliquid;
         let values = [self.clip_usd, self.depth_multiple, self.aster_taker_ms, self.lighter_rtt_ms,
-            self.aster_fill_notice_ms, self.lighter_fill_notice_ms, self.aster.maker_bps, self.aster.taker_bps,
+            self.aster_fill_notice_ms, self.lighter_fill_notice_ms, self.aster_print_delay_ms, self.aster.maker_bps, self.aster.taker_bps,
             self.aster.group_b_taker_bps, self.aster.rwa_taker_bps, self.lighter.standard.maker_bps,
             self.lighter.standard.taker_bps, self.lighter.standard.taker_delay_ms, self.lighter.premium.maker_bps,
             self.lighter.premium.taker_bps, self.lighter.premium.taker_delay_ms, h.maker_bps, h.taker_bps,
@@ -135,12 +138,12 @@ impl Report {
     }
 
     pub fn costs(&self, market: &Market, lighter: &LighterTier) -> Costs {
-        let (maker_bps, taker_bps, taker_ms, notice_ms, quote_age_ms) = match market.venue {
-            Venue::Aster => (self.aster.maker_bps, self.aster_taker_bps(&market.symbol, &market.subtypes), self.aster_taker_ms, self.aster_fill_notice_ms, self.xemm.quote_age_ms as f64),
-            Venue::Lighter => (lighter.maker_bps, lighter.taker_bps, self.lighter_rtt_ms + lighter.taker_delay_ms, self.lighter_fill_notice_ms, self.xemm.quote_age_ms as f64),
-            Venue::Hyperliquid => { let h = &self.hyperliquid; (h.maker_bps, h.taker_bps, h.taker_ms, h.fill_notice_ms, h.quote_age_ms) },
+        let (maker_bps, taker_bps, taker_ms, notice_ms, quote_age_ms, print_delay_ms) = match market.venue {
+            Venue::Aster => (self.aster.maker_bps, self.aster_taker_bps(&market.symbol, &market.subtypes), self.aster_taker_ms, self.aster_fill_notice_ms, self.xemm.quote_age_ms as f64, self.aster_print_delay_ms),
+            Venue::Lighter => (lighter.maker_bps, lighter.taker_bps, self.lighter_rtt_ms + lighter.taker_delay_ms, self.lighter_fill_notice_ms, self.xemm.quote_age_ms as f64, 0.0),
+            Venue::Hyperliquid => { let h = &self.hyperliquid; (h.maker_bps, h.taker_bps, h.taker_ms, h.fill_notice_ms, h.quote_age_ms, 0.0) },
         };
-        Costs { maker_bps, taker_bps, taker_ms, notice_ms, quote_age_ms }
+        Costs { maker_bps, taker_bps, taker_ms, notice_ms, quote_age_ms, print_delay_ms }
     }
 
     pub fn lighter(&self) -> Result<&LighterTier> {

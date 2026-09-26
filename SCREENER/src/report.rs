@@ -6,9 +6,9 @@
 //!   cooldown and the inventory cap. Each leg fills at the recorded state after its latency. PnL is
 //!   the trades' cash plus the leftover hedged inventory closed at the last window's mean basis.
 //! - **XEMM**, maker on one venue and a taker hedge on the other, as `quote_engine.rs` prices it:
-//!   the quote is priced from the state `quote_age` before the trade; a trade printing *through*
-//!   it fills min(trade, clip) (queue position ignored); a fill pauses the market for the
-//!   cooldown, and with inventory only the side that reduces it is quoted; the hedge fills at the
+//!   the quote is priced from the state `quote_age` before the trade (an Aster print is moved back
+//!   to the book change it made); a trade printing *through* it fills min(trade, clip) (queue
+//!   position ignored); a fill pauses the market for the cooldown, and with inventory only the side that reduces it is quoted; the hedge fills at the
 //!   recorded state after the fill notice and the hedge latency; the leftover inventory closes as
 //!   the taker's. Run in both directions with the bot's settings (required edge, distance gate),
 //!   and as a sweep of the required edge without the gate.
@@ -292,6 +292,8 @@ pub struct XemmSim {
     pub clip_usd: f64,
     pub depth_usd: f64,
     pub quote_age: i64,
+    /// A maker-venue print arrives this much after the book change it made: its time is moved back.
+    pub print_delay: i64,
     pub notice: i64,
     pub hedge_lag: i64,
     pub cooldown: i64,
@@ -307,14 +309,15 @@ pub fn simulate_xemm(states: &[State], trades: &[Trade], sim: &XemmSim) -> XemmR
         Leg::Right => (s.l, s.a),
     };
     for trade in trades.iter().filter(|t| t.venue == sim.maker) {
+        let t = trade.t - sim.print_delay;
         // A buyer lifts our ask: we sell on the maker venue and buy the hedge. Our left leg:
         let signed = if trade.buy == (sim.maker == Leg::Left) { -1.0 } else { 1.0 };
         // As the bot: a fill pauses the market ([maker.live] cooldown_scope), and with inventory
         // only the side that reduces it is quoted ([maker.live.quote] reduce_position_only).
-        if trade.t - last_fill < sim.cooldown || position * signed > 0.0 {
+        if t - last_fill < sim.cooldown || position * signed > 0.0 {
             continue;
         }
-        let Some(quoted) = state_at(states, trade.t - sim.quote_age) else { continue };
+        let Some(quoted) = state_at(states, t - sim.quote_age) else { continue };
         let (maker, hedge) = books(quoted);
         if !(maker.known() && hedge.known()) {
             continue;
@@ -341,7 +344,7 @@ pub fn simulate_xemm(states: &[State], trades: &[Trade], sim: &XemmSim) -> XemmR
         if !(if trade.buy { trade.price > price } else { trade.price < price }) {
             continue;
         }
-        let Some(hedged) = state_at(states, trade.t + sim.notice + sim.hedge_lag).map(|s| books(s).1).filter(Bbo::known) else {
+        let Some(hedged) = state_at(states, t + sim.notice + sim.hedge_lag).map(|s| books(s).1).filter(Bbo::known) else {
             r.unresolved += 1;
             continue;
         };
@@ -353,8 +356,8 @@ pub fn simulate_xemm(states: &[State], trades: &[Trade], sim: &XemmSim) -> XemmR
         r.fills += 1;
         r.pnl_usd += net;
         edge_sum += gross / reference * 1e4;
-        *r.by_day.entry(day(trade.t)).or_default() += net;
-        last_fill = trade.t;
+        *r.by_day.entry(day(t)).or_default() += net;
+        last_fill = t;
         position += signed * qty;
     }
     if r.fills > 0 {
@@ -447,6 +450,7 @@ fn score(cfg: &Report, latency: f64, pair: &Pair, series: &Series) -> Result<Sco
             clip_usd: cfg.clip_usd,
             depth_usd,
             quote_age: ms(own.quote_age_ms),
+            print_delay: own.print_delay_ms.round() as i64,
             notice: ms(own.notice_ms),
             hedge_lag: ms(hedge.taker_ms),
             cooldown: cfg.xemm.cooldown_ms,
@@ -681,6 +685,7 @@ mod tests {
             clip_usd: 100.0,
             depth_usd: 1_000.0,
             quote_age: 250,
+            print_delay: 0,
             notice: 100,
             hedge_lag: 300,
             cooldown: 3_000,
@@ -696,6 +701,10 @@ mod tests {
         let qty = 100.0 / 100.01;
         assert_eq!(r.fills, 1);
         assert!((r.pnl_usd - qty * (99.99 - price)).abs() < 1e-9);
+        // A print arriving 300 ms after the book change it made (Aster's) is moved back: the hedge
+        // sells at 1,100 ms, before the Lighter bid fell.
+        let late = simulate_xemm(&states, &[at(1_000, 99.85)], &XemmSim { print_delay: 300, ..sim });
+        assert!((late.pnl_usd - qty * (100.0 - price)).abs() < 1e-9);
         // Left open, that inventory (bought on Aster, sold on Lighter) closes at the given basis:
         // Lighter 10 bps over Aster's last mid, 99.91.
         let open = simulate_xemm(&states, &[at(1_000, 99.85)], &XemmSim { close_basis_bps: Some(10.0), ..sim });
