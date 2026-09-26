@@ -503,10 +503,10 @@ impl Pending {
     }
 }
 
-// Same-µs order: a print before the book change it causes, market before our actions
-// (pessimistic), deliveries last.
+// Same-µs order: a print before the book change it causes, book frames as they arrived (Aster
+// stamps its 50 ms batch: a depth snapshot and the tickers published after it share one time),
+// market before our actions (pessimistic), deliveries last.
 const RANK_TRADE: u8 = 0;
-const RANK_TOP: u8 = 1;
 const RANK_BOOK: u8 = 2;
 const RANK_FUNDING: u8 = 3;
 const RANK_ACTION: u8 = 4;
@@ -673,7 +673,7 @@ impl Exchange {
         }
         let (rank, stream) = match event {
             FeedEvent::Trade { .. } => (RANK_TRADE, Some("trade")),
-            FeedEvent::Book(BookUpdate::Top { .. }) => (RANK_TOP, Some("top")),
+            FeedEvent::Book(BookUpdate::Top { .. }) => (RANK_BOOK, Some("top")),
             FeedEvent::Book(_) => (RANK_BOOK, Some("book")),
             FeedEvent::Gap => (RANK_BOOK, None),
         };
@@ -1611,6 +1611,15 @@ mod tests {
         sim.send(Venue::Aster, limit(Side::Buy, dec!(4), dec!(102), Tif::Ioc));
         sim.at(400);
         assert_eq!(sim.fills(Venue::Aster)[2..], [(dec!(102), dec!(2), false)]);
+    }
+
+    #[test]
+    fn a_ticker_published_after_the_snapshot_of_its_batch_stays_on_top() {
+        let mut sim = Sim::new();
+        sim.book(Venue::Aster, 50, &[(dec!(99), dec!(5))], &[(dec!(101), dec!(5))]);
+        sim.feed(Venue::Aster, 50, FeedEvent::Book(BookUpdate::Top { bid: (dec!(99), dec!(5)), ask: (dec!(100.5), dec!(2)) }));
+        sim.at(60);
+        assert_eq!(sim.ex.replica(Venue::Aster, HYPE).unwrap().best(Side::Sell), Some((dec!(100.5), dec!(2))));
     }
 
     #[test]

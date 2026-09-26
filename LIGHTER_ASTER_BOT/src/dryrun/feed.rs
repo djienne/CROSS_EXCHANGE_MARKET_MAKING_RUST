@@ -370,8 +370,9 @@ impl Hub {
         let _ = self.tx.send(Relay::Frame(self.last_id, frame));
     }
 
-    /// The upstream broke: what was in flight is dropped and the following connections close,
-    /// as a real disconnect forces the bot to resubscribe.
+    /// The upstream broke: the following connections close once what is in flight reaches them
+    /// (the core applies it too), as a real disconnect forces the bot to resubscribe. A later
+    /// subscriber starts after the gap.
     pub fn gap(&mut self) {
         self.pending.clear();
         self.books.clear();
@@ -404,12 +405,14 @@ pub struct Follower {
     outbox: Outbox,
     /// Aster combined streams wrap each frame as `{"stream","data"}`.
     combined: bool,
+    /// The upstream broke: close once the outbox is empty.
+    closing: bool,
 }
 
 impl Follower {
     pub fn new(hub: Arc<Mutex<Hub>>, latency: Latency, seed: u64, combined: bool) -> Self {
         let shift_us = hub.lock().expect("feed hub poisoned").shift_us;
-        Self { hub, shift_us, rx: None, streams: HashMap::new(), outbox: Outbox::new(seed, latency), combined }
+        Self { hub, shift_us, rx: None, streams: HashMap::new(), outbox: Outbox::new(seed, latency), combined, closing: false }
     }
 
     /// Follows `stream` from now on; false if the upstream does not carry it.
@@ -439,13 +442,16 @@ impl Follower {
         self.outbox.push(at_us, text);
     }
 
-    /// The next frame due on this connection; `None` once it must close (the upstream broke,
-    /// or the connection fell too far behind).
+    /// The next frame due on this connection; `None` once it must close (the upstream broke
+    /// and its last frames are out, or the connection fell too far behind).
     pub async fn next(&mut self) -> Option<Arc<str>> {
         loop {
             let now = wall_us();
             if let Some(text) = self.outbox.pop_due(now) {
                 return Some(text);
+            }
+            if self.closing && self.outbox.next_due().is_none() {
+                return None;
             }
             let wait = self.outbox.next_due().map(|due| Duration::from_micros((due - now) as u64));
             let relay = match (&mut self.rx, wait) {
@@ -467,7 +473,8 @@ impl Follower {
                         self.push(&frame.stream, frame.publish_us + self.shift_us, frame.text.clone());
                     }
                 }
-                Some(Ok(Relay::Gap)) | Some(Err(_)) => return None,
+                Some(Ok(Relay::Gap)) => (self.rx, self.closing) = (None, true),
+                Some(Err(_)) => return None,
             }
         }
     }
@@ -554,7 +561,8 @@ pub async fn aster_upstream(ws_root: String, symbols: Vec<String>, shift_us: i64
     aster_stream(aster_url(&ws_root, &symbols), "dry-run upstream Aster", |wire| match wire {
         Wire::Text(text) => match aster_frame(text, shift_us) {
             Ok(Some(frame)) => {
-                last_us = Some(frame.engine_us);
+                // The latest, not the last: an aggTrade's stamp runs ~190 ms behind the books'.
+                last_us = last_us.max(Some(frame.engine_us));
                 forward(frame, &hub, &inputs);
             }
             Ok(None) => {}
@@ -813,8 +821,11 @@ mod tests {
             assert!(wall_us() / 1_000 >= ts, "never released before its shifted publish time");
             last = nonce;
         }
+        // A frame in flight when the upstream breaks still arrives (the core applies it too).
+        hub.lock().unwrap().arrive(wall_us(), at(SHIFT_MS, &[("update", 12, 13, wall_us() / 1_000)]).pop().unwrap());
         hub.lock().unwrap().gap();
-        assert!(bot.next().await.is_none(), "an upstream gap closes the stream");
+        assert_eq!(served(&bot.next().await.unwrap()).1, 13, "what was in flight arrives");
+        assert!(bot.next().await.is_none(), "then the upstream gap closes the stream");
     }
 
     #[tokio::test]
