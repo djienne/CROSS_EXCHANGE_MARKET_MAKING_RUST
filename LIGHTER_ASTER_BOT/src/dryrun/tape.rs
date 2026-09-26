@@ -7,19 +7,20 @@
 //! |---|---|
 //! | `A` | an Aster combined-stream frame, raw: `depth20@100ms` (20 levels), `bookTicker`, `aggTrade` |
 //! | `A-` | the Aster connection ended, or a reconnect failed (empty); later frames follow a reconnect |
-//! | `L` | a Lighter frame, raw: `order_book` (snapshot, then deltas: the whole book), `trade`, `market_stats` (funding) |
+//! | `L` | a Lighter frame, raw: `order_book` (snapshot, then deltas: the whole book; a new day's file carries on the book of the file before), `trade`, `market_stats` (funding) |
 //! | `L-` | the Lighter connection ended, or a reconnect failed (empty) |
 //! | `F` | an Aster `premiumIndex` response (funding), every minute |
 //! | `X`, `O` | the Aster `exchangeInfo` and Lighter `orderBooks` responses (filters), hourly |
 //!
-//! Lines are in the order they arrived. Their times are this host's wall clock, which a clock
-//! correction can step back a few ms (seen once: 5.7 ms), so a reader orders venues by time
-//! with a stable sort and keeps each venue's lines in file order.
+//! Lines are in the order they arrived, which a reader keeps. Their times are this host's wall
+//! clock, which clock corrections step back (2026-09-26: 71 steps over 1 ms, most of a few ms, the
+//! largest 0.37, 0.50 and 0.70 s), so a reader lets no time pass across a step.
 //!
 //! A file is concatenated zstd frames, one per flush (every 10 s), so a kill loses at most the
 //! last 10 s and `zstd -dc` reads any file. A frame cut short by a power loss can only end a
 //! file, since no later start appends to it. Recording never waits: the network tasks hand each
-//! line to a writer thread, and drop (and count) it if the writer is a whole queue behind.
+//! line to a writer thread, and drop it if the writer is a whole queue behind, counted in the log
+//! only (none by 2026-09-26): a Lighter book read across a drop is wrong until the next snapshot.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
