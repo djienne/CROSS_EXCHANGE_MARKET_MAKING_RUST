@@ -100,7 +100,11 @@ or trading connector is imported.
   a window later. At the Premium tier its samples are the Standard ones above Premium's edge.
 - **Arrival times.** Replay uses arrival times on this host (Europe), not synchronized exchange
   event times. Venue/feed delays need not cancel; neither ping RTT nor an old local model
-  establishes order execution latency.
+  establishes order execution latency. Measured 2026-09-27, venue timestamp to arrival (median /
+  p99): Aster book 145 / 239 ms, Lighter trades 214 / 568 ms, Hyperliquid bbo 361 / 682 ms. So a
+  Hyperliquid leg is ~0.2 s staler than an Aster one, whatever the host. Two connections can also
+  receive the same Hyperliquid frame up to seconds apart. Small Hyperliquid taker edges may be
+  partly this lag. The fills at the latency charge for it only in part.
 - **XEMM fills.** XEMM ignores queue position (a fill needs a trade *through* the quote) and our
   own market impact.
 - **Stablecoin parity.** USD-equivalent results assume USDT/USDC parity and omit conversion costs.
