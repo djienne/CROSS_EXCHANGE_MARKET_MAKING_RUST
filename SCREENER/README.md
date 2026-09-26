@@ -56,8 +56,8 @@ docker compose run --rm report --latency 2          # sensitivity: every latency
 ```
 
 `report` is its own service (profile `report`, never started by `up`): it holds every recorded
-state of the days it scores in memory, ~75 bytes a row: ~2 GB a day at the three-venue rate below
-(0.4 GB for Aster-Lighter alone), so its 8 GB cap holds about four days.
+state of the days it scores in memory, ~75 bytes a row: ~1 GB a day at the three-venue rate below
+(0.4 GB for Aster-Lighter alone), so its 8 GB cap holds about a week.
 
 ## Reading the report
 
@@ -116,9 +116,9 @@ Version 2 uses venue-qualified keys and two-second tails. Existing Aster-Lighter
 readable without migration; their one-second tails still limit their own replay settings. A kill
 loses at most the last 30 s. A new run reads the last 72 h of summaries back for its gate.
 
-With Hyperliquid, files take ~120 MB a day: 163 pairs, ~300 rows/s over the first 45 minutes on
-2026-09-26 (Aster-Lighter alone: ~23 MB for 64 pairs, ~60 rows/s). A burst on one pair can double
-a 5-minute window. Nothing deletes them:
+With Hyperliquid, files take ~60 MB a day for ~155 pairs (18:03–20:07 UTC on 2026-09-26; twice
+that in the first hours, while the new pairs' gates warmed up at their floors). Aster-Lighter
+alone took ~23 MB for 64 pairs. A burst on one pair can double a 5-minute window. Nothing deletes them:
 remove old days by hand, keeping the last 3 for the gate.
 
 The image build runs `cargo test --release --locked` before building the release binary. Checks

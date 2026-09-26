@@ -29,7 +29,7 @@ services:
 
   # The ranking, on demand: `docker compose run --rm report [--since YYYY-MM-DD ...]`. Its profile
   # keeps `up` (and start_all.bat) from starting it. It holds every recorded state of the days it
-  # scores in memory (~2 GB a day with Hyperliquid, measured 2026-09-26): past ~4 days, score a
+  # scores in memory (~1 GB a day with Hyperliquid, measured 2026-09-26): past ~a week, score a
   # range with --since/--until.
   report:
     image: aster_lighter_screener:latest
