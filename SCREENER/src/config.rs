@@ -109,6 +109,8 @@ pub struct Xemm {
     pub max_quote_distance_bps: f64,
     pub quote_age_ms: i64,
     pub cooldown_ms: i64,
+    pub min_hedge_usd: f64,
+    pub pending_age_ms: i64,
     pub sweep_bps: Vec<f64>,
 }
 
@@ -131,9 +133,9 @@ impl Report {
             self.aster.group_b_taker_bps, self.aster.rwa_taker_bps, self.lighter.standard.maker_bps,
             self.lighter.standard.taker_bps, self.lighter.standard.taker_delay_ms, self.lighter.premium.maker_bps,
             self.lighter.premium.taker_bps, self.lighter.premium.taker_delay_ms, h.maker_bps, h.taker_bps,
-            h.taker_ms, h.fill_notice_ms, h.quote_age_ms, self.taker.margin_bps, self.xemm.required_bps];
+            h.taker_ms, h.fill_notice_ms, h.quote_age_ms, self.taker.margin_bps, self.xemm.required_bps, self.xemm.min_hedge_usd];
         ensure!(values.iter().chain(&self.xemm.sweep_bps).all(|x| x.is_finite() && *x >= 0.0), "fees, latencies and thresholds must be finite and nonnegative (rebates require a different recording floor)");
-        ensure!(self.clip_usd > 0.0 && self.depth_multiple > 0.0 && self.xemm.quote_age_ms >= 0, "invalid clip, depth or quote age");
+        ensure!(self.clip_usd > 0.0 && self.depth_multiple > 0.0 && self.xemm.quote_age_ms >= 0 && self.xemm.pending_age_ms >= 0, "invalid clip, depth, quote or pending age");
         Ok(())
     }
 

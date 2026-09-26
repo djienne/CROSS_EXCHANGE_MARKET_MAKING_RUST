@@ -65,6 +65,10 @@ min_touch_distance_bps = 18.0   # [maker.quote] min_aster_touch_distance_bps
 max_quote_distance_bps = 50.0   # [maker.quote] max_quote_distance_bps
 quote_age_ms           = 250    # the resting quote was priced this long before the fill (150 ms requote + post)
 cooldown_ms            = 3000   # [maker.live] post_trade_cooldown_ms, cooldown_scope "per_market"
+# [maker.live.partials]: a fill under lighter_min_notional is held, then corrected by a taker order
+# (Hyperliquid's minimum is also $10; Aster's $5, so the reverse direction holds a few it could hedge).
+min_hedge_usd          = 10.0   # lighter_min_notional
+pending_age_ms         = 6000   # max_pending_age_ms
 sweep_bps = [5.0, 8.0, 10.0, 12.0, 15.0, 18.5, 22.0, 26.0, 30.0, 40.0, 50.0, 60.0]
 
 # Native perps, base tier without discounts. Fees checked 2026-09-26:

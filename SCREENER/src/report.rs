@@ -7,11 +7,13 @@
 //!   the trades' cash plus the leftover hedged inventory closed at the last window's mean basis.
 //! - **XEMM**, maker on one venue and a taker hedge on the other, as `quote_engine.rs` prices it:
 //!   the quote is priced from the state `quote_age` before the trade (an Aster print is moved back
-//!   to the book change it made); a trade printing *through* it fills min(trade, clip) (queue
-//!   position ignored); a fill pauses the market for the cooldown, and with inventory only the side that reduces it is quoted; the hedge fills at the
-//!   recorded state after the fill notice and the hedge latency; the leftover inventory closes as
-//!   the taker's. Run in both directions with the bot's settings (required edge, distance gate),
-//!   and as a sweep of the required edge without the gate.
+//!   to the book change it made); the prints of one ms *through* it fill min(their sum, clip)
+//!   (queue position ignored); a fill pauses the market for the cooldown, and with inventory only
+//!   the side that reduces it is quoted; the hedge fills at the recorded state after the fill notice
+//!   and the hedge latency, and a fill below the hedge's minimum, held then corrected by the bot, at
+//!   the same time (from flat, flattened on the maker venue); the leftover inventory closes as the
+//!   taker's. Run in both directions with the bot's settings (required edge, distance gate, skipped
+//!   behind a thin maker top), and as a sweep of the required edge without the gate.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -258,7 +260,7 @@ pub fn simulate_taker(states: &[State], windows: &[(i64, Samples)], sim: &TakerS
 
 /// A hedged inventory of `position` left base (long: bought left, sold right), in clips, and
 /// the cost of closing it: its left leg at the left mid, its right leg at the right mid,
-/// `basis_bps` apart, booked on the last day both books were known.
+/// `basis_bps` apart, free of fees, booked on the last day both books were known.
 fn close(position: f64, states: &[State], basis_bps: Option<f64>, clip_usd: f64, by_day: &mut BTreeMap<i64, f64>) -> (f64, f64) {
     let mid = states.iter().rev().find(|s| s.a.known()).map_or(0.0, |s| s.a.mid());
     let cost = position * mid * basis_bps.unwrap_or(0.0) / 1e4;
@@ -274,7 +276,7 @@ pub struct XemmResult {
     pub fills: usize,
     /// Fills whose hedge met an unknown book (a connection gap): left out.
     pub unresolved: usize,
-    /// Mean hedge price minus quote price, bps of the reference (before fees).
+    /// Mean hedge (or flatten) price minus quote price, bps of the reference (before fees).
     pub edge_bps: f64,
     pub pnl_usd: f64,
     pub inventory_clips: f64,
@@ -289,8 +291,13 @@ pub struct XemmSim {
     pub distance: Option<(f64, f64)>,
     pub fee_maker: f64,
     pub fee_hedge: f64,
+    /// The maker venue's taker fee, paid to flatten a fill too small to hedge.
+    pub fee_flatten: f64,
     pub clip_usd: f64,
     pub depth_usd: f64,
+    /// The hedge venue's minimum order: a smaller fill is held `pending_age`, then corrected.
+    pub min_hedge_usd: f64,
+    pub pending_age: i64,
     pub quote_age: i64,
     /// A maker-venue print arrives this much after the book change it made: its time is moved back.
     pub print_delay: i64,
@@ -308,7 +315,8 @@ pub fn simulate_xemm(states: &[State], trades: &[Trade], sim: &XemmSim) -> XemmR
         Leg::Left => (s.a, s.l),
         Leg::Right => (s.l, s.a),
     };
-    for trade in trades.iter().filter(|t| t.venue == sim.maker) {
+    let trades: Vec<&Trade> = trades.iter().filter(|t| t.venue == sim.maker).collect();
+    for (i, trade) in trades.iter().enumerate() {
         let t = trade.t - sim.print_delay;
         // A buyer lifts our ask: we sell on the maker venue and buy the hedge. Our left leg:
         let signed = if trade.buy == (sim.maker == Leg::Left) { -1.0 } else { 1.0 };
@@ -335,30 +343,44 @@ pub fn simulate_xemm(states: &[State], trades: &[Trade], sim: &XemmSim) -> XemmR
             continue;
         }
         if let Some((min_bps, max_bps)) = sim.distance {
-            let touch = if trade.buy { maker.ask } else { maker.bid };
+            // The bot measures from where the maker side's depth reaches the bot's: unknown behind a thin top.
+            let (touch, touch_usd) = if trade.buy { (maker.ask, maker.ask * maker.ask_size) } else { (maker.bid, maker.bid * maker.bid_size) };
             let distance = (price - touch).abs() / reference * 1e4;
-            if distance < min_bps || distance > max_bps {
+            if touch_usd < sim.depth_usd || distance < min_bps || distance > max_bps {
                 continue;
             }
         }
-        if !(if trade.buy { trade.price > price } else { trade.price < price }) {
+        // A taker sweeping levels prints once per level, in one ms: we fill from all that pass our price.
+        let through: f64 = trades[i..].iter().take_while(|u| u.t == trade.t)
+            .filter(|u| u.buy == trade.buy && if u.buy { u.price > price } else { u.price < price }).map(|u| u.size).sum();
+        if through == 0.0 {
             continue;
         }
-        let Some(hedged) = state_at(states, t + sim.notice + sim.hedge_lag).map(|s| books(s).1).filter(Bbo::known) else {
+        // A clip when flat, else at most what flattens.
+        let qty = through.min(if position == 0.0 { sim.clip_usd / reference } else { position.abs() });
+        // Below the hedge venue's minimum the bot holds the fill ([maker.live.partials]); `pending_age`
+        // later it freezes and corrects it by a taker order on the leg the fill grew: the maker's from
+        // flat, else the hedge's. Priced at the hedge's time: the recording ends 2 s after a print.
+        let small = qty * reference < sim.min_hedge_usd;
+        let flatten = small && position == 0.0;
+        let exit = |s: &State| if flatten { books(s).0 } else { books(s).1 };
+        let Some(hedged) = state_at(states, t + sim.notice + sim.hedge_lag).map(exit).filter(Bbo::known) else {
             r.unresolved += 1;
             continue;
         };
         let hedge_price = if trade.buy { hedged.ask } else { hedged.bid };
-        // A clip when flat, else at most what flattens.
-        let qty = trade.size.min(if position == 0.0 { sim.clip_usd / reference } else { position.abs() });
+        let fee_exit = if flatten { sim.fee_flatten } else { sim.fee_hedge };
         let gross = if trade.buy { price - hedge_price } else { hedge_price - price };
-        let net = qty * gross - qty * price * sim.fee_maker - qty * hedge_price * sim.fee_hedge;
+        let net = qty * gross - qty * price * sim.fee_maker - qty * hedge_price * fee_exit;
         r.fills += 1;
         r.pnl_usd += net;
         edge_sum += gross / reference * 1e4;
         *r.by_day.entry(day(t)).or_default() += net;
-        last_fill = t;
-        position += signed * qty;
+        // Frozen until the correction, then the cooldown stands in for the reconciliation that unfreezes it.
+        last_fill = if small { t + sim.pending_age } else { t };
+        if !flatten {
+            position += signed * qty;
+        }
     }
     if r.fills > 0 {
         r.edge_bps = edge_sum / r.fills as f64;
@@ -447,8 +469,11 @@ fn score(cfg: &Report, latency: f64, pair: &Pair, series: &Series) -> Result<Sco
             distance,
             fee_maker: own.maker_bps / 1e4,
             fee_hedge: hedge.taker_bps / 1e4,
+            fee_flatten: own.taker_bps / 1e4,
             clip_usd: cfg.clip_usd,
             depth_usd,
+            min_hedge_usd: cfg.xemm.min_hedge_usd,
+            pending_age: cfg.xemm.pending_age_ms,
             quote_age: ms(own.quote_age_ms),
             print_delay: own.print_delay_ms.round() as i64,
             notice: ms(own.notice_ms),
@@ -682,8 +707,11 @@ mod tests {
             distance: None,
             fee_maker: 0.0,
             fee_hedge: 0.0,
+            fee_flatten: 4e-4,
             clip_usd: 100.0,
             depth_usd: 1_000.0,
+            min_hedge_usd: 10.0,
+            pending_age: 6_000,
             quote_age: 250,
             print_delay: 0,
             notice: 100,
@@ -701,6 +729,18 @@ mod tests {
         let qty = 100.0 / 100.01;
         assert_eq!(r.fills, 1);
         assert!((r.pnl_usd - qty * (99.99 - price)).abs() < 1e-9);
+        // The prints of one ms through our bid fill together (99.95 is not through it).
+        let sized = |size: f64, price: f64| Trade { size, ..at(1_000, price) };
+        let swept = simulate_xemm(&states, &[sized(0.4, 99.85), sized(5.0, 99.95), sized(0.4, 99.8)], &sim);
+        assert_eq!(swept.fills, 1);
+        assert!((swept.pnl_usd - 0.8 * (99.99 - price)).abs() < 1e-9);
+        // A $5 fill is under the $10 hedge minimum: the bot holds it, then flattens it on Aster (bid
+        // 99.80, 4 bps taker), frozen for the 6 s wait and the 3 s cooldown after it.
+        let small = simulate_xemm(&states, &[sized(0.05, 99.85)], &sim);
+        assert_eq!(small.inventory_clips, 0.0);
+        assert!((small.pnl_usd - 0.05 * (99.8 - price - 99.8 * 4e-4)).abs() < 1e-9);
+        let paused = |t| simulate_xemm(&states, &[sized(0.05, 99.85), at(t, 99.7)], &sim).fills;
+        assert_eq!((paused(9_900), paused(10_000)), (1, 2));
         // A print arriving 300 ms after the book change it made (Aster's) is moved back: the hedge
         // sells at 1,100 ms, before the Lighter bid fell.
         let late = simulate_xemm(&states, &[at(1_000, 99.85)], &XemmSim { print_delay: 300, ..sim });
@@ -721,9 +761,13 @@ mod tests {
         assert_eq!((r.fills, r.inventory_clips), (2, 0.0));
         let ask = 100.01 + 10e-4 * 99.955;
         assert!((r.pnl_usd - qty * (99.99 - price) - qty * (ask - 100.01)).abs() < 1e-9);
-        // The bot's gate: our bid sits 10 bps behind Aster's 100.00 bid, inside the 18 bps minimum.
-        let gated = XemmSim { distance: Some((18.0, 50.0)), ..sim };
-        assert_eq!(simulate_xemm(&states, &[at(1_000, 99.85)], &gated).fills, 0);
+        // The bot's gate: our bid sits 10 bps behind Aster's 100.00 bid, inside the 18 bps minimum;
+        // within a 5 bps one it fills, unless that bid is thinner than the bot's depth.
+        let gate = |min_bps: f64, bid_size: f64| {
+            let thin = [State { a: Bbo { bid_size, ..states[0].a }, ..states[0] }, states[1]];
+            simulate_xemm(&thin, &[at(1_000, 99.85)], &XemmSim { distance: Some((min_bps, 50.0)), ..sim }).fills
+        };
+        assert_eq!((gate(18.0, 100.0), gate(5.0, 100.0), gate(5.0, 1.0)), (0, 1, 0));
     }
 
     /// The collector keeps every moment the report trades on: scoring what it wrote gives the same

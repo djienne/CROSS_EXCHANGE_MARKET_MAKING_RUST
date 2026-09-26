@@ -16,11 +16,13 @@ runs apart from the bot, with its own crate, image, container and data.
   - each moment keeps two seconds after it (where latency-delayed orders fill).
 - **`report`** replays the bot's rules on those moments and ranks the pairs.
   - **Taker-taker:** the entry gate, cooldown, inventory cap and each leg's latency.
-  - **XEMM:** the quote price, a fill only when a trade prints through the quote, the hedge latency
-    and the distance gate. After a fill the market pauses 3 s; with inventory, only the side that
-    reduces it is quoted (`reduce_position_only`).
-  - Both close their leftover inventory at the last window's mean basis: a standing basis is paid
-    back, not earned.
+  - **XEMM:** the quote price, a fill only when trades print through the quote (those of one ms
+    add up), the hedge latency and the distance gate (skipped behind a maker top thinner than the
+    bot's depth). After a fill the market pauses 3 s; with inventory, only the side that reduces it
+    is quoted (`reduce_position_only`). A fill under the hedge venue's $10 minimum is held, then
+    corrected by a taker order, from flat on the maker venue, and the market pauses 6 s more.
+  - Both close their leftover inventory at the last window's mean basis, without fees or spread: a
+    standing basis is paid back, not earned.
 
   Fees, latencies and thresholds apply at report time (`screener.toml` `[report]`). What is recorded
   follows from `[report]` at its loosest, so the same data answers Standard vs Premium, latency
@@ -97,7 +99,10 @@ or trading connector is imported.
   (`LIGHTER_ASTER_BOT`, `record --market <X>`) and replay precisely.
 - **The gate.** The gate's samples are counted in 0.25 bps bins, from the pair's required edge at
   the cheaper Lighter tier, and it reads whole 5-minute windows: it opens within a bin of the bot's,
-  a window later. At the Premium tier its samples are the Standard ones above Premium's edge.
+  a window later. At the Premium tier its samples are the Standard ones above Premium's edge. The
+  bot samples only outside its cooldown and when it could size a trade, so it misses the peaks it
+  trades on: on busy pairs its gate sits lower (2026-09-26: TAO 7.25 vs 9.05 bps, WLD 11.4 vs 14.7)
+  and the report trades less often than it would.
 - **Arrival times.** Replay uses arrival times on this host (Europe), not synchronized exchange
   event times. Venue/feed delays need not cancel; neither ping RTT nor an old local model
   establishes order execution latency. Measured 2026-09-27, venue timestamp to arrival (median /
@@ -107,8 +112,12 @@ or trading connector is imported.
   partly this lag. The fills at the latency charge for it only in part. Aster also sends each trade
   ~150 ms after the book change it made (Lighter and Hyperliquid send them together), so the
   report moves Aster prints back by `aster_print_delay_ms` before pricing and hedging XEMM fills.
+  That is a median: the delay varies by print (aggTrade E − T is 186 ms at the median, 25–50 ms
+  for ~13%), so some prints are moved back too far.
 - **XEMM fills.** XEMM ignores queue position (a fill needs a trade *through* the quote) and our
-  own market impact.
+  own market impact. A held fill's correction is priced when the hedge would have filled, not 6 s
+  later (the recording ends 2 s after a print), and an opposite fill that nets it meanwhile is not
+  modeled. The distance gate's 1 bps re-arm hysteresis is not modeled either.
 - **Stablecoin parity.** USD-equivalent results assume USDT/USDC parity and omit conversion costs.
 - **No funding.** Funding is not scored: Lighter's funding sources disagree on units. Check it by
   hand for a candidate pair.
