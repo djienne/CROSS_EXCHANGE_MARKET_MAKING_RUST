@@ -232,6 +232,13 @@ impl HyperliquidCreds {
         Self::load(&std::env::var_os("HYPERLIQUID_ENV_PATH").map_or_else(|| PathBuf::from("hyperliquid.env"), PathBuf::from))
     }
 
+    /// The dry-run identity: an agent key trading the dry-run owner's account.
+    pub fn dry_run() -> Self {
+        let key = dry_run_key("hyperliquid agent");
+        let signer = address_hex(&address_from_priv(&key).expect("the fixed dry-run key is valid"));
+        HyperliquidCreds { account: dry_run_owner(), signer, vault: None, key }
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let m = parse_env_file(path)?;
         if let Some(extra) = m.keys().find(|k| !["exchange", "wallet_address", "private_key", "is_vault"].contains(&k.as_str())) {

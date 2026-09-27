@@ -1,19 +1,20 @@
 //! Dry-run mode: the unchanged live bot trades against an in-process simulation of Aster and
-//! Lighter as a bot in AWS Tokyo would see them.
+//! its hedge venue (Lighter, or Hyperliquid) as a bot in AWS Tokyo would see them.
 //!
 //! The simulated world is the real one delayed by a constant shift D: real feed events are
 //! replayed D late, so this host's own feed lag (Europe) is hidden and the latency a Tokyo bot
 //! would pay is modelled explicitly. `matching` is the venues' deterministic core; `book` holds
 //! the replica each market trades against; `account` settles the money; `clock` draws the
 //! latencies; `feed` brings the real market in; `server` speaks HTTP and WebSocket on
-//! loopback, and `aster` and `lighter` speak each venue's protocol on top of it. `tape` records
-//! the same feeds to disk for backtests (`record`).
+//! loopback, and `aster`, `lighter` and `hyperliquid` speak each venue's protocol on top of
+//! it. `tape` records the same feeds to disk for backtests (`record`).
 
 pub mod account;
 pub mod aster;
 pub mod book;
 pub mod clock;
 pub mod feed;
+pub mod hyperliquid;
 pub mod lighter;
 pub mod matching;
 pub mod server;
@@ -93,6 +94,7 @@ impl DryRunCfg {
             fees,
             leverage,
             balances: [self.aster_balance_usdt, self.lighter_balance_usdc],
+            hedge: Venue::Lighter,
         }
     }
 }
@@ -134,6 +136,7 @@ pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::
         min_qty: parse_dec(&detail.min_base_amount)?,
         min_notional: parse_dec(&detail.min_quote_amount)?,
         percent_price: None,
+        sig_figs: None,
     };
     // Fees are the bot's own keys (circular by construction); both engines must agree on the
     // one they share.
@@ -157,6 +160,7 @@ pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::
         min_qty: aster.min_qty,
         min_notional: aster.min_notional,
         percent_price: aster.percent_price,
+        sig_figs: None,
     };
     core.add_market(Venue::Aster, &symbol, Some(ASTER_DEPTH), aster_filters);
     core.add_market(Venue::Lighter, &lighter_market, None, lighter);
@@ -541,12 +545,13 @@ pub(crate) mod tests {
                 fees: [Fees { maker: dec!(0), taker: dec!(0.0004) }, Fees { maker: dec!(0), taker: dec!(0) }],
                 leverage: dec!(1),
                 balances: [dec!(1000), dec!(1000)],
+                hedge: Venue::Lighter,
             };
             let mut core = Exchange::new(params, wall_us());
             core.trust_feed();
             let band = Some((dec!(0.95), dec!(1.05)));
-            let aster = Filters { tick: dec!(0.001), step: dec!(0.01), min_qty: dec!(0.01), min_notional: dec!(5), percent_price: band };
-            let lighter = Filters { tick: dec!(0.0001), step: dec!(0.01), min_qty: dec!(0.07), min_notional: dec!(10), percent_price: band };
+            let aster = Filters { tick: dec!(0.001), step: dec!(0.01), min_qty: dec!(0.01), min_notional: dec!(5), percent_price: band, sig_figs: None };
+            let lighter = Filters { tick: dec!(0.0001), step: dec!(0.01), min_qty: dec!(0.07), min_notional: dec!(10), percent_price: band, sig_figs: None };
             core.add_market(Venue::Aster, "HYPEUSDT", Some(20), aster);
             core.add_market(Venue::Lighter, "24", None, lighter);
             let shift = SHIFT_MS * 1_000;

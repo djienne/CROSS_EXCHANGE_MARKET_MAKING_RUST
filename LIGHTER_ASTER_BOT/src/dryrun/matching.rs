@@ -53,12 +53,16 @@ const KEEP: usize = 1_000;
 pub enum Venue {
     Aster,
     Lighter,
+    Hyperliquid,
 }
 
 impl Venue {
-    /// Its slot in the per-venue pairs (`[Aster, Lighter]`).
+    /// Its slot in the per-venue pairs: Aster, then the hedge venue (`SimParams::hedge`).
     pub fn ix(self) -> usize {
-        self as usize
+        match self {
+            Venue::Aster => 0,
+            Venue::Lighter | Venue::Hyperliquid => 1,
+        }
     }
 }
 
@@ -85,6 +89,8 @@ pub struct SimParams {
     pub fees: [Fees; 2],
     pub leverage: Decimal,
     pub balances: [Decimal; 2],
+    /// The venue in the second slot: Lighter or Hyperliquid.
+    pub hedge: Venue,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -96,6 +102,8 @@ pub struct Filters {
     /// PERCENT_PRICE `(down, up)` multipliers: buys at most mark × up, sells at least
     /// mark × down.
     pub percent_price: Option<(Decimal, Decimal)>,
+    /// Hyperliquid: at most this many significant figures in a price, unless it is an integer.
+    pub sig_figs: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,6 +383,9 @@ fn venue_limits(venue: Venue) -> Vec<Window> {
         Venue::Aster => vec![Window::new(60, 2_400, false), Window::new(60, 1_200, true), Window::new(10, 300, true)],
         // Lighter docs, Standard account: 60 REST requests and 60 transactions per minute.
         Venue::Lighter => vec![Window::new(60, 60, false), Window::new(60, 60, true)],
+        // Hyperliquid docs: REST weight 1200/min per IP (the per-address action budget, one
+        // per USDC traded, is not modelled).
+        Venue::Hyperliquid => vec![Window::new(60, 1_200, false)],
     }
 }
 
@@ -535,6 +546,10 @@ fn check_filters(f: &Filters, spec: &OrderSpec, mark: Option<Decimal>) -> Result
         if price <= Decimal::ZERO || off(price, f.tick) {
             return Err(Reject::TickSize);
         }
+        let figures = |p: Decimal| p.normalize().mantissa().unsigned_abs().to_string().len();
+        if f.sig_figs.is_some_and(|n| !price.fract().is_zero() && figures(price) > n as usize) {
+            return Err(Reject::TickSize);
+        }
         if let (Some((down, up)), Some(mark)) = (f.percent_price, mark) {
             let outside = match spec.side {
                 Side::Buy => price > mark * up,
@@ -583,7 +598,7 @@ impl Exchange {
     pub fn new(p: SimParams, start_us: i64) -> Self {
         let mut venues = [VenueState::new(p.balances[0]), VenueState::new(p.balances[1])];
         venues[0].limits = venue_limits(Venue::Aster);
-        venues[1].limits = venue_limits(Venue::Lighter);
+        venues[1].limits = venue_limits(p.hedge);
         Self {
             rng: Rng::new(p.seed),
             p,
@@ -630,7 +645,7 @@ impl Exchange {
                 ..saved
             };
         }
-        for venue in [Venue::Aster, Venue::Lighter] {
+        for venue in [Venue::Aster, self.p.hedge] {
             let due: Vec<(String, i64)> = self.venues[venue.ix()].funding.iter()
                 .flat_map(|(market, rates)| rates.keys().map(move |&exch_us| (market.clone(), exch_us)))
                 .collect();
@@ -643,7 +658,7 @@ impl Exchange {
     /// Re-arms the restored deadmen: one that ran out while the venues were down cancels its
     /// market's orders now.
     pub fn resume(&mut self) {
-        for venue in [Venue::Aster, Venue::Lighter] {
+        for venue in [Venue::Aster, self.p.hedge] {
             let armed: Vec<(String, i64)> = self.venues[venue.ix()].deadman.iter().map(|(m, &d)| (m.clone(), d)).collect();
             for (market, deadline) in armed {
                 self.schedule(deadline, RANK_ACTION, Pending::Deadman { venue, market, deadline });
@@ -1320,6 +1335,7 @@ mod tests {
             fees: [Fees { maker: dec!(0), taker: dec!(0.0004) }, Fees { maker: dec!(0), taker: dec!(0) }],
             leverage: dec!(1),
             balances: [dec!(1000), dec!(1000)],
+            hedge: Venue::Lighter,
         }
     }
 
@@ -1360,6 +1376,7 @@ mod tests {
                 min_qty: dec!(0.01),
                 min_notional: dec!(5),
                 percent_price: Some((dec!(0.98), dec!(1.02))),
+                sig_figs: None,
             };
             ex.add_market(Venue::Aster, HYPE, Some(20), filters.clone());
             ex.add_market(Venue::Lighter, HYPE, None, filters);
@@ -1454,6 +1471,17 @@ mod tests {
         match sim.reply(ticket) {
             Some(Reply::Order(order)) => order.clone(),
             other => panic!("expected an order reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hyperliquid_prices_keep_five_significant_figures_unless_whole() {
+        let f = Filters { tick: dec!(0.0001), step: dec!(0.01), sig_figs: Some(5), ..Filters::default() };
+        let spec = |price| OrderSpec {
+            market: HYPE.into(), client_id: "c".into(), side: Side::Buy, qty: dec!(1), price: Some(price), tif: Tif::Gtc, reduce_only: false,
+        };
+        for (price, valid) in [(dec!(40.012), true), (dec!(40.0125), false), (dec!(0.0012), true), (dec!(123456), true), (dec!(12345.5), false)] {
+            assert_eq!(check_filters(&f, &spec(price), None).is_ok(), valid, "{price}");
         }
     }
 
