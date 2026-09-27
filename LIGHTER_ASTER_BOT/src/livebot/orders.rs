@@ -397,6 +397,11 @@ impl OrderManager {
             );
             return CancelTarget::Suppressed;
         }
+        // A place whose admission was cancelled never left: the worker's `PlaceReject` closes
+        // the slot. A cancel would cost a request and hold up the next place behind it.
+        if slot.state == OrderLifecycle::PendingPlace && slot.queued_admission.as_ref().is_some_and(|ticket| ticket.is_cancelled()) {
+            return CancelTarget::Suppressed;
+        }
         let Some(client_id) = slot.client_id.clone() else { return CancelTarget::None };
         if slot.state == OrderLifecycle::PendingCancel
             && now_ns.saturating_sub(slot.last_cancel_attempt_ns) < retry_ns
@@ -713,6 +718,28 @@ mod tests {
         // Far in the future the 60s window has drained — and the CHECK itself prunes, so placement
         // recovers WITHOUT any new send in between (the bug was: it never drained without a send).
         assert!(m.replace_rate_ok(&"BTC".into(), 3, 120_000_000_000));
+    }
+
+    #[test]
+    fn a_place_that_never_left_gets_no_cancel_and_a_claimed_one_does() {
+        let (mut m, market): (_, MarketId) = (mgr(), "BTC".into());
+        for claimed in [false, true] {
+            let id = m.next_client_id(&market, Side::Buy).unwrap();
+            m.on_place_sent(&market, Side::Buy, id.clone(), 1000, 5, 0);
+            let ticket = super::super::fills::Admission::new(i64::MAX);
+            m.bind_admission(&market, Side::Buy, ticket.clone());
+            if claimed {
+                assert!(ticket.try_claim(0), "the worker took it");
+            }
+            m.revoke_queued(&market, Side::Buy);
+            let target = m.cancel_target(&market, Side::Buy, 0, 1000);
+            if claimed {
+                assert!(matches!(target, CancelTarget::Send { ref client_id, .. } if client_id == &id), "{target:?}");
+            } else {
+                assert_eq!(target, CancelTarget::Suppressed);
+            }
+            m.on_closed(&market, Side::Buy);
+        }
     }
 
     #[test]
