@@ -64,10 +64,13 @@ pub(super) enum Direction {
 }
 
 impl Direction {
-    pub(super) fn as_str(self) -> &'static str {
-        match self {
-            Direction::SellAsterBuyLighter => "SELL_ASTER_BUY_LIGHTER",
-            Direction::SellLighterBuyAster => "SELL_LIGHTER_BUY_ASTER",
+    /// The ledger's name, naming the second leg's real venue.
+    pub(super) fn as_str(self, hedge: HedgeVenue) -> &'static str {
+        match (self, hedge) {
+            (Direction::SellAsterBuyLighter, HedgeVenue::Lighter) => "SELL_ASTER_BUY_LIGHTER",
+            (Direction::SellLighterBuyAster, HedgeVenue::Lighter) => "SELL_LIGHTER_BUY_ASTER",
+            (Direction::SellAsterBuyLighter, HedgeVenue::Hyperliquid) => "SELL_ASTER_BUY_HYPERLIQUID",
+            (Direction::SellLighterBuyAster, HedgeVenue::Hyperliquid) => "SELL_HYPERLIQUID_BUY_ASTER",
         }
     }
 
@@ -1420,7 +1423,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
                     warn!(
                         "book sanity blocked new ARB entry market={} direction={} qty={} reason={:?} blocked_until={:?} failure_streak={} success_streak={}",
                         spec.market_id,
-                        opp.direction.as_str(),
+                        opp.direction.as_str(spec.hedge),
                         opp.qty,
                         sanity.last_reason,
                         sanity.blocked_until,
@@ -1438,7 +1441,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
         if tracing::enabled!(Level::DEBUG) {
             debug!(
                 "arb opportunity {} qty={} gross={}bps net_margin={}bps sell_vwap={} buy_vwap={} expected_gross=${} expected_fee=${} expected_net=${} threshold_margin=${} min_qty={} desired_qty={} top_depth={} depth_supported={} liquidity_multiple={} sell_depth_target={} buy_depth_target={} sell_depth_available={} buy_depth_available={} sell_levels_used={} buy_levels_used={} headroom={} margin_room={}",
-                opp.direction.as_str(),
+                opp.direction.as_str(spec.hedge),
                 opp.qty,
                 opp.gross_edge_bps,
                 opp.expected_net_margin_bps,
@@ -1466,7 +1469,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
         let gate = entry_gate.evaluate(
             OpportunityGateInput {
                 timestamp: now,
-                direction: opp.direction.as_str(),
+                direction: opp.direction.as_str(spec.hedge),
                 gross_edge_bps: opp.gross_edge_bps,
                 expected_net_margin_bps: opp.expected_net_margin_bps,
                 expected_net_usd: opp.expected_net_usd,
@@ -1534,7 +1537,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
                     want = Some(Want { id: next_want_id, at: tokio::time::Instant::now(), granted: false, attempted: false });
                     tx.send_replace(Some(next_want_id));
                     info!("asking XEMM for the execution rights market={} direction={} gross={}bps want_id={next_want_id}",
-                        spec.market_id, opp.direction.as_str(), opp.gross_edge_bps);
+                        spec.market_id, opp.direction.as_str(spec.hedge), opp.gross_edge_bps);
                 }
             }
             // Standby/observe hits this every poll while an edge exists; 5s heartbeat.
@@ -1546,7 +1549,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
                 info!(
                     "standby skip order submission market={} direction={} qty={} gross={}bps expected_net=${} gate_decision={} threshold={:?} samples={} recorded={} observe_only={} lease_required={}",
                     spec.market_id,
-                    opp.direction.as_str(),
+                    opp.direction.as_str(spec.hedge),
                     opp.qty,
                     opp.gross_edge_bps,
                     opp.expected_net_usd,
@@ -1575,7 +1578,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
             warn!(
                 "reduce-only execution guard skipped non-reducing opportunity market={} direction={} qty={} pos_aster={} pos_lighter={}",
                 spec.market_id,
-                opp.direction.as_str(),
+                opp.direction.as_str(spec.hedge),
                 opp.qty,
                 pos.aster_qty,
                 pos.lighter_qty
@@ -2528,7 +2531,7 @@ async fn execute_opportunity(
     // The durable session was armed cold. This bounded queue operation never waits for disk.
     journal.try_append(ExecutionRecord::Start(ExecutionStart { schema_version:2,economic_status:"incomplete",
         timestamp:started_at,execution_id:execution_id.clone(),session_id:session.id().to_string(),
-        market:spec.market_id.to_string(),outcome:"submitting",direction:opp.direction.as_str(),qty:opp.qty }))?;
+        market:spec.market_id.to_string(),outcome:"submitting",direction:opp.direction.as_str(spec.hedge),qty:opp.qty }))?;
     let (a_res, (l_res, pending)) = tokio::join!(
         aster.submit_ioc_order(&spec.market_id, aster_side, opp.qty, aster_bound, reduce_only),
         lighter.submit_market_order_deferred_fill(&spec.market_id, lighter_side, opp.qty, lighter_bound, reduce_only),
@@ -2545,7 +2548,7 @@ async fn execute_opportunity(
     let mut row = serde_json::json!({
         "schema_version": 2, "economic_status": "incomplete", "timestamp": Utc::now(),
         "started_at": started_at, "execution_id": execution_id, "session_id": session.id(), "market": spec.market_id.to_string(),
-        "execution_mode": "concurrent_confirm_rescue", "direction": opp.direction.as_str(),
+        "execution_mode": "concurrent_confirm_rescue", "direction": opp.direction.as_str(spec.hedge), "hedge_venue": spec.hedge,
         "qty": opp.qty, "reduce_only": reduce_only, "orders": orders, "orders_complete": true,
         "aster_submit": format!("{a_res:?}"), "lighter_submit": format!("{l_res:?}"),
         "aster_confirmation": a, "lighter_confirmation": l,
@@ -2686,15 +2689,16 @@ fn recovery_loss_row(spec: &MarketSpec, recovery: &RecoveryReport) -> TradeLedge
         actual_net_bps: Decimal::ZERO,
         fill_qty_mismatch: Decimal::ZERO,
         aster_fill: zero_fill_summary().with_fee_provenance(FeeProvenance::Unknown),
-        lighter_fill: zero_fill_summary().with_fee_provenance(FeeProvenance::Unknown),
-        lighter_fee_evidence: Vec::new(),
+        hedge_venue: spec.hedge,
+        hedge_fill: zero_fill_summary().with_fee_provenance(FeeProvenance::Unknown),
+        hedge_fee_evidence: Vec::new(),
         // The controller's realized-loss stop dedups rows on `taker:<aster_order_id>:<lighter_client_order_index>`;
         // a constant 0 collapsed every recovery after the first into one key, hiding
         // repeat losses from downstream accounting. The row timestamp keys each recovery.
         aster_order_id: -timestamp.timestamp_micros(),
-        lighter_client_order_index: 0,
+        hedge_client_order_index: 0,
         final_aster_position: recovery.position.aster_qty,
-        final_lighter_position: recovery.position.lighter_qty,
+        final_hedge_position: recovery.position.lighter_qty,
         final_net_position: recovery.position.net_qty(),
         available_before_usd: recovery.margin_after.aster_available_usd
             + recovery.margin_after.lighter_available_usd
@@ -2703,8 +2707,8 @@ fn recovery_loss_row(spec: &MarketSpec, recovery: &RecoveryReport) -> TradeLedge
             + recovery.margin_after.lighter_available_usd,
         aster_available_before_usd: recovery.margin_after.aster_available_usd,
         aster_available_after_usd: recovery.margin_after.aster_available_usd,
-        lighter_available_before_usd: recovery.margin_after.lighter_available_usd,
-        lighter_available_after_usd: recovery.margin_after.lighter_available_usd,
+        hedge_available_before_usd: recovery.margin_after.lighter_available_usd,
+        hedge_available_after_usd: recovery.margin_after.lighter_available_usd,
     }
 }
 
@@ -2745,7 +2749,7 @@ fn pnl_trade_row(spec: &MarketSpec, opp: &Opportunity, report: &TradeReport) -> 
         source_event_id: Some(report.execution_id.clone()),
         timestamp: Utc::now(),
         market: spec.market_id.0.clone(),
-        direction: opp.direction.as_str().to_string(),
+        direction: opp.direction.as_str(spec.hedge).to_string(),
         qty: report
             .economics
             .aster_fill
@@ -2758,12 +2762,13 @@ fn pnl_trade_row(spec: &MarketSpec, opp: &Opportunity, report: &TradeReport) -> 
         actual_net_bps: report.economics.net_bps,
         fill_qty_mismatch: report.economics.fill_qty_mismatch,
         aster_fill: report.economics.aster_fill,
-        lighter_fill: report.economics.lighter_fill,
-        lighter_fee_evidence: report.lighter_fee_evidence.clone(),
+        hedge_venue: spec.hedge,
+        hedge_fill: report.economics.lighter_fill,
+        hedge_fee_evidence: report.lighter_fee_evidence.clone(),
         aster_order_id: report.aster_order_id,
-        lighter_client_order_index: report.lighter_client_order_index,
+        hedge_client_order_index: report.lighter_client_order_index,
         final_aster_position: report.position.aster_qty,
-        final_lighter_position: report.position.lighter_qty,
+        final_hedge_position: report.position.lighter_qty,
         final_net_position: report.position.net_qty(),
         available_before_usd: report.margin_before.aster_available_usd
             + report.margin_before.lighter_available_usd,
@@ -2771,8 +2776,8 @@ fn pnl_trade_row(spec: &MarketSpec, opp: &Opportunity, report: &TradeReport) -> 
             + report.margin_after.lighter_available_usd,
         aster_available_before_usd: report.margin_before.aster_available_usd,
         aster_available_after_usd: report.margin_after.aster_available_usd,
-        lighter_available_before_usd: report.margin_before.lighter_available_usd,
-        lighter_available_after_usd: report.margin_after.lighter_available_usd,
+        hedge_available_before_usd: report.margin_before.lighter_available_usd,
+        hedge_available_after_usd: report.margin_after.lighter_available_usd,
     }
 }
 
@@ -3719,7 +3724,7 @@ mod tests {
             lighter_market_id: 24,
             lighter_price_decimals: 4,
             lighter_size_decimals: 2,
-            lighter_price_tick: dec!(0.0001),
+            lighter_price_tick: dec!(0.0001), hedge: Default::default(),
             tick: dec!(0.001),
             step: dec!(0.01),
             aster_min_qty: dec!(0.01),
@@ -4309,7 +4314,7 @@ mod tests {
         let second = recovery_loss_row(&spec,&other);
         assert_ne!(row.source_event_id,second.source_event_id);
         assert_eq!(row.economic_status,EconomicStatus::Estimated);
-        assert_eq!(row.lighter_client_order_index, 0);
+        assert_eq!(row.hedge_client_order_index, 0);
         assert_eq!(row.actual_net_usd, dec!(-1.25));
     }
 

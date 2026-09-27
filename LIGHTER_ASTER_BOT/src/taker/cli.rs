@@ -857,7 +857,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("taker_diagnostic_{}_{}",std::process::id(),chrono::Utc::now().timestamp_micros()));
         cfg.pnl.persist_dir = dir.to_string_lossy().into_owned();
         let spec = MarketSpec {market_id:"HYPE".into(),aster_symbol:"HYPEUSDT".to_string(),lighter_symbol:"HYPE".to_string(),
-            lighter_market_id:24,lighter_price_decimals:4,lighter_size_decimals:2,lighter_price_tick:dec!(0.0001),
+            lighter_market_id:24,lighter_price_decimals:4,lighter_size_decimals:2,lighter_price_tick:dec!(0.0001), hedge: Default::default(),
             tick:dec!(0.01),step:dec!(0.01),aster_min_qty:dec!(0.01),aster_min_notional:dec!(10),
             lighter_qty_step:dec!(0.01),lighter_min_notional:dec!(10)};
         let aster = AsterRest::new(url,Arc::new(crate::taker::aster::sign::test_support::TestSigner::new()),std::slice::from_ref(&spec)).unwrap();

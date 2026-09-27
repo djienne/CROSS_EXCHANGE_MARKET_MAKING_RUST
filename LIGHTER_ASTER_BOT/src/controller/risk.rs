@@ -329,7 +329,7 @@ impl RealizedTrades {
         if raw.get("market").and_then(Value::as_str).is_some_and(|market| market != self.market) {
             return false;
         }
-        let (aster, lighter) = (text("aster_order_id"), text("lighter_client_order_index"));
+        let (aster, lighter) = (text("aster_order_id"), text("hedge_client_order_index").or_else(|| text("lighter_client_order_index")));
         let key = if text("direction").is_some_and(|d| d.eq_ignore_ascii_case("RECOVERY")) {
             format!("taker:recovery:{aster:?}:{lighter:?}:{:?}", text("timestamp"))
         } else if aster.is_some() || lighter.is_some() {

@@ -56,6 +56,18 @@ class EconomicContractTests(unittest.TestCase):
                 finally:
                     conn.close()
 
+    def test_a_taker_row_hedged_on_hyperliquid_reads_like_a_lighter_one(self):
+        fill = lambda px, fee: {"qty": "0.1", "vwap": px, "notional": str(Decimal(px) / 10), "fee_usd": fee, "fee_provenance": "venue"}
+        old = {"schema_version": 2, "economic_status": "confirmed", "market": "HYPE", "timestamp": "2026-01-02T00:00:00Z",
+               "direction": "SELL_LIGHTER_BUY_ASTER", "aster_order_id": 1, "lighter_client_order_index": 2,
+               "aster_fill": fill("98", "0.00392"), "lighter_fill": fill("99", "0.004455"),
+               "actual_gross_usd": "0.1", "actual_fees_usd": "0.008375", "actual_net_usd": "0.091625"}
+        new = {("hedge" + k[len("lighter"):] if k.startswith("lighter") else k): v for k, v in old.items()}
+        new.update(direction="SELL_HYPERLIQUID_BUY_ASTER", hedge_venue="hyperliquid")
+        for row in (old, new):
+            result = economics.taker_economics(row)
+            self.assertEqual((result["economic_status"], result["net_pnl_usdc"], result["lighter_client_order_index"]), ("confirmed", Decimal("0.091625"), "2"))
+
     def test_pairing_precedes_window_filter_and_no_future_fill_is_used(self):
         with tempfile.TemporaryDirectory() as td:
             path=Path(td)/"events.jsonl"

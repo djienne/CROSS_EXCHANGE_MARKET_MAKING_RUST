@@ -18,4 +18,7 @@ pub struct MarketSpec {
     pub aster_min_notional: Decimal,
     pub lighter_qty_step: Decimal,
     pub lighter_min_notional: Decimal,
+    /// The second leg's venue; the `lighter_*` fields describe its market there.
+    #[serde(default)]
+    pub hedge: crate::config::HedgeVenue,
 }

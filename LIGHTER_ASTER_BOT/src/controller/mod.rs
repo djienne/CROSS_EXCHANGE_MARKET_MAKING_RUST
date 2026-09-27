@@ -440,9 +440,9 @@ mod tests {
         .expect("no hedged trade within 60 s");
         let confirmed = crate::taker::pnl::EconomicStatus::Confirmed;
         assert_eq!((row.economic_status, row.direction.as_str()), (confirmed, "SELL_LIGHTER_BUY_ASTER"), "{row:?}");
-        assert_eq!((row.aster_fill.vwap, row.lighter_fill.vwap), (dec!(98), dec!(99)), "each leg took the top: {row:?}");
-        assert_eq!(row.aster_fill.qty, row.lighter_fill.qty, "{row:?}");
-        assert!(row.aster_fill.fee_usd > Decimal::ZERO && row.lighter_fill.fee_usd.is_zero(), "Aster charges 4 bps: {row:?}");
+        assert_eq!((row.aster_fill.vwap, row.hedge_fill.vwap), (dec!(98), dec!(99)), "each leg took the top: {row:?}");
+        assert_eq!(row.aster_fill.qty, row.hedge_fill.qty, "{row:?}");
+        assert!(row.aster_fill.fee_usd > Decimal::ZERO && row.hedge_fill.fee_usd.is_zero(), "Aster charges 4 bps: {row:?}");
         assert!(row.final_net_position.is_zero(), "{row:?}");
         // XEMM stayed out from its yield to its resume, then quotes again.
         market.set_aster(dec!(99), dec!(101));
@@ -529,8 +529,9 @@ mod tests {
         .await
         .expect("no hedged trade within 60 s");
         let confirmed = crate::taker::pnl::EconomicStatus::Confirmed;
-        assert_eq!((row.economic_status, row.direction.as_str()), (confirmed, "SELL_LIGHTER_BUY_ASTER"), "{row:?}");
-        let hedge = row.lighter_fill;
+        let hyperliquid = crate::config::HedgeVenue::Hyperliquid;
+        assert_eq!((row.economic_status, row.direction.as_str(), row.hedge_venue), (confirmed, "SELL_HYPERLIQUID_BUY_ASTER", hyperliquid), "{row:?}");
+        let hedge = row.hedge_fill;
         assert_eq!((row.aster_fill.vwap, hedge.vwap, row.aster_fill.qty), (dec!(98), dec!(99), hedge.qty), "{row:?}");
         let fee = hedge.notional * dec!(0.00045);
         assert!(hedge.fee_provenance == crate::taker::types::FeeProvenance::Venue && (hedge.fee_usd - fee).abs() < dec!(0.000001), "{row:?}");

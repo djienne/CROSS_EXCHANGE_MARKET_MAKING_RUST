@@ -503,7 +503,7 @@ mod tests {
             lighter_market_id: 24,
             lighter_price_decimals: 4,
             lighter_size_decimals: 2,
-            lighter_price_tick: dec!(0.0001),
+            lighter_price_tick: dec!(0.0001), hedge: Default::default(),
             step: dec!(0.01),
             tick: dec!(0.001),
             aster_min_qty: dec!(0.01),

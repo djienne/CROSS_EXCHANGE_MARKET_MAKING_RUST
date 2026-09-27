@@ -152,7 +152,8 @@ def calculate(fills: list[Fill], *, legacy: bool = False) -> dict[str, Any]:
 
 def taker_economics(row: dict[str, Any]) -> dict[str, Any] | None:
     direction = str(row.get("direction", "")).upper()
-    key_a, key_h = row.get("aster_order_id"), row.get("lighter_client_order_index")
+    # Rows name the hedge leg `hedge_*` since it may be Hyperliquid; older ones `lighter_*`.
+    key_a, key_h = row.get("aster_order_id"), row.get("hedge_client_order_index", row.get("lighter_client_order_index"))
     if key_a is None or key_h is None or not row.get("market"):
         return None
     if direction == "RECOVERY":
@@ -163,11 +164,12 @@ def taker_economics(row: dict[str, Any]) -> dict[str, Any] | None:
             economic_status="estimated", key=f"taker:recovery:{key_a}:{key_h}:{row.get('timestamp')}")
     else:
         sides = {"SELL_ASTER_BUY_LIGHTER": ("sell", "buy"), "SELL_LIGHTER_BUY_ASTER": ("buy", "sell")}
-        if direction not in sides:
+        leg = direction.replace("HYPERLIQUID", "LIGHTER")
+        if leg not in sides:
             return None
         fills = []
-        for venue, side, identity in zip(("aster", "lighter"), sides[direction], (key_a, key_h)):
-            d = row.get(f"{venue}_fill")
+        for venue, side, identity in zip(("aster", "lighter"), sides[leg], (key_a, key_h)):
+            d = row.get("aster_fill") if venue == "aster" else row.get("hedge_fill", row.get("lighter_fill"))
             if not isinstance(d, dict):
                 return None
             trusted = row.get("schema_version", 1) >= 2 and d.get("fee_provenance") == "venue"

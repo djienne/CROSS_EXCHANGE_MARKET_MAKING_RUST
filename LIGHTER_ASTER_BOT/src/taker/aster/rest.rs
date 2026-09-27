@@ -786,7 +786,7 @@ mod tests {
         let hype = MarketId("HYPE".into());
         let spec = MarketSpec {
             market_id: hype.clone(), aster_symbol: "HYPEUSDT".into(), lighter_symbol: "HYPE".into(),
-            lighter_market_id: 24, lighter_price_decimals: 4, lighter_size_decimals: 2, lighter_price_tick: dec!(0.0001),
+            lighter_market_id: 24, lighter_price_decimals: 4, lighter_size_decimals: 2, lighter_price_tick: dec!(0.0001), hedge: Default::default(),
             tick: dec!(0.001), step: dec!(0.01), aster_min_qty: dec!(0.01), aster_min_notional: dec!(5),
             lighter_qty_step: dec!(0.01), lighter_min_notional: dec!(10),
         };

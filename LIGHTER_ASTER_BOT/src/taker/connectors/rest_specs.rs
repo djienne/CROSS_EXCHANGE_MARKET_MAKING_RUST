@@ -83,6 +83,7 @@ pub async fn build_market_specs(
             aster_min_notional: min_notional,
             lighter_qty_step: Decimal::new(1, lm.size_decimals),
             lighter_min_notional: lm.min_quote_amount,
+            hedge: m.hedge_venue,
         });
     }
     Ok(specs)

@@ -319,20 +319,28 @@ pub struct TradeLedgerRow {
     pub actual_net_bps: Decimal,
     pub fill_qty_mismatch: Decimal,
     pub aster_fill: FillSummary,
-    pub lighter_fill: FillSummary,
+    /// The second leg's venue; rows from before it hedged on Lighter.
     #[serde(default)]
-    pub lighter_fee_evidence: Vec<FeeEvidence>,
+    pub hedge_venue: crate::config::HedgeVenue,
+    #[serde(alias = "lighter_fill")]
+    pub hedge_fill: FillSummary,
+    #[serde(default, alias = "lighter_fee_evidence")]
+    pub hedge_fee_evidence: Vec<FeeEvidence>,
     pub aster_order_id: i64,
-    pub lighter_client_order_index: i64,
+    #[serde(alias = "lighter_client_order_index")]
+    pub hedge_client_order_index: i64,
     pub final_aster_position: Decimal,
-    pub final_lighter_position: Decimal,
+    #[serde(alias = "final_lighter_position")]
+    pub final_hedge_position: Decimal,
     pub final_net_position: Decimal,
     pub available_before_usd: Decimal,
     pub available_after_usd: Decimal,
     pub aster_available_before_usd: Decimal,
     pub aster_available_after_usd: Decimal,
-    pub lighter_available_before_usd: Decimal,
-    pub lighter_available_after_usd: Decimal,
+    #[serde(alias = "lighter_available_before_usd")]
+    pub hedge_available_before_usd: Decimal,
+    #[serde(alias = "lighter_available_after_usd")]
+    pub hedge_available_after_usd: Decimal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,9 +354,11 @@ pub struct CircuitBreakerState {
     pub last_trade_timestamp: DateTime<Utc>,
     pub last_trade_actual_net_usd: Decimal,
     pub last_aster_order_id: i64,
-    pub last_lighter_client_order_index: i64,
+    #[serde(alias = "last_lighter_client_order_index")]
+    pub last_hedge_client_order_index: i64,
     pub final_aster_position: Decimal,
-    pub final_lighter_position: Decimal,
+    #[serde(alias = "final_lighter_position")]
+    pub final_hedge_position: Decimal,
     pub final_net_position: Decimal,
 }
 
@@ -384,7 +394,7 @@ pub struct PnlTracker {
 fn loss_guard_value(row: &TradeLedgerRow) -> Decimal {
     let known = row.schema_version >= 2 && row.economic_status == EconomicStatus::Confirmed
         && row.aster_fill.fee_provenance == crate::taker::types::FeeProvenance::Venue
-        && row.lighter_fill.fee_provenance == crate::taker::types::FeeProvenance::Venue;
+        && row.hedge_fill.fee_provenance == crate::taker::types::FeeProvenance::Venue;
     if known { row.actual_net_usd } else { row.actual_net_usd.min(Decimal::ZERO) }
 }
 
@@ -480,9 +490,9 @@ impl PnlTracker {
             last_trade_timestamp: row.timestamp,
             last_trade_actual_net_usd: row.actual_net_usd,
             last_aster_order_id: row.aster_order_id,
-            last_lighter_client_order_index: row.lighter_client_order_index,
+            last_hedge_client_order_index: row.hedge_client_order_index,
             final_aster_position: row.final_aster_position,
-            final_lighter_position: row.final_lighter_position,
+            final_hedge_position: row.final_hedge_position,
             final_net_position: row.final_net_position,
         }
     }
@@ -653,21 +663,32 @@ mod tests {
             fill_qty_mismatch: Decimal::ZERO,
             aster_fill: FillSummary::from_qty_notional(dec!(0.17), dec!(10), Decimal::ZERO)
                 .unwrap(),
-            lighter_fill: FillSummary::from_qty_notional(dec!(0.17), dec!(10), Decimal::ZERO)
+            hedge_venue: Default::default(),
+            hedge_fill: FillSummary::from_qty_notional(dec!(0.17), dec!(10), Decimal::ZERO)
                 .unwrap(),
-            lighter_fee_evidence: Vec::new(),
+            hedge_fee_evidence: Vec::new(),
             aster_order_id: 1,
-            lighter_client_order_index: 2,
+            hedge_client_order_index: 2,
             final_aster_position: dec!(-0.17),
-            final_lighter_position: dec!(0.17),
+            final_hedge_position: dec!(0.17),
             final_net_position: Decimal::ZERO,
             available_before_usd: dec!(100),
             available_after_usd: dec!(100),
             aster_available_before_usd: dec!(50),
             aster_available_after_usd: dec!(50),
-            lighter_available_before_usd: dec!(50),
-            lighter_available_after_usd: dec!(50),
+            hedge_available_before_usd: dec!(50),
+            hedge_available_after_usd: dec!(50),
         }
+    }
+
+    #[test]
+    fn a_row_written_before_the_hedge_names_still_reads() {
+        let written = serde_json::to_value(row("2026-06-23T23:00:01Z", dec!(5))).unwrap();
+        let old: serde_json::Map<_, _> = written.as_object().unwrap().iter()
+            .filter(|(key, _)| *key != "hedge_venue").map(|(key, value)| (key.replace("hedge", "lighter"), value.clone())).collect();
+        assert!(old.contains_key("lighter_fill") && old.contains_key("final_lighter_position"), "{old:?}");
+        let read: TradeLedgerRow = serde_json::from_value(old.into()).unwrap();
+        assert_eq!((read.hedge_venue, read.hedge_client_order_index, read.final_hedge_position), (crate::config::HedgeVenue::Lighter, 2, dec!(0.17)));
     }
 
     #[test]
@@ -821,7 +842,7 @@ mod tests {
         legacy.economic_status = EconomicStatus::LegacyUnverified;
         tracker.record_trade(legacy).await.unwrap();
         let mut unknown = row("2026-06-23T23:00:02Z",dec!(5));
-        unknown.lighter_fill.fee_provenance = crate::taker::types::FeeProvenance::Unknown;
+        unknown.hedge_fill.fee_provenance = crate::taker::types::FeeProvenance::Unknown;
         tracker.record_trade(unknown).await.unwrap();
         let mut estimated = row("2026-06-23T23:00:03Z",dec!(-2));
         estimated.economic_status = EconomicStatus::Estimated;
