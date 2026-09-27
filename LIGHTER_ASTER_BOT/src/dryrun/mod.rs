@@ -350,7 +350,7 @@ impl Venues {
         let _ = self.commands.send(Command::Resume);
     }
 
-    /// Saves the venues' state now, durably.
+    /// Saves the venues' state now, durably, and appends the diagnostics of the last window.
     pub async fn save(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         let _ = self.commands.send(Command::Save(tx));
@@ -439,7 +439,7 @@ async fn drive(
                     }
                     Command::Resume => core.resume(),
                     Command::Save(reply) => {
-                        let _ = reply.send(files.as_mut().map_or(Ok(()), |files| files.save(&core)));
+                        let _ = reply.send(files.as_mut().map_or(Ok(()), |files| files.save(&core).and_then(|()| files.report(&mut core))));
                     }
                 }
             }
@@ -721,7 +721,7 @@ pub(crate) mod tests {
         let (stop, stem) = (CancellationToken::new(), runs.join("bot-HYPE"));
         let xemm = tokio::spawn({
             let (cfg, stop, stem) = (cfg.maker.clone(), stop.clone(), stem.clone());
-            async move { crate::livebot::run(&cfg, maker_markets, stem, Default::default(), None, stop).await }
+            async move { crate::livebot::run(&cfg, maker_markets, stem, Default::default(), None, Default::default(), stop).await }
         });
         // A taker waiting for a lease runs beside XEMM on the same account, as under `run`.
         let (_no_lease, lease) = tokio::sync::watch::channel(None);

@@ -78,7 +78,8 @@ pub const STRATEGY_THREAD: &str = "livebot-strategy";
 ///
 /// The bot's hot planes (strategy/exec) run concurrently off the lock-free `VenueBook` cells.
 /// `stem` (e.g. `runs/bot-HYPE`) names the journal, trip latch, active-session marker and
-/// residual report (`<stem>*`).
+/// residual report (`<stem>*`). The reconciler publishes the accounts into `account`, which
+/// the controller reads too.
 ///
 /// Cancelling `stop` takes the same bounded drain as an internal safety halt.
 pub async fn run(
@@ -87,6 +88,7 @@ pub async fn run(
     stem: PathBuf,
     pause: Arc<AtomicBool>,
     rights: Option<super::strategy::Rights>,
+    account: AccountState,
     stop: CancellationToken,
 ) -> Result<()> {
     if markets.is_empty() {
@@ -221,8 +223,7 @@ pub async fn run(
         None
     };
 
-    // --- cold plane: account state + journal ---
-    let account = AccountState::default();
+    // --- cold plane: journal ---
     let (journal, jrx) = Journal::channel();
     // Stem `runs/bot-HYPE` → journal `runs/bot-HYPE-journal.jsonl`.
     let journal_path = crate::live_report::inferred_journal_path(&stem);
@@ -598,7 +599,7 @@ async fn setup_live_planes(
     // writes (worker), reads (reconciler), listenKey+WS (user stream).
     let worker_aster = new_aster()?;
     let worker_hl = hedge.clone();
-    let recon = Reconciler::new(new_aster()?, hedge.clone(), specs, cfg.live.max_book_staleness_ms);
+    let recon = Reconciler::new(new_aster()?, hedge.clone(), specs, cfg.live.max_book_staleness_ms).without_hedge_orders();
     // A second reconciler instance reserved for SHUTDOWN verification (cheap: a reqwest client +
     // the shared signer Arc). The main one is consumed by its cold loop task and dies with the
     // shutdown token; this one performs the post-drain cancel-confirmation + residual sweep.

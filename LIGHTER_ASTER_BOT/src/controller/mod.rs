@@ -390,7 +390,7 @@ mod tests {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let market = std::sync::Arc::new(crate::dryrun::tests::World::start().await);
         let dir = crate::dryrun::tests::temp_dir("dry-run-e2e");
-        // The shipped 15 s poll: both engines' status reads share Lighter's 60 requests/min.
+        // The shipped 15 s poll and request budget: Lighter answers 429 past 60 requests/min.
         let mut cfg = crate::dryrun::tests::shipped_config(&market, &dir);
         // The taker's warm-up and history gates would need minutes of market data.
         let arb = &mut cfg.taker.arb;
@@ -447,8 +447,17 @@ mod tests {
         let k = kinds();
         let (yielded, returned, resumed) = (position(&k, "yield").unwrap(), position(&k, "rights_returned").unwrap(), position(&k, "resumed").unwrap());
         assert!(yielded < returned && returned < resumed && !k[yielded..resumed].iter().any(|x| x == "accepted"), "{k:?}");
+        // After its first start-up read, the controller reads XEMM's own snapshot, which has
+        // no resting Lighter orders, instead of the venues.
+        let state = dir.join("dry-run").join("bot-HYPE.state.json");
+        let from_snapshot = || std::fs::read_to_string(&state).ok().and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .is_some_and(|state| state["accounts"]["xemm"]["lighter_open_orders"].is_null() && state["accounts"]["xemm"]["total_equity_usd"].is_string());
+        wait_for("a status from XEMM's snapshot", &|| vec![from_snapshot().to_string()], |k| k[0] == "true").await;
         stop.cancel();
         tokio::time::timeout(Duration::from_secs(60), bot).await.expect("the drain hung").unwrap().expect("a clean stop");
+        let diag = std::fs::read_to_string(dir.join("dry-run").join("sim-HYPE.diag.jsonl")).unwrap();
+        let lighter: Vec<Value> = diag.lines().map(|line| serde_json::from_str::<Value>(line).unwrap()["lighter"].clone()).collect();
+        assert!(lighter.iter().all(|w| w["rejects"].get("RateLimited").is_none()), "Lighter answered 429: {lighter:?}");
         // The final save keeps the hedged pair for the next start.
         let state = std::fs::read_to_string(dir.join("dry-run").join("sim-HYPE.state.json")).unwrap();
         let state: serde_json::Value = serde_json::from_str(&state).unwrap();

@@ -175,6 +175,8 @@ pub struct Reconciler {
     /// Throttle for the "uPnL unmarked" warn (mono ns of the last emit).
     last_upnl_warn_ns: std::sync::atomic::AtomicI64,
     maker_query_cursor: std::sync::atomic::AtomicUsize,
+    /// Read the resting Lighter orders (see `without_hedge_orders`).
+    hedge_orders: bool,
 }
 
 impl Reconciler {
@@ -193,7 +195,15 @@ impl Reconciler {
             mark_max_age_ms,
             last_upnl_warn_ns: std::sync::atomic::AtomicI64::new(0),
             maker_query_cursor: std::sync::atomic::AtomicUsize::new(0),
+            hedge_orders: true,
         }
+    }
+
+    /// For the engine's 2 s loop: nothing it drives reads resting Lighter orders (XEMM only
+    /// sends IOCs there), and the read cost half of Lighter's 60 requests/min.
+    pub fn without_hedge_orders(mut self) -> Self {
+        self.hedge_orders = false;
+        self
     }
 
     /// Fresh Lighter mark for `market`: the exchange's WS book cache if within
@@ -241,7 +251,7 @@ impl Reconciler {
             self.aster.position_risk(),
             self.aster_open_orders(),
             self.hl.clearinghouse_state(),
-            self.hl.open_orders_info(),
+            async { if self.hedge_orders { self.hl.open_orders_info().await } else { Ok(Vec::new()) } },
             self.aster.account_available_balance(),
         );
         let (bal, pos, oo, ch, hloo, aster_available_usd) = (bal?, pos?, oo?, ch?, hloo?, available?);

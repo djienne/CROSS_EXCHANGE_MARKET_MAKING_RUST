@@ -1,7 +1,8 @@
 //! The supervisor loop: runs both engine tasks for the whole session and halts fail-closed.
 //! * at start: both venues verified clear, then XEMM and the taker spawned once;
 //! * every 250 ms: an engine that exited halts the bot;
-//! * every `poll_sec` (`tick`): poll the statuses, update the loss stops and the network pause.
+//! * every `poll_sec` (`tick`): read the accounts' status, update the loss stops and the
+//!   network pause.
 //!
 //! Execution rights move between the engines without the supervisor, through the two watch
 //! channels of [`EngineIo`]: XEMM quotes until the taker asks for the rights (an arbitrage
@@ -20,7 +21,6 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
-use rust_decimal_macros::dec;
 use serde_json::{json, Value};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -35,7 +35,7 @@ use crate::taker::pnl::write_json_atomic;
 
 const FAST_POLL: Duration = Duration::from_millis(250);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(25);
-/// Consecutive ticks without both statuses before the network pause.
+/// Consecutive ticks without a status before the network pause.
 const MAX_STATUS_FAILURES: u32 = 3;
 /// Consecutive good status ticks (4 x poll_sec, ~60 s) before a network pause lifts: a
 /// flapping network must not resume two-leg trades that a drop can leave half-filled.
@@ -45,9 +45,8 @@ const STABLE_TICKS: u32 = 4;
 const STARTUP_ORDERS_CLEAR_TIMEOUT: Duration = Duration::from_secs(15);
 /// Above XEMM's worst-case bounded drain (~190 s: 5 quiesce + 4x2 sends + 70 + 65 + 30 verify
 /// + 5 journal + 5 trip retry). Compose's stop_grace_period (460 s) covers a status tick in
-/// progress (2 x STATUS_TIMEOUT) plus this for XEMM and again for the taker.
+/// progress (STATUS_TIMEOUT) plus this for XEMM and again for the taker.
 const ENGINE_STOP_TIMEOUT: Duration = Duration::from_secs(200);
-const DIVERGENCE_EVENT_INTERVAL_SEC: i64 = 1800;
 
 /// Bot labels kept from the two-process era: persisted state and reports use them.
 pub const TAKER_BOT: &str = "LIGHTER_ASTER_TAKER_ARB";
@@ -83,8 +82,8 @@ pub struct EngineIo {
 /// What the supervisor drives: the real engines in production, fakes in tests.
 pub trait Engines {
     fn spawn(&mut self, bot: Bot, io: &EngineIo, stop: CancellationToken) -> JoinHandle<Result<()>>;
-    /// The engine's status report as JSON (`taker::status` / `livebot::status`).
-    fn status(&self, bot: Bot) -> impl Future<Output = Result<Value>>;
+    /// The status of the accounts both engines trade, as JSON (`livebot::status`).
+    fn status(&self) -> impl Future<Output = Result<Value>>;
 }
 
 /// Controller files: `bot-<M>.*`. The XEMM stem `bot-<M>` names XEMM's own journal, trip latch
@@ -159,8 +158,6 @@ pub struct Supervisor<E: Engines> {
     equity: EquityTracker,
     trades: RealizedTrades,
     equity_failures: u32,
-    equity_source: Option<&'static str>,
-    last_divergence_at: Option<DateTime<Utc>>,
     halted: Option<&'static str>,
     shutdown: bool,
     stop: CancellationToken,
@@ -204,8 +201,6 @@ impl<E: Engines> Supervisor<E> {
             equity,
             trades,
             equity_failures: 0,
-            equity_source: None,
-            last_divergence_at: None,
             halted: None,
             shutdown: false,
             stop,
@@ -264,8 +259,7 @@ impl<E: Engines> Supervisor<E> {
     }
 
     async fn tick(&mut self) {
-        let (taker, xemm) = (self.read_status(Bot::Taker).await, self.read_status(Bot::Xemm).await);
-        if taker.is_none() || xemm.is_none() {
+        let Some(status) = self.read_status().await else {
             // Unreadable status is almost always the network: halting cannot drain or cancel
             // without it either, so pause new exposure and wait for it to come back.
             self.status_failures += 1;
@@ -277,10 +271,10 @@ impl<E: Engines> Supervisor<E> {
                 self.events.emit("network_pause", json!({"consecutive_failures": self.status_failures}));
             }
             return;
-        }
+        };
         self.status_failures = 0;
         self.trades.poll(&mut self.events);
-        let sample = self.record_equity(taker.as_ref(), xemm.as_ref());
+        let sample = self.record_equity(&status);
         if let Some(reason) = self.equity.breach().or_else(|| self.trades.breach(self.cfg.max_loss_usdc)) {
             return self.safe_halt("pnl_breaker", json!({"breaker_reason": reason, "pnl_sample": sample})).await;
         }
@@ -292,32 +286,27 @@ impl<E: Engines> Supervisor<E> {
                 self.events.emit("network_resume", json!({"paused_secs": (Utc::now() - since).num_seconds()}));
             }
         }
-        self.write_state(taker.as_ref(), xemm.as_ref(), Value::Null);
+        self.write_state(Some(&status), Value::Null);
     }
 
-    async fn read_status(&mut self, bot: Bot) -> Option<Value> {
-        let failure = match tokio::time::timeout(STATUS_TIMEOUT, self.engines.status(bot)).await {
-            Ok(Ok(mut status)) if status.get("market").and_then(Value::as_str) == Some(self.market.as_str()) => {
-                if let Some(map) = status.as_object_mut() {
-                    map.entry("bot").or_insert_with(|| json!(bot.label()));
-                }
-                return Some(status);
-            }
+    async fn read_status(&mut self) -> Option<Value> {
+        let failure = match tokio::time::timeout(STATUS_TIMEOUT, self.engines.status()).await {
+            Ok(Ok(status)) if status.get("market").and_then(Value::as_str) == Some(self.market.as_str()) => return Some(status),
             Ok(Ok(status)) => json!({"error": "status for another market", "market": status.get("market")}),
             Ok(Err(error)) => json!({"error": format!("{error:#}")}),
             Err(_) => json!({"error": "timeout"}),
         };
-        self.events.emit("status_read_failed", json!({"bot": bot.label(), "failure": failure}));
+        self.events.emit("status_read_failed", json!({"failure": failure}));
         None
     }
 
-    /// Polls XEMM's status until both venues show no open order for the market, at least
+    /// Polls the status until both venues show no open order for the market, at least
     /// once. Fail-closed: anything unreadable counts as not clear.
     async fn verify_orders_clear(&mut self, deadline: Duration) -> std::result::Result<(), Value> {
         let until = Instant::now() + deadline;
         let mut last = Value::Null;
         loop {
-            if let Some(status) = self.read_status(Bot::Xemm).await {
+            if let Some(status) = self.read_status().await {
                 let count = |venue: &str| status.pointer(&format!("/accounts/{venue}_open_orders")).and_then(Value::as_u64);
                 if count("aster") == Some(0) && count("lighter") == Some(0) {
                     return Ok(());
@@ -333,23 +322,8 @@ impl<E: Engines> Supervisor<E> {
 
     /// The drawdown stop samples the taker's marked equity when its status has one, else
     /// XEMM's, so one definition holds unless the taker status is unavailable.
-    fn record_equity(&mut self, taker: Option<&Value>, xemm: Option<&Value>) -> Value {
-        let now = Utc::now();
-        let equity_of = |status: Option<&Value>| status.and_then(|s| py_decimal(s.pointer("/accounts/total_equity_usd")));
-        let (taker_equity, xemm_equity) = (equity_of(taker), equity_of(xemm));
-        if let (Some(t), Some(x)) = (taker_equity, xemm_equity) {
-            let due = self.last_divergence_at.is_none_or(|at| (now - at).num_seconds() >= DIVERGENCE_EVENT_INTERVAL_SEC);
-            if (t - x).abs() >= self.cfg.max_loss_usdc * dec!(0.2) && due {
-                self.events.emit("equity_calc_divergence", json!({"taker_equity_usd": t, "xemm_equity_usd": x}));
-                self.last_divergence_at = Some(now);
-            }
-        }
-        let source = match (taker_equity, xemm_equity) {
-            (Some(equity), _) => Some((TAKER_BOT, equity, taker)),
-            (None, Some(equity)) => Some((XEMM_BOT, equity, xemm)),
-            (None, None) => None,
-        };
-        let Some((label, equity, status)) = source else {
+    fn record_equity(&mut self, status: &Value) -> Value {
+        let Some(equity) = py_decimal(status.pointer("/accounts/total_equity_usd")) else {
             self.equity_failures += 1;
             if self.equity_failures == 3 {
                 self.events.emit("equity_feed_starving", json!({"consecutive_failures": self.equity_failures}));
@@ -357,12 +331,8 @@ impl<E: Engines> Supervisor<E> {
             return Value::Null;
         };
         self.equity_failures = 0;
-        if let Some(previous) = self.equity_source.filter(|previous| *previous != label) {
-            self.events.emit("pnl_source_switched", json!({"from_bot": previous, "to_bot": label}));
-        }
-        self.equity_source = Some(label);
-        let accounts = status.and_then(|s| s.get("accounts")).cloned().unwrap_or(Value::Null);
-        self.equity.record(equity, label, &accounts, now, &mut self.events)
+        let accounts = status.get("accounts").cloned().unwrap_or(Value::Null);
+        self.equity.record(equity, XEMM_BOT, &accounts, Utc::now(), &mut self.events)
     }
 
     /// Stops XEMM, then the taker; the first failure is returned once both were tried.
@@ -404,21 +374,21 @@ impl<E: Engines> Supervisor<E> {
         if let Err(error) = write_json_atomic(&self.files.breaker, &breaker, true) {
             self.events.emit("breaker_file_write_failed", json!({"path": self.files.breaker.display().to_string(), "error": format!("{error:#}")}));
         }
-        self.write_state(None, None, json!({"reason": reason, "details": details}));
+        self.write_state(None, json!({"reason": reason, "details": details}));
     }
 
     /// `bot-<M>.state.json`: read by combined_pnl.py (and trade_history.py through it) and
-    /// bot_stats.py (`rights`, `accounts.{taker,xemm}.total_equity_usd`, `pnl`) and by
-    /// operators. `halt` is set once a safe halt latched.
-    fn write_state(&mut self, taker: Option<&Value>, xemm: Option<&Value>, halt: Value) {
-        let field = |status: Option<&Value>, key: &str| status.and_then(|s| s.get(key)).cloned().unwrap_or(Value::Null);
+    /// bot_stats.py (`rights`, `accounts.xemm.total_equity_usd`, `pnl`) and by operators.
+    /// `halt` is set once a safe halt latched.
+    fn write_state(&mut self, status: Option<&Value>, halt: Value) {
+        let field = |key: &str| status.and_then(|s| s.get(key)).cloned().unwrap_or(Value::Null);
         let state = json!({
             "timestamp": iso(Utc::now()), "market": self.market, "run_mode": self.run_mode.as_str(),
             "rights": self.rights(), "halt": halt,
             "pnl": self.equity.summary(),
             "trades": self.trades.summary(),
-            "positions": {"taker": field(taker, "positions"), "xemm": field(xemm, "positions")},
-            "accounts": {"taker": field(taker, "accounts"), "xemm": field(xemm, "accounts")},
+            "positions": {"xemm": field("positions")},
+            "accounts": {"xemm": field("accounts")},
         });
         if let Err(error) = write_json_atomic(&self.files.state, &state, false) {
             self.events.emit("state_write_failed", json!({"error": format!("{error:#}")}));
@@ -434,7 +404,7 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct Shared {
-        statuses: Arc<Mutex<Vec<(Bot, Value)>>>,
+        status: Arc<Mutex<Option<Value>>>,
         /// Engine stops, in order.
         stopped: Arc<Mutex<Vec<Bot>>>,
     }
@@ -458,9 +428,8 @@ mod tests {
             })
         }
 
-        async fn status(&self, bot: Bot) -> Result<Value> {
-            let statuses = self.shared.statuses.lock().unwrap();
-            statuses.iter().find(|(b, _)| *b == bot).map(|(_, s)| s.clone()).ok_or_else(|| anyhow!("{} status unavailable", bot.label()))
+        async fn status(&self) -> Result<Value> {
+            self.shared.status.lock().unwrap().clone().ok_or_else(|| anyhow!("status unavailable"))
         }
     }
 
@@ -474,15 +443,15 @@ mod tests {
         (sup, shared, dir)
     }
 
-    fn set_statuses(shared: &Shared) {
+    fn set_status(shared: &Shared) {
         let status = json!({"market": "HYPE", "accounts": {"aster_open_orders": 0, "lighter_open_orders": 0, "total_equity_usd": "200"}});
-        *shared.statuses.lock().unwrap() = vec![(Bot::Xemm, status.clone()), (Bot::Taker, status)];
+        *shared.status.lock().unwrap() = Some(status);
     }
 
     #[tokio::test(start_paused = true)]
     async fn an_engine_exit_halts_and_stops_xemm_before_the_taker() {
         let (sup, shared, dir) = supervisor(true);
-        set_statuses(&shared);
+        set_status(&shared);
         let error = sup.run().await.expect_err("an engine exit is a halt");
         assert!(format!("{error:#}").contains("engine_exited"), "{error:#}");
         assert_eq!(*shared.stopped.lock().unwrap(), [Bot::Xemm]);
@@ -490,7 +459,7 @@ mod tests {
 
         // A clean stop drains XEMM first, then the taker.
         let (sup, shared, clean) = supervisor(false);
-        set_statuses(&shared);
+        set_status(&shared);
         let stop = sup.stop.clone();
         let running = tokio::spawn(sup.run());
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -510,13 +479,13 @@ mod tests {
             sup.tick().await;
         }
         assert!(sup.halted.is_none() && paused.load(Ordering::Acquire), "an outage pauses, never halts");
-        set_statuses(&shared);
+        set_status(&shared);
         for _ in 0..STABLE_TICKS - 1 {
             sup.tick().await;
         }
-        shared.statuses.lock().unwrap().pop();
+        shared.status.lock().unwrap().take();
         sup.tick().await; // a drop inside the window restarts it
-        set_statuses(&shared);
+        set_status(&shared);
         for _ in 0..STABLE_TICKS - 1 {
             sup.tick().await;
             assert!(paused.load(Ordering::Acquire), "still inside the stability window");

@@ -28,7 +28,10 @@ One regime at a time, like Hummingbot's XEMM with the taker's arbitrage in betwe
 Both engines run for the whole session; one that exits halts the bot. XEMM's journal records
 each hand-over (`yield`, `yield_withdrawn`, `rights_returned`, `resumed`), and `bot_stats.py`
 summarizes them. The `[controller]` table of `bot.toml` holds the status poll and the
-cross-engine loss stop.
+cross-engine loss stop. The controller reads the accounts from XEMM's own snapshot, which XEMM
+refreshes every 2 s; it reads the venues only at start-up. Lighter Standard allows 60 REST
+requests a minute per IP, and the whole process sends about 46 when idle: XEMM's account read
+30, the taker's account refresh 8, and the two book checks 8.
 
 ## Build, secrets, configuration
 
@@ -73,7 +76,7 @@ Stop with Ctrl-C, SIGINT, SIGTERM or SIGHUP (`tmux send-keys -t lighter_aster_bo
 `docker kill --signal=SIGINT bot-hype`). XEMM drains first, then the taker.
 XEMM quiesces admission, cancels makers, drains fills and execution outcomes, corrects net
 residuals, reconciles and flushes persistence; this can take up to ~190 s per engine, after
-any status poll in progress (up to 50 s). Never stop it with a shorter kill: `docker stop`
+any status poll in progress (up to 25 s). Never stop it with a shorter kill: `docker stop`
 needs `-t 460`, and compose already sets `stop_grace_period: 460s`. Paired positions stay
 open and delta-neutral. Exit 0 means a clean stop; nonzero means a halt, an unresolved engine
 stop or an unwritable event log. A panic outside XEMM's strategy thread aborts the process at
@@ -263,8 +266,9 @@ the simulated venues' `sim-<M>.state.json` and `sim-<M>.diag.jsonl`.
 An engine that fails its drain or does not stop within 200 s makes the exit nonzero
 (`bot_stopped` carries the error).
 
-**Network outage.** Three unreadable required statuses in a row (45 s) are treated as a lost
-network, not a halt: the bot emits `network_pause`, and no engine opens new exposure (no
+**Network outage.** Three unreadable statuses in a row (45 s) are treated as a lost network
+(a status is unreadable while XEMM's account snapshot is older than `poll_sec`), not a halt:
+the bot emits `network_pause`, and no engine opens new exposure (no
 taker entry, XEMM quotes pulled). In-flight executions, hedges, corrections and the Aster
 deadman carry on, and the taker asks for no rights. The loss
 stops still run on every readable status. After 4 readable statuses in a row (about 60 s,

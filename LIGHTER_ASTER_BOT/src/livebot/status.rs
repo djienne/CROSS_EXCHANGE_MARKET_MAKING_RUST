@@ -112,6 +112,10 @@ struct PositionSnapshot {
 }
 
 impl PositionSnapshot {
+    fn of(snapshot: &AccountSnapshot, market: &MarketId) -> Self {
+        Self { aster_qty: snapshot.reported_position(Venue::Aster, market), lighter_qty: snapshot.reported_position(Venue::Hedge, market) }
+    }
+
     fn net_qty(self) -> Decimal {
         self.aster_qty + self.lighter_qty
     }
@@ -177,6 +181,16 @@ impl StatusPoller {
         );
         Ok(build_report(&self.cfg, &self.spec, snapshot, &aster_book?, &lighter_book?))
     }
+
+    /// The positions and accounts of `report` from a running engine's own snapshot, with no
+    /// venue read. That snapshot has no resting Lighter orders (`without_hedge_orders`).
+    pub fn from_snapshot(&self, snapshot: &AccountSnapshot) -> serde_json::Value {
+        let market = &self.spec.market_id;
+        let positions = position_status(&self.cfg, None, PositionSnapshot::of(snapshot, market));
+        let mut report = serde_json::json!({"market": market.0, "positions": positions, "accounts": account_status(snapshot, market)});
+        report["accounts"]["lighter_open_orders"] = serde_json::Value::Null;
+        report
+    }
 }
 
 pub(super) fn build_aster(cfg: &Config, specs: &[MarketSpec], creds: AsterCreds) -> Result<AsterRest> {
@@ -203,10 +217,7 @@ fn build_report(
     lighter_book: &OrderBook,
 ) -> StatusReport {
     let now = Utc::now();
-    let pos = PositionSnapshot {
-        aster_qty: snapshot.reported_position(Venue::Aster, &spec.market_id),
-        lighter_qty: snapshot.reported_position(Venue::Hedge, &spec.market_id),
-    };
+    let pos = PositionSnapshot::of(&snapshot, &spec.market_id);
     let mark = aster_book.mid().or_else(|| lighter_book.mid());
     StatusReport {
         timestamp: now,
