@@ -533,7 +533,15 @@ impl Reconciler {
         for _ in 0..queries.len().min(8) {
             let index = self.maker_query_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % queries.len();
             let query = &queries[index];
-            let Ok(row) = self.aster.query_order(&query.market, &query.client_id).await else { continue };
+            let row = match self.aster.query_order(&query.market, &query.client_id).await {
+                Ok(row) => row,
+                Err(e) => {
+                    if super::exec::aster::unknown_order(&e) {
+                        let _ = events.send(super::exec::command::ExecEvent::MakerOrderMissing { client_id: query.client_id.clone() }).await;
+                    }
+                    continue;
+                }
+            };
             if row.get("clientOrderId").and_then(|v| v.as_str()) != Some(&query.client_id) { continue; }
             let Some(qty) = row.get("executedQty").and_then(|v| v.as_str()).and_then(|v| v.parse::<Decimal>().ok()) else { continue };
             let status = row.get("status").and_then(|v| v.as_str()).unwrap_or("");

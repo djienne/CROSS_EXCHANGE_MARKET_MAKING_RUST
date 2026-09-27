@@ -45,6 +45,11 @@ pub fn definitive_no_fill(error: &anyhow::Error) -> bool {
             && !matches!(c, -1000 | -1001 | -1006 | -1007)))
 }
 
+/// Aster's -2013 "Order does not exist": the order never landed, or is long gone.
+pub fn unknown_order(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<VenueFailure>().is_some_and(|e| e.status < 500 && e.code == Some(-2013))
+}
+
 #[derive(Clone)]
 struct MarketWire {
     scale: MarketScale,
@@ -1386,6 +1391,8 @@ mod tests {
             assert!(err.contains(&code.to_string()), "error must include code {code}: {err}");
             assert!(err.contains(msg), "error must include msg: {err}");
         }
+        let missing = |code: i64| unknown_order(&reject_body_error("/p", &format!(r#"{{"code":{code},"msg":"m"}}"#)).unwrap_err());
+        assert!(missing(-2013) && !missing(-2011));
     }
 
     #[test]

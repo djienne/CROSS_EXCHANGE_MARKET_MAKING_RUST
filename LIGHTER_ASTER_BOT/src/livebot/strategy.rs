@@ -85,6 +85,9 @@ const BREAKER_BASELINE_SAMPLES: usize = 5;
 const BREAKER_TRIP_STREAK: u32 = 3;
 /// Rolling window of the Aster REST command budget (the per-minute cap and its safety reserve).
 const ASTER_CMD_WINDOW_NS: i64 = 60_000_000_000;
+/// Aster refuses a nonce more than 60 s from its clock (v3 docs), plus 10 s for clock skew: a
+/// request signed longer ago than this can no longer land.
+const ASTER_NONCE_EXPIRED_NS: i64 = 70_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AsterCommandPriority {
@@ -712,7 +715,8 @@ pub struct Strategy {
     pending: HashMap<MarketId, PendingInventory>,
     logical_ids: HashMap<MarketId, Cloid>,
     maker_coverage: HashMap<String, MakerCoverage>,
-    uncertain_makers: std::collections::HashSet<String>,
+    /// Makers whose outcome is unknown, since when.
+    uncertain_makers: HashMap<String, i64>,
     rights: Option<Rights>,
     yield_state: Yield,
     correction_needed: std::collections::HashSet<MarketId>,
@@ -872,7 +876,7 @@ impl Strategy {
             pending: HashMap::new(),
             logical_ids: HashMap::new(),
             maker_coverage: HashMap::new(),
-            uncertain_makers: std::collections::HashSet::new(),
+            uncertain_makers: HashMap::new(),
             rights: None,
             yield_state: Yield::Idle,
             correction_needed: std::collections::HashSet::new(),
@@ -2362,7 +2366,7 @@ impl Strategy {
         if !self.orders.is_own_client_id(&fill.client_id) { return; }
         if !self.dedup.observe(&fill) { return; }
         self.revoke_makers();
-        if self.uncertain_makers.contains(&fill.client_id) {
+        if self.uncertain_makers.contains_key(&fill.client_id) {
             if let (Some(ctx), Some(lots)) = (self.ctx.get(&fill.market), self.orders.expected_lots(&fill.client_id)) {
                 if ctx.scale.qty_to_lots(fill.cum_filled_qty) >= lots { self.uncertain_makers.remove(&fill.client_id); }
             }
@@ -2588,7 +2592,7 @@ impl Strategy {
                 }
             }
             ExecEvent::PlaceUnknown { client_id, reason } => {
-                self.uncertain_makers.insert(client_id.clone());
+                self.uncertain_makers.insert(client_id.clone(), now_ns);
                 // The order may be resting. Do NOT close the local slot. Freeze and
                 // sweep/reconcile so account/openOrders becomes the source of truth.
                 warn!("place outcome UNKNOWN (client {client_id}): {reason}; sweeping all bot orders + freezing");
@@ -2601,11 +2605,20 @@ impl Strategy {
             ExecEvent::CancelFilledOrExpired { client_id } => {
                 // Not resting any more, so no sweep. The gate stays closed until the fill (user
                 // stream) or a terminal backfill (`recover_orphans`) accounts for the order.
-                self.uncertain_makers.insert(client_id.clone());
+                self.uncertain_makers.insert(client_id.clone(), now_ns);
                 self.cancel_ack_by_client_id(&client_id);
             }
+            ExecEvent::MakerOrderMissing { client_id } => {
+                // The uncertainty began after the order was signed, so once its nonce has
+                // expired an order Aster has never heard of never landed: nothing filled.
+                let expired = self.uncertain_makers.get(&client_id).is_some_and(|since| now_ns - since > ASTER_NONCE_EXPIRED_NS);
+                if expired && !self.maker_coverage.contains_key(&client_id) {
+                    warn!("maker {client_id} never reached Aster; no longer uncertain");
+                    self.uncertain_makers.remove(&client_id);
+                }
+            }
             ExecEvent::CancelReject { client_id, reason } => {
-                self.uncertain_makers.insert(client_id.clone());
+                self.uncertain_makers.insert(client_id.clone(), now_ns);
                 // The cancel FAILED, so the order may still be resting. Freeze and request a
                 // cancel-all, but do NOT forget local slots until a newer account snapshot proves
                 // no bot-owned Aster orders remain.
@@ -4788,6 +4801,23 @@ lighter_symbol = "BTC"
         strat.handle_maker_order_progress(m.clone(),Side::Buy,client,"17".into(),dec!(0.5),Some(dec!(50)),true,1700000000000,now+5).await;
         let HedgeCommand::Hedge { intent,.. }=hrx.try_recv().unwrap() else {panic!("hedge expected")}; assert_eq!(intent.qty,dec!(0.5));
         assert!(strat.uncertain_makers.is_empty() && !strat.frozen);
+    }
+
+    #[test]
+    fn a_place_aster_never_heard_of_stops_being_uncertain_once_its_nonce_expired() {
+        let account=AccountState::default(); let (etx,_erx)=tokio::sync::mpsc::channel(16); let (htx,_hrx)=tokio::sync::mpsc::channel(16);
+        let mut strat=live_strat(etx,htx,account.clone()); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
+        let client=strat.orders.next_client_id(&m,Side::Buy).unwrap(); strat.orders.on_place_sent(&m,Side::Buy,client.clone(),10000,500,now);
+        strat.handle_exec_event(ExecEvent::PlaceUnknown { client_id: client.clone(), reason: "timeout".into() }, now);
+        strat.handle_exec_event(ExecEvent::MakerOrderMissing { client_id: client.clone() }, now+60_000_000_000);
+        assert!(strat.uncertain_makers.contains_key(&client), "its nonce may still land");
+        let expired=now+ASTER_NONCE_EXPIRED_NS+1;
+        strat.handle_exec_event(ExecEvent::MakerOrderMissing { client_id: client.clone() }, expired);
+        assert!(strat.uncertain_makers.is_empty());
+        for t in [expired+1, expired+3] {
+            account.publish(funded_snapshot(t,dec!(0),dec!(0))); strat.drive_safety_sweep(t+1); strat.recover_orphans(t+1);
+        }
+        assert!(!strat.frozen && strat.orders.live_slots().is_empty(), "XEMM quotes again");
     }
 
     #[tokio::test]

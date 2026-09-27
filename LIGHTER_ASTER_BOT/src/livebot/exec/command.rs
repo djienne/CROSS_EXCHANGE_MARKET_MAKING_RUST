@@ -194,6 +194,8 @@ pub enum ExecEvent {
     /// The cancel found the order FILLED or EXPIRED: it no longer rests, but a fill may not
     /// have reached the strategy yet. The slot closes; the fill is hedged when it arrives.
     CancelFilledOrExpired { client_id: String },
+    /// The reconciler's query found no such order (Aster -2013).
+    MakerOrderMissing { client_id: String },
     MakerOrderProgress { market: MarketId, side: Side, client_id: String, order_id: String,
         cumulative_qty: Decimal, cumulative_quote_usd: Option<Decimal>, terminal: bool, event_time_ms: i64 },
     AttemptStarted { cloid: Cloid, proof: WireProof },
