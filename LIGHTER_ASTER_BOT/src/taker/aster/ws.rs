@@ -296,7 +296,7 @@ impl Merged {
 
 /// `top`'s level, then `depth`'s levels behind it on each side. Those are as old as the last
 /// snapshot (at most ~100 ms while the book moves).
-fn overlay(depth: &OrderBook, top: &OrderBook) -> OrderBook {
+pub(crate) fn overlay(depth: &OrderBook, top: &OrderBook) -> OrderBook {
     let (bid, ask) = (top.bids[0], top.asks[0]);
     let mut book = OrderBook::from_levels(
         std::iter::once(bid).chain(depth.bids.iter().copied().filter(|l| l.px < bid.px)).map(|l| (l.px, l.qty)),

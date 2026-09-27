@@ -172,6 +172,10 @@ pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::config:
                 sig_figs: Some(5),
             };
             let fee = edge.hyperliquid_taker_fee_bps.context("hedging on Hyperliquid needs [maker.edge] hyperliquid_taker_fee_bps")?;
+            ensure!(
+                arb.hyperliquid_taker_fee_bps == Some(fee),
+                "[maker.edge] and [taker.arb] hyperliquid_taker_fee_bps are the same Hyperliquid fee but differ"
+            );
             (Venue::Hyperliquid, asset.coin, filters, fee, meta, None)
         }
     };
@@ -233,7 +237,7 @@ pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::config:
     let taker = &mut cfg.taker.venues;
     (taker.aster_base_url, taker.dry_run) = (aster_url.clone(), true);
     match hedge {
-        Venue::Hyperliquid => cfg.maker.live.hyperliquid.base_url = hedge_url.clone(),
+        Venue::Hyperliquid => (cfg.maker.live.hyperliquid.base_url, cfg.taker.venues.hyperliquid_base_url) = (hedge_url.clone(), hedge_url.clone()),
         _ => (cfg.maker.live.lighter.base_url, cfg.taker.venues.lighter_base_url) = (hedge_url.clone(), hedge_url.clone()),
     }
     cfg.taker.pnl.persist_dir = runs_dir.to_string_lossy().into_owned();

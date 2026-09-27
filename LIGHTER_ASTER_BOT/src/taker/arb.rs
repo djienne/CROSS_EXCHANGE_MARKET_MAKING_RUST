@@ -32,7 +32,7 @@ use tokio::sync::{watch, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn, Level};
 
-use crate::taker::aster::creds::venue_creds;
+use crate::taker::aster::creds::{AsterCreds, HyperliquidCreds, LighterCreds};
 use crate::taker::aster::rest::{
     immediate_fill_from_order_response, order_response_is_terminal, AsterRest,
     SubmitOutcome as AsterOutcome,
@@ -42,15 +42,18 @@ use crate::taker::aster::ws::AsterBookFeed;
 use crate::taker::book::OrderBook;
 use crate::taker::config::{Config, MarketCfg};
 use crate::taker::connectors::{rest_book, rest_specs};
+use crate::config::HedgeVenue;
 use crate::decimal::bps_to_rate;
 use crate::taker::decimal::{common_qty_step, floor_to_step};
 use crate::taker::entry_gate::{OpportunityGate, OpportunityGateInput};
 use crate::taker::markets::MarketSpec;
 use crate::taker::pnl::{format_ts, market_component, ActiveSession, ColdJournal, EconomicStatus, PnlTracker, PnlUpdate, TradeLedgerRow};
 use crate::taker::types::{FeeEvidence, FeeProvenance, FillSummary, MarketId, Side};
+use crate::taker::venues::hyperliquid::HyperliquidVenue;
 use crate::taker::venues::lighter::{
     LighterFillConfirmation, LighterVenue, PendingFill, SubmitOutcome as LighterOutcome,
 };
+use crate::taker::venues::{OtherLeg, TerminalOrders};
 
 static EXECUTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -384,7 +387,7 @@ fn publish_account(tx: &watch::Sender<AccountSnapshot>, snapshot: AccountSnapsho
 
 fn spawn_control_refresher(
     lease_rx: Option<watch::Receiver<Option<ExecutionLease>>>, spec: MarketSpec, cfg: Config, aster: Arc<AsterRest>,
-    lighter: Arc<LighterVenue>, execution_epoch: Arc<AtomicU64>,
+    lighter: Arc<OtherLeg>, execution_epoch: Arc<AtomicU64>,
     account_tx: watch::Sender<AccountSnapshot>, wake: Arc<Notify>, session: ActiveSession,
 ) -> LeaseCache {
     let (tx, rx) = watch::channel(ControlSnapshot {
@@ -811,7 +814,15 @@ impl ExecutionError {
 /// Run the taker engine until `stop` is cancelled, the duration/trade limit is reached or a
 /// safety stop fires. Stopping never interrupts an execution: the loop checks `stop` only
 /// between iterations, then verifies flat orders/positions before clearing the session.
-pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, stop: CancellationToken) -> Result<()> {
+pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, stop: CancellationToken) -> Result<()> {
+    let hedge_venue = markets.first().map(|m| m.hedge_venue).unwrap_or_default();
+    if hedge_venue == HedgeVenue::Hyperliquid {
+        // The second leg pays its own venue's fee. Hyperliquid pushes whole books, so there is
+        // no incremental state for the book sanity check to catch.
+        cfg.arb.lighter_taker_fee_bps = cfg.arb.hyperliquid_taker_fee_bps
+            .context("a market hedged on Hyperliquid needs [taker.arb] hyperliquid_taker_fee_bps")?;
+        cfg.arb.book_sanity.enabled = false;
+    }
     if !cfg.live.enabled || !cfg.live.mode.eq_ignore_ascii_case("live") {
         bail!("refusing to run: set [live] enabled = true and mode = \"live\"");
     }
@@ -826,6 +837,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, stop
         &markets,
         &cfg.venues.aster_base_url,
         &cfg.venues.lighter_base_url,
+        Some(&cfg.venues.hyperliquid_base_url),
     )
     .await?;
     let spec = specs.first().context("no resolved market spec")?.clone();
@@ -905,7 +917,8 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, stop
         info!("entry gate disabled");
     }
 
-    let (acreds, lcreds) = venue_creds(cfg.venues.dry_run)?;
+    let dry = cfg.venues.dry_run;
+    let acreds = if dry { AsterCreds::dry_run() } else { AsterCreds::from_env()? };
     let aster_account_id = acreds.user.clone();
     let aster_signer: Arc<dyn AsterSigner> =
         Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);
@@ -914,19 +927,21 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, stop
         aster_signer,
         &specs,
     )?);
-    let lighter = Arc::new(
-        LighterVenue::new(
-            &cfg.venues.lighter_base_url,
-            Path::new(&cfg.venues.signers_dir),
-            lcreds,
-            &specs,
-        )
-        .await?,
-    );
+    let lighter = Arc::new(match hedge_venue {
+        HedgeVenue::Lighter => {
+            let lcreds = if dry { LighterCreds::dry_run() } else { LighterCreds::from_env()? };
+            OtherLeg::Lighter(LighterVenue::new(&cfg.venues.lighter_base_url, Path::new(&cfg.venues.signers_dir), lcreds, &specs).await?)
+        }
+        HedgeVenue::Hyperliquid => {
+            let hcreds = if dry { HyperliquidCreds::dry_run() } else { HyperliquidCreds::from_env()? };
+            OtherLeg::Hyperliquid(HyperliquidVenue::new(&cfg.venues.hyperliquid_base_url, hcreds, &spec).await?)
+        }
+    });
     let session = ActiveSession::new(crate::taker::pnl::session_path(&cfg.pnl, &spec.market_id), serde_json::json!({
         "schema_version": 2, "session_id": next_execution_id(), "process_id": std::process::id(), "started_at": Utc::now(), "status": "active",
         "market": spec.market_id.to_string(), "aster_account": aster_account_id,
-        "lighter_account_index": lighter.account_index(), "lighter_market_index": spec.lighter_market_id,
+        "hedge_venue": hedge_venue, "lighter_market_index": spec.lighter_market_id,
+        "lighter_account_index": match &*lighter { OtherLeg::Lighter(l) => Some(l.account_index()), OtherLeg::Hyperliquid(_) => None },
     }));
     let execution_journal = ColdJournal::new(execution_log_path(&cfg, &spec.market_id), true)?;
     let scan_wake = Arc::new(Notify::new());
@@ -940,7 +955,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, stop
     lighter
         .wait_ready(&spec.market_id, Duration::from_secs(20))
         .await?;
-    info!("Lighter websocket state ready: market={}", spec.market_id);
+    info!("{hedge_venue:?} websocket state ready: market={}", spec.market_id);
     let standby_until_lease = options.lease.is_some();
     ensure_clean_start(
         &cfg,
@@ -1192,11 +1207,13 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, stop
         // Throttled fill-matching health log (cold: one Instant compare per iteration).
         if last_fill_stats_log.elapsed() >= Duration::from_secs(60) {
             last_fill_stats_log = tokio::time::Instant::now();
-            let s = lighter.fill_tracker_stats();
-            info!(
-                "lighter fill-tracker stats: registered={} trades_seen={} matched={} unmatched={} duplicates={} timeouts={}",
-                s.registered, s.trades_seen, s.matched_trades, s.unmatched_trades, s.duplicate_trades, s.timeouts
-            );
+            if let OtherLeg::Lighter(l) = &*lighter {
+                let s = l.fill_tracker_stats();
+                info!(
+                    "lighter fill-tracker stats: registered={} trades_seen={} matched={} unmatched={} duplicates={} timeouts={}",
+                    s.registered, s.trades_seen, s.matched_trades, s.unmatched_trades, s.duplicate_trades, s.timeouts
+                );
+            }
         }
 
         let pos = account.position;
@@ -1783,7 +1800,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, stop
 fn fetch_books(
     spec: &MarketSpec,
     aster_books: &AsterBookFeed,
-    lighter: &LighterVenue,
+    lighter: &OtherLeg,
 ) -> Result<(Arc<OrderBook>, Arc<OrderBook>)> {
     let aster = aster_books.order_book_arc()?;
     let lighter_book = lighter.order_book_arc(&spec.market_id)?;
@@ -2432,7 +2449,7 @@ pub(crate) async fn resolve_aster_evidence(
 }
 
 pub(crate) async fn resolve_lighter_evidence(
-    spec: &MarketSpec, lighter: &LighterVenue, outcome: &LighterOutcome,
+    spec: &MarketSpec, lighter: &impl TerminalOrders, outcome: &LighterOutcome,
     mut pending: Option<PendingFill>, side: Side, qty: Decimal, timeout: Duration,
 ) -> LegEvidence {
     let client = match outcome {
@@ -2480,7 +2497,7 @@ pub(crate) async fn resolve_lighter_evidence(
 }
 
 async fn wait_position_evidence(
-    cfg: &Config, spec: &MarketSpec, aster: &AsterRest, lighter: &LighterVenue,
+    cfg: &Config, spec: &MarketSpec, aster: &AsterRest, lighter: &OtherLeg,
     expected: PositionSnapshot, reference: Decimal,
 ) -> Result<PositionSnapshot> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -2498,7 +2515,7 @@ async fn wait_position_evidence(
 }
 
 async fn execute_opportunity(
-    cfg: &Config, spec: &MarketSpec, aster: &AsterRest, lighter: &LighterVenue,
+    cfg: &Config, spec: &MarketSpec, aster: &AsterRest, lighter: &OtherLeg,
     opp: &Opportunity, pre_position: PositionSnapshot, margin_before: MarginSnapshot,
     reduce_only: bool, journal: &ExecutionJournal, session: &ActiveSession,
 ) -> std::result::Result<TradeReport, ExecutionError> {
@@ -2939,7 +2956,7 @@ async fn submit_aster_hedge_retry(
 }
 
 async fn submit_lighter_hedge_retry(
-    spec: &MarketSpec, lighter: &LighterVenue, plan: HedgeRetryPlan,
+    spec: &MarketSpec, lighter: &OtherLeg, plan: HedgeRetryPlan,
     reduce_only: bool, timeout: Duration,
 ) -> (String, Option<FillSummary>, Option<String>, Option<String>, serde_json::Value, Vec<FeeEvidence>) {
     let start = tokio::time::Instant::now();
@@ -2961,7 +2978,7 @@ async fn try_missing_hedge_retry(
     cfg: &Config,
     spec: &MarketSpec,
     aster: &AsterRest,
-    lighter: &LighterVenue,
+    lighter: &OtherLeg,
     opp: &Opportunity,
     pre_position: PositionSnapshot,
     mut current_position: PositionSnapshot,
@@ -3124,7 +3141,7 @@ async fn wait_post_trade_reconciled_for(
     cfg: &Config,
     spec: &MarketSpec,
     aster: &AsterRest,
-    lighter: &LighterVenue,
+    lighter: &OtherLeg,
     opp: &Opportunity,
     timeout: Duration,
 ) -> std::result::Result<(PositionSnapshot, Decimal), ExecutionError> {
@@ -3166,7 +3183,7 @@ async fn wait_post_trade_reconciled_for(
 }
 
 async fn recover_if_needed(
-    cfg: &Config, spec: &MarketSpec, aster: &AsterRest, lighter: &LighterVenue,
+    cfg: &Config, spec: &MarketSpec, aster: &AsterRest, lighter: &OtherLeg,
     http: &reqwest::Client, margin_before: MarginSnapshot, session: &ActiveSession,
     journal: &ExecutionJournal,
 ) -> Result<RecoveryReport> {
@@ -3181,7 +3198,11 @@ async fn recover_if_needed(
             let (position, a_book, l_book) = tokio::join!(
                 reconcile_positions(&spec.market_id, aster, lighter),
                 rest_book::fetch_aster_book(http, &cfg.venues.aster_base_url, &spec.aster_symbol, 20),
-                rest_book::fetch_lighter_book(http, &cfg.venues.lighter_base_url, spec.lighter_market_id, 20),
+                async { match &*lighter {
+                    OtherLeg::Lighter(_) => rest_book::fetch_lighter_book(http, &cfg.venues.lighter_base_url, spec.lighter_market_id, 20).await,
+                    OtherLeg::Hyperliquid(_) => crate::connectors::rest_book::fetch_hyperliquid_book(http, &cfg.venues.hyperliquid_base_url, &spec.lighter_symbol)
+                        .await.map(crate::taker::venues::hyperliquid::taker_book),
+                } },
             );
             let position = position?;
             if baseline.is_none() { baseline = Some(position); }
@@ -3327,7 +3348,7 @@ fn emergency_close_bound(mark: Decimal, side: Side, bps: Decimal) -> Decimal {
 async fn reconcile_positions(
     market: &MarketId,
     aster: &AsterRest,
-    lighter: &LighterVenue,
+    lighter: &OtherLeg,
 ) -> Result<PositionSnapshot> {
     let (a, l) = tokio::join!(
         aster.position_qty(market),
@@ -3342,7 +3363,7 @@ async fn reconcile_positions(
 async fn refresh_account_snapshot(
     market: &MarketId,
     aster: &AsterRest,
-    lighter: &LighterVenue,
+    lighter: &OtherLeg,
     execution_epoch: &AtomicU64,
 ) -> Result<AccountSnapshot> {
     let epoch = execution_epoch.load(Ordering::Acquire);
@@ -3387,7 +3408,7 @@ fn spawn_account_snapshot_refresher(
     cfg: &Config,
     market: MarketId,
     aster: Arc<AsterRest>,
-    lighter: Arc<LighterVenue>,
+    lighter: Arc<OtherLeg>,
     tx: watch::Sender<AccountSnapshot>,
     execution_epoch: Arc<AtomicU64>,
     refresh_now: Arc<Notify>,
@@ -3459,7 +3480,7 @@ fn is_rate_limit_error(error: &anyhow::Error) -> bool {
     })
 }
 
-async fn reconcile_margins(aster: &AsterRest, lighter: &LighterVenue) -> Result<MarginSnapshot> {
+async fn reconcile_margins(aster: &AsterRest, lighter: &OtherLeg) -> Result<MarginSnapshot> {
     // Same endpoints as the available-only reads (Aster /fapi/v3/balance, Lighter
     // account payload), so carrying equity costs no extra REST calls.
     let (a, l) = tokio::join!(aster.balance_snapshot(), lighter.rest_margin_snapshot());
@@ -3477,7 +3498,7 @@ async fn ensure_clean_start(
     spec: &MarketSpec,
     aster_books: &AsterBookFeed,
     aster: &AsterRest,
-    lighter: &LighterVenue,
+    lighter: &OtherLeg,
     observe_only: bool,
 ) -> Result<()> {
     let pos = reconcile_positions(&spec.market_id, aster, lighter).await?;

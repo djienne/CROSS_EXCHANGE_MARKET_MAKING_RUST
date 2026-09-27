@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
+use crate::config::HedgeVenue;
 use crate::taker::config::MarketCfg;
 use crate::taker::decimal::parse_dec;
 use crate::taker::markets::MarketSpec;
@@ -32,14 +33,17 @@ struct SymbolInfo {
     filters: Vec<serde_json::Value>,
 }
 
+/// The markets' specs. A market hedged on Hyperliquid needs `hyperliquid_base_url`: the commands
+/// that trade Lighter only pass none, and are refused it.
 pub async fn build_market_specs(
     markets: &[MarketCfg],
     aster_base_url: &str,
     lighter_base_url: &str,
+    hyperliquid_base_url: Option<&str>,
 ) -> Result<Vec<MarketSpec>> {
     let client = client()?;
     let aster = fetch_aster_exchange_info(&client, aster_base_url).await?;
-    let needs_lighter_rest = markets.iter().any(|m| manual_lighter_meta(m).is_none());
+    let needs_lighter_rest = markets.iter().any(|m| m.hedge_venue == HedgeVenue::Lighter && manual_lighter_meta(m).is_none());
     let lighter = if needs_lighter_rest {
         fetch_lighter_meta(&client, lighter_base_url).await?
     } else {
@@ -53,14 +57,18 @@ pub async fn build_market_specs(
             .get(&symbol)
             .copied()
             .ok_or_else(|| anyhow!("Aster symbol {} not found in exchangeInfo", m.aster_symbol))?;
-        let lm = manual_lighter_meta(m)
-            .or_else(|| lighter.get(&m.lighter_symbol.to_ascii_uppercase()).cloned())
-            .ok_or_else(|| {
-                anyhow!(
-                    "Lighter symbol {} not configured and not found in orderBooks",
-                    m.lighter_symbol
-                )
-            })?;
+        let lm = match (m.hedge_venue, hyperliquid_base_url) {
+            (HedgeVenue::Lighter, _) => manual_lighter_meta(m)
+                .or_else(|| lighter.get(&m.lighter_symbol.to_ascii_uppercase()).cloned())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Lighter symbol {} not configured and not found in orderBooks",
+                        m.lighter_symbol
+                    )
+                })?,
+            (HedgeVenue::Hyperliquid, Some(base)) => hyperliquid_meta(&client, base, &m.lighter_symbol).await?,
+            (HedgeVenue::Hyperliquid, None) => bail!("{} hedges on Hyperliquid, which this command does not trade", m.id()),
+        };
         specs.push(MarketSpec {
             market_id: m.id(),
             aster_symbol: symbol,
@@ -78,6 +86,20 @@ pub async fn build_market_specs(
         });
     }
     Ok(specs)
+}
+
+/// A Hyperliquid coin in the Lighter meta's shape: prices carry at most 6 - szDecimals decimals
+/// (and 5 significant figures, which the client rounds to).
+async fn hyperliquid_meta(client: &reqwest::Client, base_url: &str, coin: &str) -> Result<LighterMarketMeta> {
+    let meta = crate::hyperliquid::client::info(client, base_url, serde_json::json!({"type": "meta"})).await?;
+    let asset = crate::hyperliquid::client::asset_in(&meta, coin)?;
+    Ok(LighterMarketMeta {
+        market_id: asset.index,
+        symbol: asset.coin,
+        size_decimals: asset.sz_decimals,
+        price_decimals: 6u32.saturating_sub(asset.sz_decimals),
+        min_quote_amount: crate::connectors::rest_specs::HYPERLIQUID_MIN_NOTIONAL,
+    })
 }
 
 fn manual_lighter_meta(m: &MarketCfg) -> Option<LighterMarketMeta> {

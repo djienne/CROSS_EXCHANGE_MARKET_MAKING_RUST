@@ -151,6 +151,7 @@ impl StatusPoller {
             &markets,
             &cfg.venues.aster_base_url,
             &cfg.venues.lighter_base_url,
+            None,
         )
         .await?;
         let spec = specs.first().context("no resolved market spec")?.clone();

@@ -15,7 +15,7 @@ mod entry_gate;
 mod markets;
 pub(crate) mod pnl;
 pub(crate) mod status;
-mod types;
+pub(crate) mod types;
 mod venues;
 
 use std::ffi::OsString;

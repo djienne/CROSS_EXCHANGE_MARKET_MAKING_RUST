@@ -96,8 +96,8 @@ impl BotConfig {
         })
     }
 
-    /// Both engines' entry for `market`, which must name the same Aster and Lighter
-    /// instruments.
+    /// Both engines' entry for `market`, which must name the same instruments on the same
+    /// venues.
     pub fn select(&self, market: &str) -> Result<(Vec<crate::taker::config::MarketCfg>, Vec<crate::config::MarketCfg>)> {
         let taker = self.taker.select_markets(Some(market));
         let maker = self.maker.select_markets(Some(market));
@@ -105,10 +105,8 @@ impl BotConfig {
             bail!("market {market} must appear exactly once in both [[taker.markets]] and [[maker.markets]]");
         };
         ensure!(t.id().0 == market && m.id().0 == market, "market ids must be spelled {market} in both engine configs");
-        ensure!(t.aster_symbol.eq_ignore_ascii_case(&m.aster_symbol) && t.lighter_symbol.eq_ignore_ascii_case(&m.hl_coin),
-            "taker and maker configs name different instruments for {market}");
-        ensure!(m.hedge_venue == crate::config::HedgeVenue::Lighter,
-            "{market} hedges on Hyperliquid, and the taker `run` pairs XEMM with has no Hyperliquid leg yet");
+        ensure!(t.aster_symbol.eq_ignore_ascii_case(&m.aster_symbol) && t.lighter_symbol.eq_ignore_ascii_case(&m.hl_coin)
+            && t.hedge_venue == m.hedge_venue, "taker and maker configs name different instruments for {market}");
         ensure!(self.maker.live.enabled, "[maker.live] enabled must be true under `run`");
         ensure!(self.taker.pnl.enabled && self.maker.live.circuit_breaker.enabled,
             "`run` keeps both engines' own loss stops: [taker.pnl] and [maker.live.circuit_breaker] need enabled = true");
@@ -370,6 +368,8 @@ mod tests {
         let (taker, maker) = cfg.select("HYPE").unwrap();
         assert_eq!((taker[0].lighter_market_index, maker[0].aster_symbol.as_str()), (Some(24), "HYPEUSDT"));
         assert!(cfg.select("BNB").is_err(), "BNB has no taker entry");
+        let (taker, maker) = cfg.select("HYPE-HL").unwrap();
+        assert!(taker[0].hedge_venue == maker[0].hedge_venue && maker[0].hedge_venue == crate::config::HedgeVenue::Hyperliquid);
         for (edited, expected) in [
             // XEMM's old `[live] mode` key: the mode is a command-line choice only.
             (shipped.replace("[maker.live]", "[maker.live]\nmode = \"live\""), "live.mode"),
@@ -494,6 +494,56 @@ mod tests {
             .any(|entry| entry.file_name().to_string_lossy().starts_with("active_session_HYPE.json.unclean."));
         assert!(!marker.exists() && archived, "the unclean-session marker is archived");
         fresh.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The same arbitrage with both engines hedging on Hyperliquid: the taker's second leg takes
+    /// the Hyperliquid bid and pays the fee the venue's own fills report.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dry_run_arbitrage_hedges_on_hyperliquid() {
+        use rust_decimal_macros::dec;
+        use std::time::Duration;
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let market = std::sync::Arc::new(crate::dryrun::tests::World::hedged_on(crate::dryrun::matching::Venue::Hyperliquid).await);
+        let dir = crate::dryrun::tests::temp_dir("dry-run-e2e-hl");
+        let mut cfg = crate::dryrun::tests::shipped_config(&market, &dir);
+        let arb = &mut cfg.taker.arb;
+        (arb.startup_warmup_ms, arb.entry_gate.enabled) = (0, false);
+        let fresh = market.keep_fresh();
+        let stop = CancellationToken::new();
+        let bot = tokio::spawn({
+            let (stop, runs) = (stop.clone(), dir.clone());
+            async move { run_with(cfg, &runs, "HYPE-HL", LiveMode::DryRun, false, false, stop).await }
+        });
+        // Aster asks 98 while Hyperliquid bids 99.
+        market.set_aster(dec!(97), dec!(98));
+        let ledger = dir.join("dry-run").join("trades_HYPE-HL.jsonl");
+        let row = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if let Some(line) = std::fs::read_to_string(&ledger).ok().and_then(|text| text.lines().next().map(str::to_string)) {
+                    break serde_json::from_str::<crate::taker::pnl::TradeLedgerRow>(&line).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("no hedged trade within 60 s");
+        let confirmed = crate::taker::pnl::EconomicStatus::Confirmed;
+        assert_eq!((row.economic_status, row.direction.as_str()), (confirmed, "SELL_LIGHTER_BUY_ASTER"), "{row:?}");
+        let hedge = row.lighter_fill;
+        assert_eq!((row.aster_fill.vwap, hedge.vwap, row.aster_fill.qty), (dec!(98), dec!(99), hedge.qty), "{row:?}");
+        let fee = hedge.notional * dec!(0.00045);
+        assert!(hedge.fee_provenance == crate::taker::types::FeeProvenance::Venue && (hedge.fee_usd - fee).abs() < dec!(0.000001), "{row:?}");
+        // Both legs took their tops: the net it expected is the one it made, fees included.
+        assert!(row.final_net_position.is_zero() && (row.expected_net_usd - row.actual_net_usd).abs() < dec!(0.001), "{row:?}");
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(60), bot).await.expect("the drain hung").unwrap().expect("a clean stop");
+        fresh.abort();
+        let state = std::fs::read_to_string(dir.join("dry-run").join("sim-HYPE-HL.state.json")).unwrap();
+        let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+        let qty = |venue: usize, market: &str| state[venue]["account"]["positions"][market]["qty"].as_str().and_then(|q| q.parse::<Decimal>().ok());
+        let (aster, hyperliquid) = (qty(0, "HYPEUSDT").unwrap(), qty(1, "HYPE").unwrap());
+        assert!(aster + hyperliquid == Decimal::ZERO && aster >= dec!(0.13), "{state}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

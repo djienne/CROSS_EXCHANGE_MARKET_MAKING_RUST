@@ -18,7 +18,7 @@ use crate::taker::connectors::rest_book;
 use crate::taker::markets::MarketSpec;
 use crate::taker::pnl::market_component;
 use crate::taker::types::{MarketId, Side};
-use crate::taker::venues::lighter::LighterVenue;
+use crate::taker::venues::OtherLeg;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookSanitySnapshot {
@@ -163,7 +163,7 @@ pub fn start(
     cfg: Config,
     spec: MarketSpec,
     aster_books: AsterBookFeed,
-    lighter: Arc<LighterVenue>,
+    lighter: Arc<OtherLeg>,
     http: reqwest::Client,
 ) -> BookSanityHandle {
     let handle = BookSanityHandle::new(cfg.arb.book_sanity.enabled);
@@ -230,7 +230,7 @@ async fn run_check(
     cfg: &Config,
     spec: &MarketSpec,
     aster_books: &AsterBookFeed,
-    lighter: &LighterVenue,
+    lighter: &OtherLeg,
     http: &reqwest::Client,
     handle: &BookSanityHandle,
 ) -> SanityEvent {

@@ -139,7 +139,7 @@ pub async fn fetch_lighter_meta_from_base(client: &reqwest::Client, base_url: &s
 
 /// Hyperliquid refuses an order worth under $10 at its limit price; the margin covers a sell
 /// IOC priced under the mark.
-const HYPERLIQUID_MIN_NOTIONAL: Decimal = rust_decimal_macros::dec!(10.5);
+pub(crate) const HYPERLIQUID_MIN_NOTIONAL: Decimal = rust_decimal_macros::dec!(10.5);
 
 /// Resolve `MarketSpec`s for the configured markets from the venues' REST base URLs; a hedge
 /// venue is read only if a market hedges there.

@@ -34,7 +34,8 @@ impl Config {
     pub fn from_table(value: toml::Value) -> Result<Self> {
         let cfg: Config = crate::config::strict_from_toml(value)?;
         cfg.validate()?;
-        crate::config::require_mainnet_origins(&cfg.venues.aster_base_url, &cfg.venues.lighter_base_url)?;
+        let venues = &cfg.venues;
+        crate::config::require_mainnet_origins(&venues.aster_base_url, &venues.lighter_base_url, &venues.hyperliquid_base_url)?;
         Ok(cfg)
     }
 
@@ -50,6 +51,7 @@ impl Config {
         }
         if self.arb.aster_taker_fee_bps < Decimal::ZERO
             || self.arb.lighter_taker_fee_bps < Decimal::ZERO
+            || self.arb.hyperliquid_taker_fee_bps.is_some_and(|fee| fee < Decimal::ZERO)
         {
             bail!("taker fees must be non-negative");
         }
@@ -219,6 +221,9 @@ pub struct ArbCfg {
     pub margin_bps: Decimal,
     pub aster_taker_fee_bps: Decimal,
     pub lighter_taker_fee_bps: Decimal,
+    /// The second leg's fee when a market hedges on Hyperliquid; the slippage caps stay Lighter's.
+    #[serde(default)]
+    pub hyperliquid_taker_fee_bps: Option<Decimal>,
     #[serde(default = "default_max_aster_slippage_bps")]
     pub max_aster_slippage_bps: Decimal,
     pub max_lighter_slippage_bps: Decimal,
@@ -252,6 +257,7 @@ impl Default for ArbCfg {
             margin_bps: Decimal::from(2),
             aster_taker_fee_bps: Decimal::from(4),
             lighter_taker_fee_bps: Decimal::ZERO,
+            hyperliquid_taker_fee_bps: None,
             max_aster_slippage_bps: Decimal::from(3),
             max_lighter_slippage_bps: Decimal::from(3),
             emergency_slippage_bps: Decimal::from(25),
@@ -473,6 +479,8 @@ impl Default for LiveCfg {
 pub struct VenueCfg {
     pub aster_base_url: String,
     pub lighter_base_url: String,
+    #[serde(default = "crate::config::default_hyperliquid_base_url")]
+    pub hyperliquid_base_url: String,
     pub signers_dir: String,
     /// Set only by `run --mode dry-run` after pointing the URLs at the simulated venues: the
     /// taker then signs with the dry-run identity. No file can set it.
@@ -485,6 +493,7 @@ impl Default for VenueCfg {
         VenueCfg {
             aster_base_url: crate::config::default_aster_base_url(),
             lighter_base_url: crate::config::default_hl_base_url(),
+            hyperliquid_base_url: crate::config::default_hyperliquid_base_url(),
             signers_dir: "signers".to_string(),
             dry_run: false,
         }
@@ -533,7 +542,10 @@ impl Default for RiskCfg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketCfg {
     pub aster_symbol: String,
+    /// The second leg's coin, on Hyperliquid as on Lighter.
     pub lighter_symbol: String,
+    #[serde(default)]
+    pub hedge_venue: crate::config::HedgeVenue,
     pub market_id: Option<String>,
     pub lighter_market_index: Option<u32>,
     pub lighter_price_decimals: Option<u32>,
@@ -566,6 +578,7 @@ mod tests {
             markets: vec![MarketCfg {
                 aster_symbol: "HYPEUSDT".to_string(),
                 lighter_symbol: "HYPE".to_string(),
+                hedge_venue: Default::default(),
                 market_id: Some("HYPE".to_string()),
                 lighter_market_index: Some(24),
                 lighter_price_decimals: Some(4),

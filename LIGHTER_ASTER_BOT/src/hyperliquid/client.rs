@@ -18,6 +18,8 @@ pub const MAINNET: &str = "https://api.hyperliquid.xyz";
 /// An order's `expiresAfter` past its nonce: a later arrival is refused (and costs five times
 /// the usual rate limit), so a lost reply resolves within this plus the resolver's margin.
 pub const ORDER_TTL_MS: u64 = 5_000;
+/// `userFillsByTime` is read from this far before an order's send, against clock skew.
+pub const FILLS_LOOKBACK_MS: i64 = 5_000;
 
 /// A perp as `meta` lists it; `index` is its asset id in actions.
 #[derive(Debug, Clone)]
@@ -241,6 +243,26 @@ impl Client {
             None => Decimal::ZERO,
         };
         Ok((status, filled))
+    }
+
+    /// The fills of the IOC sent with `cloid` after `since_ms`, once they add up to its filled
+    /// size: `filled` when its reply said, else `orderStatus`'s. `None` while the order is open
+    /// or unknown or its fills are not listed yet; past the order's `expiresAfter`
+    /// (`unknown_is_final`) an unknown order never landed and has no fill.
+    pub async fn ioc_fills(&self, cloid: &str, since_ms: i64, filled: Option<Decimal>, unknown_is_final: bool) -> Option<Vec<Value>> {
+        let filled = match filled {
+            Some(size) => size,
+            None => match self.order_status(cloid).await.ok()? {
+                (status, _) if status == "unknownOid" && unknown_is_final => Decimal::ZERO,
+                (status, _) if status == "unknownOid" || status == "open" => return None,
+                (_, filled) => filled,
+            },
+        };
+        let fills: Vec<Value> = self.fills_since(since_ms).await.ok()?.into_iter()
+            .filter(|f| f["cloid"].as_str().is_some_and(|c| c.eq_ignore_ascii_case(cloid)))
+            .collect();
+        let listed: Decimal = fills.iter().filter_map(|f| dec(&f["sz"]).ok()).sum();
+        (listed >= filled).then_some(fills)
     }
 
     /// The account's fills since `start_ms`, oldest first.

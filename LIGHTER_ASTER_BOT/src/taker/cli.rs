@@ -160,6 +160,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 &selected,
                 &cfg.venues.aster_base_url,
                 &cfg.venues.lighter_base_url,
+                None,
             )
             .await?;
             println!(
@@ -396,7 +397,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Commands::ResolveSession { market } => {
             let selected = cfg.select_markets(market.as_deref());
             anyhow::ensure!(selected.len() == 1, "resolve-session requires one market");
-            let spec = rest_specs::build_market_specs(&selected, &cfg.venues.aster_base_url, &cfg.venues.lighter_base_url)
+            let spec = rest_specs::build_market_specs(&selected, &cfg.venues.aster_base_url, &cfg.venues.lighter_base_url, None)
                 .await?.into_iter().next().context("market specification missing")?;
             let path = crate::taker::pnl::session_path(&cfg.pnl, &spec.market_id);
             let _ownership = crate::taker::pnl::lock_inactive_session(&path)?;
@@ -518,7 +519,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
 /// The resolved spec of the first selected market.
 async fn first_spec(cfg: &Config, market: Option<&str>) -> Result<MarketSpec> {
     let selected = cfg.select_markets(market);
-    rest_specs::build_market_specs(&selected, &cfg.venues.aster_base_url, &cfg.venues.lighter_base_url)
+    rest_specs::build_market_specs(&selected, &cfg.venues.aster_base_url, &cfg.venues.lighter_base_url, None)
         .await?
         .into_iter()
         .next()

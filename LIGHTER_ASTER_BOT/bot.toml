@@ -25,6 +25,8 @@ desired_notional = "13"
 margin_bps = "2.0"
 aster_taker_fee_bps = "4.0"
 lighter_taker_fee_bps = "0.0"
+# A market hedged on Hyperliquid pays this instead (the same fee as [maker.edge]'s).
+hyperliquid_taker_fee_bps = "4.5"
 max_aster_slippage_bps = "30.0"
 max_lighter_slippage_bps = "30.0"
 # Emergency (naked-leg recovery) bound: must be WIDER than the normal bounds — recovery
@@ -99,6 +101,12 @@ lighter_market_index = 24
 lighter_size_decimals = 2
 lighter_price_decimals = 4
 lighter_min_notional = "10"
+
+[[taker.markets]]
+market_id = "HYPE-HL"
+aster_symbol = "HYPEUSDT"
+lighter_symbol = "HYPE"
+hedge_venue = "hyperliquid"
 
 [maker.edge]
 # The required quoted edge is 14 + 1.5 + 2 + 1 = 18.5 bps above configured

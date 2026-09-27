@@ -17,7 +17,7 @@ use super::command::{ExecEvent, ExecutionTrade, HedgeCommand};
 use super::creds::HyperliquidCreds;
 use super::lighter::{HlAssetPosition, HlClearinghouse, HlMarginSummary, HlOpenOrder, HlPosition};
 use crate::hotpath::clock::mono_now_ns;
-use crate::hyperliquid::client::{asset_in, dec, Asset, Client, Placed, Tif, ORDER_TTL_MS};
+use crate::hyperliquid::client::{asset_in, dec, Asset, Client, Placed, Tif, FILLS_LOOKBACK_MS, ORDER_TTL_MS};
 use crate::livebot::account::Venue;
 use crate::livebot::fills::{HedgeIntent, IntentPurpose, WireProof};
 use crate::livebot::journal::Journal;
@@ -26,8 +26,6 @@ use crate::types::{MarketId, Side};
 
 /// How long a sent hedge is chased before it is left to the reconciler (as on Lighter).
 const RESOLUTION_BUDGET: Duration = Duration::from_secs(60);
-/// `userFillsByTime` is read from this far before the send, against clock skew.
-const FILLS_LOOKBACK_MS: i64 = 5_000;
 
 pub struct HyperliquidHedge {
     client: Client,
@@ -167,24 +165,10 @@ async fn settle(hl: Arc<HyperliquidHedge>, tx: Sender<ExecEvent>, journal: Journ
     let mut poll = tokio::time::interval(Duration::from_millis(500));
     while started.elapsed() < RESOLUTION_BUDGET {
         poll.tick().await;
-        let filled = match reply {
-            Some((size, ..)) => size,
-            None => match hl.client.order_status(&cloid).await {
-                Ok((status, _)) if status == "unknownOid" && Instant::now() >= unknown_is_final => Decimal::ZERO,
-                Ok((status, filled)) if status != "unknownOid" && status != "open" => filled,
-                _ => continue,
-            },
-        };
-        let Ok(fills) = hl.client.fills_since(since_ms).await else { continue };
-        let trades: Vec<ExecutionTrade> = fills
-            .iter()
-            .filter(|f| f["cloid"].as_str().is_some_and(|c| c.eq_ignore_ascii_case(&cloid)))
-            .filter_map(|f| trade(f, &intent))
-            .collect();
+        let filled = reply.map(|(size, ..)| size);
+        let Some(fills) = hl.client.ioc_fills(&cloid, since_ms, filled, Instant::now() >= unknown_is_final).await else { continue };
+        let trades: Vec<ExecutionTrade> = fills.iter().filter_map(|f| trade(f, &intent)).collect();
         let qty: Decimal = trades.iter().map(|t| t.qty).sum();
-        if qty < filled {
-            continue; // not listed yet
-        }
         let quote: Decimal = trades.iter().map(|t| t.notional_usd).sum();
         let fee: Option<Decimal> = trades.iter().map(|t| t.fee_usd).sum();
         let (oid, time) = (trades.iter().find_map(|t| t.order_id.clone()), trades.iter().filter_map(|t| t.event_time_ms).max());

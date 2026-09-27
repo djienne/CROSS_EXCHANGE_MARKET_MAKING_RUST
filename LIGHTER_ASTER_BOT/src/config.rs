@@ -427,7 +427,7 @@ impl Default for LiveHyperliquidCfg {
     }
 }
 
-fn default_hyperliquid_base_url() -> String {
+pub(crate) fn default_hyperliquid_base_url() -> String {
     crate::hyperliquid::client::MAINNET.to_string()
 }
 
@@ -632,11 +632,12 @@ pub(crate) fn default_hl_base_url() -> String {
 }
 
 /// File-loaded operational configs of both engines perform venue I/O: pin the supported origins.
-pub(crate) fn require_mainnet_origins(aster_base_url: &str, lighter_base_url: &str) -> Result<()> {
+pub(crate) fn require_mainnet_origins(aster_base_url: &str, lighter_base_url: &str, hyperliquid_base_url: &str) -> Result<()> {
     if aster_base_url.trim_end_matches('/') != default_aster_base_url()
         || lighter_base_url.trim_end_matches('/') != default_hl_base_url()
+        || hyperliquid_base_url.trim_end_matches('/') != default_hyperliquid_base_url()
     {
-        bail!("operational venue URLs must use the supported Aster and Lighter mainnet origins");
+        bail!("operational venue URLs must use the supported Aster, Lighter and Hyperliquid mainnet origins");
     }
     Ok(())
 }
@@ -748,10 +749,7 @@ impl Config {
         }
         let cfg: Config = strict_from_toml(value)?;
         cfg.validate()?;
-        require_mainnet_origins(&cfg.live.aster.base_url, &cfg.live.lighter.base_url)?;
-        if cfg.live.hyperliquid.base_url.trim_end_matches('/') != default_hyperliquid_base_url() {
-            bail!("operational venue URLs must use the supported Hyperliquid mainnet origin");
-        }
+        require_mainnet_origins(&cfg.live.aster.base_url, &cfg.live.lighter.base_url, &cfg.live.hyperliquid.base_url)?;
         Ok(cfg)
     }
 
