@@ -5,14 +5,15 @@
 # never baked. The runs/ dir (journals, ledgers, latches, controller state) is a persistent
 # bind mount.
 #
-# `docker compose build` / `up -d` touch only `dryrun`, the same bot against simulated venues
-# (no credentials, files in runs/dry-run/, image lighter_aster_bot:dryrun), and `recorder`, the
+# `docker compose build` / `up -d` touch only `dryrun` and `dryrun-hl`, the same bot against
+# simulated venues (no credentials, files in runs/dry-run/, image lighter_aster_bot:dryrun;
+# `dryrun-hl` trades HYPE-HL, hedged on Hyperliquid), and `recorder`, the
 # market-data tape for backtests (public data only, files in data/). The real-money
 # `bot` service sits behind the `live` profile: only a command naming it builds or starts it,
 # so never set COMPOSE_PROFILES=live here.
 #
 # ---- Dry run (safe unattended; the fleet's start_all.bat starts it) ---------------
-#   docker compose up -d --build dryrun
+#   docker compose up -d --build dryrun dryrun-hl
 #   docker compose logs -f dryrun
 #   docker compose restart dryrun     # after a halt: the restart is the review
 #
@@ -63,7 +64,7 @@ services:
   # The same bot against simulated Aster and Lighter venues fed by live public market data
   # (RUNBOOK.md, "Dry run"). No credentials are mounted, and its dry-run identity signs for
   # no real account.
-  dryrun:
+  dryrun: &dryrun
     build:
       context: .
       dockerfile: Dockerfile
@@ -98,6 +99,18 @@ services:
       options:
         max-size: "20m"
         max-file: "5"
+
+  # The same dry run on HYPE-HL: Aster against a simulated Hyperliquid instead of Lighter.
+  dryrun-hl:
+    <<: *dryrun
+    container_name: lighter-aster-dryrun-hl
+    command: ["run", "--market", "HYPE-HL", "--mode", "dry-run", "--ack-breaker"]
+    # Declared again: cpu_limits.bat keeps each service's own `cpus`.
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
 
   # Records HYPE's raw public Aster and Lighter feeds, the dry run's input (Aster 20-level book,
   # best bid/ask and trades; Lighter book updates, trades and funding), to data/HYPE/ for

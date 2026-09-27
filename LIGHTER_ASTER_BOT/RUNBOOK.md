@@ -52,6 +52,11 @@ cargo build --release --locked        # Rust 1.92; the Lighter signers exist for
   (`[maker.live]`, `[taker.venues]`). The mode is a command-line choice only: in either mode,
   `[taker.live] enabled = true, mode = "live"` and `[maker.live] enabled = true` arm the
   engines.
+- A market's `hedge_venue` (`"lighter"` by default, the same in its `[[taker.markets]]` and
+  `[[maker.markets]]` entries) names the second leg: `HYPE-HL` trades Aster against
+  Hyperliquid. The bot sends Hyperliquid IOCs only, since the venue offers this account no
+  dead-man to cancel a resting order. Live, it reads `hyperliquid.env` ([Probes](#probes)), and
+  the leverage gate wants 1x on both legs: set the Hyperliquid market to 1x cross first.
 
 ## Run and stop
 
@@ -89,7 +94,8 @@ on contention. A dry run locks `runs/dry-run/bot-<MARKET>.lock`, so it can run b
 ## Dry run
 
 `run --mode dry-run` is the whole bot, both engines, the controller and every client and
-signer unchanged, against an in-process simulated Aster and Lighter on loopback. The
+signer unchanged, against an in-process simulated Aster and hedge venue (Lighter, or
+Hyperliquid for `HYPE-HL`) on loopback. The
 simulator follows the live public market data and answers in each venue's own protocol. It
 needs no credentials: the bot signs with a fixed dry-run identity whose keys exist on no
 venue, so a request that escaped to mainnet could not trade. Its files live in
@@ -113,8 +119,9 @@ The venues respond as seen from AWS Tokyo, and pessimistically where the data ca
   one, before filling them; the book shrinking only shortens the visible queue. A print through
   their price, or a book that crosses them, fills them outright.
 - **Venue rules**: the live filters, reduce-only, the Aster deadman and listen-key expiry,
-  Lighter's sequential nonces, and both venues' rate limits (Lighter Standard: 60 REST
-  requests and 60 transactions a minute).
+  Lighter's sequential nonces, Hyperliquid's five significant figures, and the venues' rate
+  limits (Lighter Standard: 60 REST requests and 60 transactions a minute; Hyperliquid: 1200
+  weight a minute).
 - **Accounts**: one cross account per venue from the `[dry_run]` balances. Fees come from the
   bot's own fee keys, so the dry run cannot catch a wrong one. Funding follows the public
   rates at each venue's funding times. A maintenance-margin breach is reported, not
@@ -123,7 +130,7 @@ The venues respond as seen from AWS Tokyo, and pessimistically where the data ca
 Docker (from this directory; the fleet's `start_all.bat` also starts it):
 
 ```bash
-docker compose up -d --build dryrun
+docker compose up -d --build dryrun dryrun-hl   # HYPE on Lighter, HYPE-HL on Hyperliquid
 docker compose logs -f dryrun
 ```
 
@@ -239,7 +246,7 @@ kinds listed in `src/dryrun/tape.rs`. Read a day with `zstd -dc data/HYPE/<day>T
 | `bot-<M>.state.json` | Who holds the rights, loss stops, positions, accounts; read by `combined_pnl.py` / `trade_history.py` |
 | `bot-<M>.breaker.json` | Controller halt latch |
 | `bot-<M>.baseline.json`, `bot-<M>.equity.jsonl` | Equity-drawdown baseline and samples |
-| `bot-<M>-journal.jsonl` | XEMM execution journal |
+| `bot-<M>-journal.jsonl` | XEMM execution journal (its `"lighter"` venue is the hedge leg, Hyperliquid on `HYPE-HL`) |
 | `bot-<M>.trip.json`, `bot-<M>.active.json` | XEMM loss latch and unclean-session marker |
 | `bot-<M>.residual.json` | Legs XEMM left open at its last stop (a report, not a latch) |
 | `trades_<M>.jsonl`, `executions_<M>.jsonl`, `opportunities_<M>.jsonl` | Taker ledger, execution log and entry-gate history |

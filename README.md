@@ -1,8 +1,8 @@
 # Aster/Lighter Cross-Exchange Market Making and Arbitrage
 
 One Rust binary, `lighter_aster_bot` in `LIGHTER_ASTER_BOT/`, trades one market across Aster
-and Lighter with two engines: a taker–taker arbitrage engine and an XEMM engine that quotes on
-Aster and hedges on Lighter. Its `run` command holds both in one process and enforces a
+and Lighter (or Hyperliquid) with two engines: a taker–taker arbitrage engine and an XEMM
+engine that quotes on Aster and hedges on the other venue. Its `run` command holds both in one process and enforces a
 cross-engine loss stop: XEMM quotes, and when an arbitrage passes the taker's entry gate it
 pulls its quotes and hands the execution rights to the taker until the trade is done. `run --mode dry-run`
 runs the same bot against simulated venues fed by live market data, with no credentials and no
