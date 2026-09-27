@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use tracing::info;
 
 use super::crypto::{address_from_priv, address_hex, keccak256, parse_address, parse_priv_key};
@@ -210,6 +210,49 @@ impl LighterCreds {
     }
 }
 
+/// Hyperliquid credentials from `HYPERLIQUID_ENV_PATH` (default `hyperliquid.env`), keys
+/// `exchange=hyperliquid`, `wallet_address` (the traded subaccount or vault: the `/info` user),
+/// `private_key` (the agent key that signs; its address owns the nonces) and `is_vault` (sign
+/// for `wallet_address` as `vaultAddress`).
+pub struct HyperliquidCreds {
+    pub account: String,
+    pub signer: String,
+    pub vault: Option<[u8; 20]>,
+    pub key: [u8; 32],
+}
+
+impl std::fmt::Debug for HyperliquidCreds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HyperliquidCreds {{ account: {}, signer: {}, vault: {}, key: <redacted> }}", self.account, self.signer, self.vault.is_some())
+    }
+}
+
+impl HyperliquidCreds {
+    pub fn from_env() -> Result<Self> {
+        Self::load(&std::env::var_os("HYPERLIQUID_ENV_PATH").map_or_else(|| PathBuf::from("hyperliquid.env"), PathBuf::from))
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        let m = parse_env_file(path)?;
+        if let Some(extra) = m.keys().find(|k| !["exchange", "wallet_address", "private_key", "is_vault"].contains(&k.as_str())) {
+            bail!("hyperliquid env: unknown key {extra}");
+        }
+        ensure!(required(&m, "exchange")? == "hyperliquid", "hyperliquid env: exchange must be hyperliquid");
+        let key = parse_priv_key(&required(&m, "private_key")?)?;
+        let account = parse_address(&required(&m, "wallet_address")?).context("hyperliquid env wallet_address")?;
+        let vault = match required(&m, "is_vault")?.as_str() {
+            "true" => true,
+            "false" => false,
+            other => bail!("hyperliquid env: is_vault must be true or false, got {other}"),
+        };
+        let signer = address_from_priv(&key)?;
+        ensure!(!vault || signer != account, "hyperliquid env: private_key must be an agent key, not the vault's own");
+        let (account_hex, signer_hex) = (address_hex(&account), address_hex(&signer));
+        info!("hyperliquid credentials: account={account_hex} signer={signer_hex} vault={vault}");
+        Ok(Self { account: account_hex, signer: signer_hex, vault: vault.then_some(account), key })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +281,24 @@ mod tests {
         super::super::sign::EvmAsterSigner::new(aster.user.clone(), aster.signer, aster.key).unwrap();
         assert_eq!(lighter.wallet_address, aster.user);
         assert_eq!((lighter.account_index, lighter.api_key_index), (1_000_000_000, 2));
+    }
+
+    #[test]
+    fn hyperliquid_signs_as_the_agent_for_the_vault_and_hides_its_key() {
+        let p = write_tmp("hl", &format!("exchange=hyperliquid\nwallet_address={USER1}\nprivate_key={KEY1}\nis_vault=true\n"));
+        let c = HyperliquidCreds::load(&p).unwrap();
+        assert_eq!((c.account.as_str(), c.signer.as_str(), c.vault), (USER1, ADDR1, Some([0x11; 20])));
+        assert!(!format!("{c:?}").contains(&KEY1[40..]), "{c:?}");
+        for (body, error) in [
+            (format!("exchange=hyperliquid\nwallet_address={ADDR1}\nprivate_key={KEY1}\nis_vault=true\n"), "agent key"),
+            (format!("exchange=hyperliquid\nwallet_address={USER1}\nprivate_key={KEY1}\nis_vault=yes\n"), "is_vault"),
+            (format!("exchange=hyperliquid\nwallet_address={USER1}\nprivate_key={KEY1}\nis_vault=true\nvault=1\n"), "unknown key"),
+        ] {
+            let p = write_tmp("hl-bad", &body);
+            assert!(format!("{:#}", HyperliquidCreds::load(&p).unwrap_err()).contains(error));
+            std::fs::remove_file(p).ok();
+        }
+        std::fs::remove_file(p).ok();
     }
 
     #[test]

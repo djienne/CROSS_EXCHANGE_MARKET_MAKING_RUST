@@ -16,6 +16,7 @@ pub mod hot_types;
 /// Lock-free real-time substrate (latest-book cells, venue ingest threads, stream watchdog,
 /// REST book cross-check) used by the XEMM engine (`livebot`).
 pub mod hotpath;
+pub mod hyperliquid;
 pub mod inventory;
 pub mod lighter;
 /// The XEMM engine (`run`'s maker) for one market, gated behind `[live] enabled`; a dry run

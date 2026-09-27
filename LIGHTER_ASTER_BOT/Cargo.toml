@@ -47,6 +47,8 @@ core_affinity = "0.8"
 # serialization; fs2 + memmap2 for the cross-process Aster nonce counter.
 k256 = { version = "0.13", features = ["ecdsa"] }
 tiny-keccak = { version = "2", features = ["keccak"] }
+# Hyperliquid signs the MessagePack of each action.
+rmp-serde = "1"
 hex = "0.4"
 fs2 = "0.4"
 memmap2 = "0.9"

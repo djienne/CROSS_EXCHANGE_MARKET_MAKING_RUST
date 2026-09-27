@@ -29,7 +29,7 @@ fn build_aster(cfg: &Config, specs: &[MarketSpec]) -> Result<AsterRest> {
 }
 
 /// Build the live Lighter client for the given specs.
-async fn build_hl(cfg: &Config, specs: &[MarketSpec]) -> Result<LighterExchange> {
+async fn build_lighter(cfg: &Config, specs: &[MarketSpec]) -> Result<LighterExchange> {
     let creds = LighterCreds::from_env()?;
     LighterExchange::new_lighter(
         cfg.live.lighter.base_url.clone(),
@@ -78,13 +78,14 @@ pub async fn run(cfg: &Config, check: &str, target: Option<String>, i_understand
         "aster-open-orders" => probe_aster_open_orders(cfg, &target).await,
         "aster-place-cancel" => probe_aster_place_cancel(cfg, &target).await,
         "leverage" | "live-leverage" => probe_leverage(cfg, &target).await,
-        "lighter-balance" => probe_hl_balance(cfg, &target).await,
+        "lighter-balance" => probe_lighter_balance(cfg, &target).await,
         "lighter-open-orders" => probe_lighter_open_orders(cfg, &target).await,
         "lighter-order-dry-run" => probe_lighter_order_dry_run(cfg, &target).await,
-        "lighter-market" => probe_hl_market(cfg, &target, i_understand_live, max_usd).await,
+        "lighter-market" => probe_lighter_market(cfg, &target, i_understand_live, max_usd).await,
+        "hl-balance" | "hl-place-cancel" | "hl-market" => crate::hyperliquid::probe::run(check, &target, i_understand_live, max_usd).await,
         other => bail!(
             "unknown probe '{other}'. Available: aster-balance, aster-positions, aster-open-orders, \
-             aster-place-cancel, leverage, lighter-balance, lighter-open-orders, lighter-order-dry-run, lighter-market"
+             aster-place-cancel, leverage, lighter-balance, lighter-open-orders, lighter-order-dry-run, lighter-market, hl-balance, hl-place-cancel, hl-market"
         ),
     }
 }
@@ -199,7 +200,7 @@ async fn aster_place_cancel_side(aster: &AsterRest, spec: &MarketSpec, market: &
 async fn probe_leverage(cfg: &Config, target: &str) -> Result<()> {
     let (_m, specs) = resolve(cfg, target).await?;
     let aster = build_aster(cfg, &specs)?;
-    let hl = build_hl(cfg, &specs).await?;
+    let hl = build_lighter(cfg, &specs).await?;
     for spec in &specs {
         let aster_lev = aster.get_leverage(&spec.market_id).await?;
         let lighter_lev = hl.get_leverage(&spec.market_id).await?;
@@ -217,9 +218,9 @@ async fn probe_leverage(cfg: &Config, target: &str) -> Result<()> {
     Ok(())
 }
 
-async fn probe_hl_balance(cfg: &Config, target: &str) -> Result<()> {
+async fn probe_lighter_balance(cfg: &Config, target: &str) -> Result<()> {
     let (_m, specs) = resolve(cfg, target).await?;
-    let hl = build_hl(cfg, &specs).await?;
+    let hl = build_lighter(cfg, &specs).await?;
     let st = hl.clearinghouse_state().await?;
     println!("lighter account value: {} (available {})", st.margin_summary.account_value, st.withdrawable);
     for p in &st.asset_positions {
@@ -232,7 +233,7 @@ async fn probe_hl_balance(cfg: &Config, target: &str) -> Result<()> {
 
 async fn probe_lighter_open_orders(cfg: &Config, target: &str) -> Result<()> {
     let (_m, specs) = resolve(cfg, target).await?;
-    let hl = build_hl(cfg, &specs).await?;
+    let hl = build_lighter(cfg, &specs).await?;
     let rows = hl.open_orders_info().await?;
     println!("lighter open orders: {}", rows.len());
     for o in rows {
@@ -244,7 +245,7 @@ async fn probe_lighter_open_orders(cfg: &Config, target: &str) -> Result<()> {
 async fn probe_lighter_order_dry_run(cfg: &Config, target: &str) -> Result<()> {
     let (_m, specs) = resolve(cfg, target).await?;
     let spec = &specs[0];
-    let hl = build_hl(cfg, &specs).await?;
+    let hl = build_lighter(cfg, &specs).await?;
     let market = spec.market_id.clone();
     let mid = hl.mid(&spec.hl_coin).await?;
     let sz = round_up_size(spec.hl_min_notional * dec!(1.02) / mid, spec.lighter_size_decimals);
@@ -279,7 +280,7 @@ async fn probe_lighter_order_dry_run(cfg: &Config, target: &str) -> Result<()> {
 
 /// Money-risking: tiny native Lighter MARKET buy, position detection, then reduce-only
 /// MARKET sell back to flat. Requires `--i-understand-live` and stays under `--max-usd`.
-async fn probe_hl_market(cfg: &Config, target: &str, i_understand_live: bool, max_usd: Decimal) -> Result<()> {
+async fn probe_lighter_market(cfg: &Config, target: &str, i_understand_live: bool, max_usd: Decimal) -> Result<()> {
     if !i_understand_live {
         bail!("lighter-market risks real funds: re-run with --i-understand-live --max-usd <N>");
     }
@@ -291,13 +292,13 @@ async fn probe_hl_market(cfg: &Config, target: &str, i_understand_live: bool, ma
     if max_usd < spec.hl_min_notional {
         bail!("--max-usd {max_usd} is below Lighter min notional {} — pick a larger cap", spec.hl_min_notional);
     }
-    let hl = build_hl(cfg, &specs).await?;
-    hl_market_buy_then_sell(&hl, spec, max_usd).await?;
+    let hl = build_lighter(cfg, &specs).await?;
+    lighter_market_buy_then_sell(&hl, spec, max_usd).await?;
     Ok(())
 }
 
 /// Native Lighter MARKET buy -> detected position size -> reduce-only MARKET sell to exactly flat.
-async fn hl_market_buy_then_sell(hl: &LighterExchange, spec: &MarketSpec, max_usd: Decimal) -> Result<()> {
+async fn lighter_market_buy_then_sell(hl: &LighterExchange, spec: &MarketSpec, max_usd: Decimal) -> Result<()> {
     let market = spec.market_id.clone();
     let mid = hl.mid(&spec.hl_coin).await?;
     // Size to clear the Lighter min notional with 2% to spare, rounded UP to the size decimals so

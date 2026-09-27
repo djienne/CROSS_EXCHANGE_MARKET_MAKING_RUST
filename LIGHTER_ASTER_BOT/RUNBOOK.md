@@ -366,6 +366,15 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
   --max-usd <N>`. The roundtrips need a flat start and no open orders. They clean up
   reduce-only (at most three closes in 30 s) and stay blocked without terminal-order and
   flat-position evidence.
+- Hyperliquid reads `HYPERLIQUID_ENV_PATH` (default `hyperliquid.env`: `exchange=hyperliquid`,
+  `wallet_address` = the traded subaccount, `private_key` = its agent key, `is_vault`). Mount it
+  read-only: `docker compose --profile live run --rm -v <dir>/hyperliquid.env:/secrets/hyperliquid.env:ro
+  -e HYPERLIQUID_ENV_PATH=/secrets/hyperliquid.env bot probe hl-balance --market HYPE` reads the
+  account, fees and action budget. `probe hl-place-cancel` (one post-only buy 10 % under the bid,
+  cancelled) and `probe hl-market` (a ~$10.5 IOC buy sold back reduce-only) trade real funds:
+  both need `--i-understand-live --max-usd <10.5..20>`, a flat start and no open order. Every
+  action spends the account's lifetime budget (10k + ~1 per USDC traded), and there is no
+  dead-man below $1M of volume.
 
 ## Orchestrator leftovers
 
