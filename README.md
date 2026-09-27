@@ -2,9 +2,9 @@
 
 One Rust binary, `lighter_aster_bot` in `LIGHTER_ASTER_BOT/`, trades one market across Aster
 and Lighter with two engines: a taker–taker arbitrage engine and an XEMM engine that quotes on
-Aster and hedges on Lighter. Its `run` command holds both in one process, moves execution
-rights between them in memory and enforces a cross-engine loss stop: the taker trades while it
-has margin, and a reduce-only XEMM unwinds inventory while it does not. `run --mode dry-run`
+Aster and hedges on Lighter. Its `run` command holds both in one process and enforces a
+cross-engine loss stop: XEMM quotes, and when an arbitrage passes the taker's entry gate it
+pulls its quotes and hands the execution rights to the taker until the trade is done. `run --mode dry-run`
 runs the same bot against simulated venues fed by live market data, with no credentials and no
 real orders.
 
@@ -13,7 +13,7 @@ This is a live trading codebase. `run --mode live`, `taker run` without `--obser
 lose money through spread, fees, slippage and execution failures. Neither the tests nor the
 dry run prove live venue acceptance, latency or profitability.
 
-The [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md) is the operating manual: switching rules,
+The [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md) is the operating manual: how the rights are shared,
 configuration and secrets, the dry run, going live, runtime files, halts and recovery, deploy
 and probes.
 
@@ -80,7 +80,7 @@ python3 bot_stats.py --market HYPE --dry-run      # execution quality and health
 
 `bot_stats.py` explains the totals. For taker trades it reports expected vs realized edge, how much
 each leg filled worse than the decision price, book ages and fill delays. It also covers the entry
-gate's decisions, XEMM edge and hedge delay, and controller switches, halts and network pauses. For
+gate's decisions, XEMM edge and hedge delay, XEMM's hand-overs to the taker, and controller halts and network pauses. For
 a dry run it adds the simulator's late frames (with host freezes separated), latencies against the
 `[dry_run]` model, request rates and rejects.
 

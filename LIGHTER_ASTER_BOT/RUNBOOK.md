@@ -1,35 +1,34 @@
 # Operating the bot
 
-`lighter_aster_bot run` trades one market with both engines in one process. The taker–taker
-engine and the reduce-only XEMM engine take turns holding execution rights; the controller
-switches them in memory. `--mode live` trades real money; `--mode dry-run` runs the same bot
+`lighter_aster_bot run` trades one market with both engines in one process. XEMM quotes;
+when an arbitrage passes the taker's entry gate, XEMM pulls its quotes and hands the execution
+rights to the taker, which trades and hands them back. `--mode live` trades real money; `--mode dry-run` runs the same bot
 against simulated venues fed by live market data ([Dry run](#dry-run)). Commands run from
 this directory (`LIGHTER_ASTER_BOT/`) and read `bot.toml`. `run --mode live`, `taker run`
 without `--observe-only`, `probe aster-place-cancel` and the `*-market`/`*-roundtrip` probes
 submit real orders.
 
-## How `run` switches
+## How `run` shares execution rights
 
-- **Taker (normal)** holds the rights unless it is blocked: margin-limited with no
-  executable reducing trade. Margin-limited means under 2 clips of position headroom, under
-  2 clips of free margin (after the buffer) on the tighter venue, or a profitable
-  opportunity held back by headroom or margin.
-- **XEMM** takes over once the taker has been blocked for 90 s. It only posts the Aster maker
-  side whose Lighter hedge reduces inventory (both sides when flat), so `run` refuses a
-  config with `[maker.live.quote] reduce_position_only = false`.
-- **Back to the taker** once it has been ready for 45 s: near flat (one clip), a reducing
-  trade executable, or no longer margin-limited at 3 clips (the 2-vs-3 band is the
-  hysteresis).
-- **Reduce taker.** While XEMM is active, a reduce-only taker observes. A burst of 3 reducing
-  opportunities within 2 s moves the rights to it under a 180 s lease. Each burst is used
-  once and must be under 60 s old. Newer bursts and reducing trades extend the lease, never
-  past 300 s from the grant. Near flat returns to the normal taker; an expired lease returns
-  to XEMM.
+One regime at a time, like Hummingbot's XEMM with the taker's arbitrage in between:
 
-Rights move only after the previous holder has fully stopped; when XEMM hands over, its
-status must also show no open order on either venue. An engine that fails its drain or does
-not stop within 200 s halts the bot instead of switching. The `[controller]` table of
-`bot.toml` holds these thresholds and the cross-engine loss stop.
+- **XEMM (normal)** quotes both Aster sides and hedges each fill on Lighter at once
+  (`[maker.live.quote] reduce_position_only = true` keeps only the side whose hedge reduces
+  inventory).
+- **An arbitrage** that passes the taker's entry gate asks XEMM for the rights. XEMM cancels
+  both quotes and grants a 3 s lease once nothing rests or is in flight: no live or uncertain
+  quote, and every fill (one caught by the cancel included) hedged.
+- **The taker** re-reads its Lighter nonce and an account snapshot that shows no open order on
+  either venue, re-checks the opportunity on current books, trades or skips, and hands the
+  rights back. A request not granted within 5 s is withdrawn; a skip or a withdrawal is followed
+  by `[taker.arb] cooldown_ms`.
+- **XEMM resumes** after re-reading the Lighter nonce and adopting the positions the taker left:
+  only account reads started after the hand-back count, and two in a row must agree.
+
+Both engines run for the whole session; one that exits halts the bot. XEMM's journal records
+each hand-over (`yield`, `yield_withdrawn`, `rights_returned`, `resumed`), and `bot_stats.py`
+summarizes them. The `[controller]` table of `bot.toml` holds the status poll and the
+cross-engine loss stop.
 
 ## Build, secrets, configuration
 
@@ -71,7 +70,7 @@ keeps the log for reviews (`--rm` deletes the container's copy), and `-i` leaves
 bot, so the drain is still logged.
 
 Stop with Ctrl-C, SIGINT, SIGTERM or SIGHUP (`tmux send-keys -t lighter_aster_bot C-c`,
-`docker kill --signal=SIGINT bot-hype`). The active engine drains first, then the observer.
+`docker kill --signal=SIGINT bot-hype`). XEMM drains first, then the taker.
 XEMM quiesces admission, cancels makers, drains fills and execution outcomes, corrects net
 residuals, reconciles and flushes persistence; this can take up to ~190 s per engine, after
 any status poll in progress (up to 50 s). Never stop it with a shorter kill: `docker stop`
@@ -199,12 +198,11 @@ bind-mounted files as mode 777, and live refuses env files that others can read.
 3. Ship the sources, the secrets and the live image with `scripts/deploy_vps.sh` ([Deploy](#deploy)).
 4. On the host, the read-only probes pass: `docker compose run --rm bot probe aster-balance`,
    then `probe lighter-balance`, `probe lighter-open-orders`, `probe leverage` and `taker probe
-   --market HYPE`. Both venues must be at 1x cross and Aster in one-way position mode: XEMM
-   checks this only when it first takes the rights, possibly hours in with inventory to unwind.
+   --market HYPE`. Both venues must be at 1x cross and Aster in one-way position mode, which XEMM
+   checks at start.
 5. Neither venue has open orders, and positions are flat or paired.
 6. `runs/` holds no latch from an earlier run (`bot-<M>.breaker.json`, `*.trip.json`,
-   `circuit_breaker_<M>.json`): each engine checks its own only when it first starts, which
-   for XEMM can be hours in. `run` itself refuses to start on an engine's unclean-session
+   `circuit_breaker_<M>.json`): each engine checks its own when it starts. `run` itself refuses to start on an engine's unclean-session
    marker (`*.active.json`, `active_session_<M>.json`).
 7. Start it as in [Run and stop](#run-and-stop). Its drawdown baseline starts at the first
    sample.
@@ -234,8 +232,8 @@ kinds listed in `src/dryrun/tape.rs`. Read a day with `zstd -dc data/HYPE/<day>T
 
 | File | What |
 |---|---|
-| `bot-<M>.events.jsonl` | Controller events: switches, leases, loss samples, halts |
-| `bot-<M>.state.json` | Current regime, lease, accounts; read by `combined_pnl.py` / `trade_history.py` |
+| `bot-<M>.events.jsonl` | Controller events: engine starts and stops, loss samples, network pauses, halts |
+| `bot-<M>.state.json` | Who holds the rights, loss stops, positions, accounts; read by `combined_pnl.py` / `trade_history.py` |
 | `bot-<M>.breaker.json` | Controller halt latch |
 | `bot-<M>.baseline.json`, `bot-<M>.equity.jsonl` | Equity-drawdown baseline and samples |
 | `bot-<M>-journal.jsonl` | XEMM execution journal |
@@ -259,20 +257,20 @@ the simulated venues' `sim-<M>.state.json` and `sim-<M>.diag.jsonl`.
   `baseline_max_gap_hours` (48); or realized trade PnL of both engines
   since this start at or below −15. Unverified gains never count; unverified losses do. The
   engines' own stops (10) normally trip first.
-- a failed or hung engine stop (`*_shutdown_unresolved`);
-- resting orders when rights should move (`*_orders_not_clear*`, `startup_orders_not_clear`);
-- an engine error (`active_bot_exited_nonzero`), or three clean exits each under 10 minutes
-  of uptime (`active_bot_crash_loop`);
-- XEMM not reduce-only (`xemm_reduce_position_only_disabled`).
+- resting orders at startup (`startup_orders_not_clear`);
+- an engine that exits, with an error or not (`engine_exited`).
+
+An engine that fails its drain or does not stop within 200 s makes the exit nonzero
+(`bot_stopped` carries the error).
 
 **Network outage.** Three unreadable required statuses in a row (45 s) are treated as a lost
 network, not a halt: the bot emits `network_pause`, and no engine opens new exposure (no
 taker entry, XEMM quotes pulled). In-flight executions, hedges, corrections and the Aster
-deadman carry on, and the controller neither switches nor consumes reduce bursts. The loss
+deadman carry on, and the taker asks for no rights. The loss
 stops still run on every readable status. After 4 readable statuses in a row (about 60 s,
 restarting at any failure) it emits `network_resume` and trades on; no restart is needed. An
 order in flight when the network drops can still end the engine with an unresolved
-execution, which halts as `active_bot_exited_nonzero`.
+execution, which halts as `engine_exited`.
 
 Review `bot-<M>.events.jsonl` and the breaker, then restart with `--ack-breaker`, which
 archives it as `.acked.<stamp>`. An equity-drawdown breaker also needs
@@ -317,7 +315,6 @@ fresher than `max_book_staleness_ms`, and the edge passes the entry gate: the gr
 history warmup. Its Aster book is the `depth20@100ms` snapshot with the newer `bookTicker` top
 laid over it (by update id): depth alone lags the top by up to 100 ms. Aster orders are bounded
 IOC limits; Lighter uses its native market/IOC path.
-Under a lease, execution is reduce-only and capped at both existing positions.
 
 An unknown submission outcome keeps its order and client ids: a missing order row or a flat
 position does not prove no fill. A known missing hedge gets one retry within

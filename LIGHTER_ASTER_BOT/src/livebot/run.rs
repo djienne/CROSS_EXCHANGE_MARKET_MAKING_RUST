@@ -86,6 +86,7 @@ pub async fn run(
     markets: Vec<MarketCfg>,
     stem: PathBuf,
     pause: Arc<AtomicBool>,
+    rights: Option<super::strategy::Rights>,
     stop: CancellationToken,
 ) -> Result<()> {
     if markets.is_empty() {
@@ -294,6 +295,7 @@ pub async fn run(
     let breaker_tripped_flag = Arc::new(AtomicBool::new(false));
     strat.set_trip_flag(breaker_tripped_flag.clone());
     strat.set_pause_flag(pause);
+    strat.set_rights(rights);
     strat.set_dirty(dirty);
     strat.set_user_stream(stream_liveness); // freeze quoting if the Aster fill stream silently dies
     // --- strategy ---

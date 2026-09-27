@@ -1,5 +1,5 @@
-# Aster/Lighter bot: `run` holds the taker-taker engine and the reduce-only XEMM engine for
-# one market and switches execution rights between them in memory.
+# Aster/Lighter bot: `run` holds the XEMM engine and the taker-taker engine for one market;
+# XEMM hands the execution rights to the taker for each arbitrage.
 #
 # One Dockerfile, two tags: lighter_aster_bot:live and :dryrun. Secrets are mounted read-only,
 # never baked. The runs/ dir (journals, ledgers, latches, controller state) is a persistent
@@ -51,7 +51,7 @@ services:
       - ${ASTER_NONCE_DIR:-/tmp/lighter-aster-nonces}:/nonce
     # SIGINT, SIGTERM and SIGHUP all start the same graceful drain. Positions stay OPEN.
     stop_signal: SIGINT
-    # A status tick in progress (<= 50 s), then the active engine's and the observer's stops,
+    # A status tick in progress (<= 50 s), then XEMM's and the taker's stops,
     # each capped at 200 s (ENGINE_STOP_TIMEOUT in src/controller/supervisor.rs); a shorter
     # grace SIGKILLs a legitimate drain and leaves fills unhedged.
     stop_grace_period: 460s

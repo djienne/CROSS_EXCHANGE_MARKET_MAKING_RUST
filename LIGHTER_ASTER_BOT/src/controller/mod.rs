@@ -1,14 +1,13 @@
-//! The `run` command: one process holding both engines for one market and handing execution
-//! rights between them in memory. It replaces the retired orchestrator.py and its child
-//! processes.
+//! The `run` command: one process running both engines for one market. XEMM quotes; when an
+//! arbitrage passes the taker's entry gate, XEMM pulls its quotes and hands the execution
+//! rights to the taker, which trades and hands them back. It replaces the retired
+//! orchestrator.py and its child processes.
 //!
-//! * [`regime`]: which engine should hold the rights (the ported `decide()`).
 //! * [`risk`]: the cross-engine loss stops (equity drawdown, realized trade PnL).
-//! * `supervisor`: the loop — engine tasks, the reduce-only lease, switching, halts.
+//! * `supervisor`: the loop — engine tasks, loss stops, network pause, halts.
 //! * `engines`: the real engine tasks and status pollers behind the supervisor.
 
 pub(crate) mod engines;
-pub mod regime;
 pub mod risk;
 pub(crate) mod supervisor;
 
@@ -34,33 +33,8 @@ pub const RUNS_DIR: &str = "runs";
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ControllerCfg {
-    /// Status poll and regime decision cadence.
+    /// Status poll and loss-stop cadence.
     pub poll_sec: u64,
-    /// A blocked normal taker must stay blocked this long before XEMM takes over.
-    pub blocked_confirm_sec: u64,
-    /// XEMM hands back once the taker has been ready this long.
-    pub resume_confirm_sec: u64,
-    /// The taker is blocked below this many clips of headroom / of free margin ...
-    pub switch_headroom_clips: Decimal,
-    pub switch_margin_clips: Decimal,
-    /// ... and ready again only above these (default: switch + 1, the hysteresis band).
-    pub resume_headroom_clips: Option<Decimal>,
-    pub resume_margin_clips: Option<Decimal>,
-    /// Near flat at or below this notional; `0` means one clip.
-    pub near_flat_notional_usd: Decimal,
-    /// Keep a reduce-only taker in standby while XEMM is active: the reduce fast path.
-    pub observer: bool,
-    /// A confirmed reduce burst older than this is ignored.
-    pub reduce_signal_fresh_ms: i64,
-    /// This many reducing opportunities within the window confirm a burst.
-    pub reduce_burst_min_samples: usize,
-    pub reduce_burst_window_ms: i64,
-    /// The reduce-only lease is granted or extended for this long, and never past this long
-    /// after its first grant.
-    pub reduce_lease_sec: i64,
-    pub reduce_lease_max_sec: i64,
-    /// Cooldown after each reduce-filtered trade.
-    pub reduce_cooldown_ms: u64,
     /// Cross-engine loss stop, inclusive (equity drawdown or realized trade PnL).
     pub max_loss_usdc: Decimal,
     /// A persisted equity baseline not refreshed for this long is discarded; `0` keeps it.
@@ -71,20 +45,6 @@ impl Default for ControllerCfg {
     fn default() -> Self {
         Self {
             poll_sec: 15,
-            blocked_confirm_sec: 90,
-            resume_confirm_sec: 45,
-            switch_headroom_clips: Decimal::TWO,
-            switch_margin_clips: Decimal::TWO,
-            resume_headroom_clips: None,
-            resume_margin_clips: None,
-            near_flat_notional_usd: Decimal::ZERO,
-            observer: true,
-            reduce_signal_fresh_ms: 60_000,
-            reduce_burst_min_samples: 3,
-            reduce_burst_window_ms: 2_000,
-            reduce_lease_sec: 180,
-            reduce_lease_max_sec: 300,
-            reduce_cooldown_ms: 5_000,
             max_loss_usdc: Decimal::from(15),
             baseline_max_gap_hours: 48,
         }
@@ -95,32 +55,8 @@ impl ControllerCfg {
     pub fn validate(&self) -> Result<()> {
         // The loss stops run once per poll.
         ensure!((1..=60).contains(&self.poll_sec), "controller.poll_sec must be within 1..=60");
-        let clips = [self.switch_headroom_clips, self.switch_margin_clips, self.near_flat_notional_usd];
-        ensure!(clips.iter().chain(self.resume_headroom_clips.iter()).chain(self.resume_margin_clips.iter()).all(|c| !c.is_sign_negative()),
-            "controller clip and near-flat thresholds must be >= 0");
-        // Without the hysteresis band the taker reads as blocked and ready at once, and the
-        // engines flip every confirm window, each flip a full XEMM drain.
-        let t = self.thresholds();
-        ensure!(t.resume_headroom_clips > t.switch_headroom_clips && t.resume_margin_clips > t.switch_margin_clips,
-            "controller resume clips must exceed the switch clips");
         ensure!(self.max_loss_usdc > Decimal::ZERO, "controller.max_loss_usdc must be > 0");
-        ensure!(self.reduce_signal_fresh_ms > 0 && self.reduce_burst_window_ms > 0 && self.reduce_burst_min_samples > 0,
-            "controller reduce-burst settings must be > 0");
-        ensure!(self.reduce_lease_sec > 0 && self.reduce_lease_max_sec >= self.reduce_lease_sec,
-            "controller.reduce_lease_sec must be > 0 and <= reduce_lease_max_sec");
         Ok(())
-    }
-
-    pub fn thresholds(&self) -> regime::Thresholds {
-        regime::Thresholds {
-            blocked_confirm: std::time::Duration::from_secs(self.blocked_confirm_sec),
-            resume_confirm: std::time::Duration::from_secs(self.resume_confirm_sec),
-            switch_headroom_clips: self.switch_headroom_clips,
-            switch_margin_clips: self.switch_margin_clips,
-            resume_headroom_clips: self.resume_headroom_clips.unwrap_or(self.switch_headroom_clips + Decimal::ONE),
-            resume_margin_clips: self.resume_margin_clips.unwrap_or(self.switch_margin_clips + Decimal::ONE),
-            near_flat_notional_usd: self.near_flat_notional_usd,
-        }
     }
 }
 
@@ -161,7 +97,7 @@ impl BotConfig {
     }
 
     /// Both engines' entry for `market`, which must name the same Aster and Lighter
-    /// instruments. XEMM only ever unwinds inventory here, so it must be reduce-only.
+    /// instruments.
     pub fn select(&self, market: &str) -> Result<(Vec<crate::taker::config::MarketCfg>, Vec<crate::config::MarketCfg>)> {
         let taker = self.taker.select_markets(Some(market));
         let maker = self.maker.select_markets(Some(market));
@@ -171,7 +107,6 @@ impl BotConfig {
         ensure!(t.id().0 == market && m.id().0 == market, "market ids must be spelled {market} in both engine configs");
         ensure!(t.aster_symbol.eq_ignore_ascii_case(&m.aster_symbol) && t.lighter_symbol.eq_ignore_ascii_case(&m.hl_coin),
             "taker and maker configs name different instruments for {market}");
-        ensure!(self.maker.live.quote.reduce_position_only, "[maker.live.quote] reduce_position_only must be true under `run`");
         ensure!(self.maker.live.enabled, "[maker.live] enabled must be true under `run`");
         ensure!(self.taker.pnl.enabled && self.maker.live.circuit_breaker.enabled,
             "`run` keeps both engines' own loss stops: [taker.pnl] and [maker.live.circuit_breaker] need enabled = true");
@@ -179,7 +114,7 @@ impl BotConfig {
     }
 }
 
-/// `run`: both engines for `market`, execution rights switched in memory. Returns `Err` on a
+/// `run`: both engines for `market`, sharing the execution rights in memory. Returns `Err` on a
 /// safe halt or an unresolved engine stop, `Ok` after a clean signal-driven stop; a halted
 /// dry run instead stays parked until stopped.
 pub async fn run(config: &Path, market: &str, mode: LiveMode, ack_breaker: bool, reset_baseline: bool, stop: CancellationToken) -> Result<()> {
@@ -221,8 +156,7 @@ pub(crate) async fn run_with(
         if !live {
             archive_unclean_sessions(markers, &mut events)?;
         } else if let Some(marker) = markers.iter().find(|marker| marker.exists()) {
-            // Found now, not when its engine first arms, hours in for a standby taker (whose
-            // arming would fail on it every tick).
+            // Found now with the fix named, rather than as an engine exit that halts the bot.
             bail!("{} is an unresolved engine session: resolve it first (RUNBOOK.md, Halts and recovery)", marker.display());
         }
         risk::check_breaker(&files.breaker, ack_breaker, reset_baseline, &mut events)?;
@@ -446,28 +380,49 @@ mod tests {
     }
 
     /// `run --mode dry-run` end to end: the real controller and engines against the simulated
-    /// venues, fed by a scripted market standing in for mainnet. Docker runs it with
-    /// `--network none`, so nothing can reach a real venue.
+    /// venues, fed by a scripted market standing in for mainnet. XEMM quotes; an arbitrage
+    /// takes the rights from it (cancel, grant, hedged taker trade, hand-back); XEMM quotes
+    /// again. Docker runs it with `--network none`, so nothing can reach a real venue.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_dry_run_hedges_a_scripted_arbitrage_and_drains_on_stop() {
+    async fn a_dry_run_yields_to_a_scripted_arbitrage_then_quotes_again_and_drains_on_stop() {
         use rust_decimal_macros::dec;
         use std::time::Duration;
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let market = std::sync::Arc::new(crate::dryrun::tests::World::start().await);
         let dir = crate::dryrun::tests::temp_dir("dry-run-e2e");
+        // The shipped 15 s poll: both engines' status reads share Lighter's 60 requests/min.
         let mut cfg = crate::dryrun::tests::shipped_config(&market, &dir);
-        cfg.controller.poll_sec = 1;
         // The taker's warm-up and history gates would need minutes of market data.
         let arb = &mut cfg.taker.arb;
         (arb.startup_warmup_ms, arb.entry_gate.enabled, arb.book_sanity.enabled) = (0, false, false);
-        // Aster asks 98 while Lighter bids 99: 100 bps across the venues.
-        market.set_aster(dec!(97), dec!(98));
         let fresh = market.keep_fresh();
         let stop = CancellationToken::new();
         let bot = tokio::spawn({
             let (stop, runs) = (stop.clone(), dir.clone());
             async move { run_with(cfg, &runs, "HYPE", LiveMode::DryRun, false, false, stop).await }
         });
+        // XEMM's journal: the order updates and its hand-over rows, in order.
+        let journal = crate::live_report::inferred_journal_path(&dir.join("dry-run").join("bot-HYPE"));
+        let kinds = || -> Vec<String> {
+            let text = std::fs::read_to_string(&journal).unwrap_or_default();
+            text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).filter_map(|row| match row["kind"].as_str() {
+                Some("order_update") => row["detail"]["state"].as_str().map(str::to_owned),
+                Some(kind @ ("yield" | "rights_returned" | "resumed")) => Some(kind.to_owned()),
+                _ => None,
+            }).collect()
+        };
+        async fn wait_for(what: &str, kinds: &dyn Fn() -> Vec<String>, done: impl Fn(&[String]) -> bool) {
+            for _ in 0..600 {
+                if done(&kinds()) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!("{what} within 60 s: {:?}", kinds());
+        }
+        wait_for("an XEMM quote", &kinds, |k| k.iter().any(|k| k == "accepted")).await;
+        // Aster asks 98 while Lighter bids 99: 100 bps across the venues.
+        market.set_aster(dec!(97), dec!(98));
         let ledger = dir.join("dry-run").join("trades_HYPE.jsonl");
         let row = tokio::time::timeout(Duration::from_secs(60), async {
             loop {
@@ -485,13 +440,22 @@ mod tests {
         assert_eq!(row.aster_fill.qty, row.lighter_fill.qty, "{row:?}");
         assert!(row.aster_fill.fee_usd > Decimal::ZERO && row.lighter_fill.fee_usd.is_zero(), "Aster charges 4 bps: {row:?}");
         assert!(row.final_net_position.is_zero(), "{row:?}");
+        // XEMM stayed out from its yield to its resume, then quotes again.
+        market.set_aster(dec!(99), dec!(101));
+        let position = |k: &[String], kind: &str| k.iter().position(|x| x == kind);
+        wait_for("a quote after the resume", &kinds, |k| position(k, "resumed").is_some_and(|at| k[at..].iter().any(|x| x == "accepted"))).await;
+        let k = kinds();
+        let (yielded, returned, resumed) = (position(&k, "yield").unwrap(), position(&k, "rights_returned").unwrap(), position(&k, "resumed").unwrap());
+        assert!(yielded < returned && returned < resumed && !k[yielded..resumed].iter().any(|x| x == "accepted"), "{k:?}");
         stop.cancel();
         tokio::time::timeout(Duration::from_secs(60), bot).await.expect("the drain hung").unwrap().expect("a clean stop");
         // The final save keeps the hedged pair for the next start.
         let state = std::fs::read_to_string(dir.join("dry-run").join("sim-HYPE.state.json")).unwrap();
         let state: serde_json::Value = serde_json::from_str(&state).unwrap();
         let qty = |venue: usize, market: &str| state[venue]["account"]["positions"][market]["qty"].as_str().and_then(|q| q.parse::<Decimal>().ok());
-        assert_eq!((qty(0, "HYPEUSDT"), qty(1, "24")), (Some(dec!(0.13)), Some(dec!(-0.13))), "{state}");
+        // The taker's pair, plus any XEMM bid the drop to 97/98 filled and XEMM hedged.
+        let (aster, lighter) = (qty(0, "HYPEUSDT").unwrap(), qty(1, "24").unwrap());
+        assert!(aster + lighter == Decimal::ZERO && aster >= dec!(0.13), "{state}");
         let mut written: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         written.sort();
         assert_eq!(written, ["bot.toml", "dry-run"], "a dry run writes under runs/dry-run only");

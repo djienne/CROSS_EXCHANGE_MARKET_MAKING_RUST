@@ -5,7 +5,7 @@ combined_pnl.py says how much was made; this says why. It covers five things:
 - how much of the expected edge each taker trade kept, and which leg lost the rest;
 - how often the entry gate fired;
 - what XEMM trades earned and how fast they were hedged;
-- what the controller did;
+- what the controller did, and how XEMM handed the rights to the taker;
 - for a dry run, whether the simulator stayed faithful to its latency model.
 The model's targets are in bot.toml [dry_run].
 """
@@ -119,12 +119,23 @@ def controller(runs: Path, market: str, since: datetime, now: datetime) -> dict[
     events = rows(runs / f"bot-{market}.events.jsonl", since, now)
     state_path = runs / f"bot-{market}.state.json"
     state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    # XEMM's hand-overs (strategy.rs `Yield`): its cancels until the grant, the taker's hold,
+    # and the re-read of the positions the taker left.
+    handover: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    journal = runs / f"bot-{market}-journal.jsonl"
+    lo, hi = since.timestamp() * 1000, now.timestamp() * 1000
+    for _, r in iter_jsonl(journal) if journal.exists() else ():
+        if r.get("kind") in ("yield", "yield_withdrawn", "rights_returned", "resumed") and lo <= r.get("ts_ms", 0) <= hi:
+            handover[r["kind"]].append(r["detail"])
     return {
         "events": dict(collections.Counter(e["kind"] for e in events)),
-        "switches_to": dict(collections.Counter(e.get("bot") for e in events if e["kind"] == "bot_switched")),
+        "handovers": {"granted": len(handover["yield"]), "withdrawn": len(handover["yield_withdrawn"]),
+                      "fills_while_yielding": sum(d["fills"] for d in handover["yield"]),
+                      **{key: dist([d[key] for d in handover[kind]]) for kind, key in
+                         (("yield", "cancel_to_grant_ms"), ("rights_returned", "held_ms"), ("resumed", "resume_ms"))}},
         "halts": [f'{e["timestamp"][:19]} {e.get("reason")}' for e in events if e["kind"] == "safe_halt"],
         "network_paused_s": sum(e.get("paused_secs", 0) for e in events if e["kind"] == "network_resume"),
-        "active_bot": state.get("active_bot"), "equity_pnl_usd": state.get("pnl", {}).get("equity_pnl_usdc"),
+        "rights": state.get("rights"), "equity_pnl_usd": state.get("pnl", {}).get("equity_pnl_usdc"),
     }
 
 

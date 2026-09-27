@@ -50,7 +50,7 @@ tiny-keccak = { version = "2", features = ["keccak"] }
 hex = "0.4"
 fs2 = "0.4"
 memmap2 = "0.9"
-# The market-data tape (`record`), and the regime-decision fixture in tests.
+# The market-data tape (`record`).
 zstd = "0.13"
 
 [dev-dependencies]

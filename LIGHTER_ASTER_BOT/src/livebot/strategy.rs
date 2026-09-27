@@ -47,6 +47,31 @@ use super::scale::MarketScale;
 const MAKER_GATE_FROZEN: &str = "FROZEN";
 /// The controller's network pause: quotes are pulled; hedging and corrections carry on.
 const MAKER_GATE_NETWORK_PAUSE: &str = "NETWORK_PAUSE";
+const MAKER_GATE_YIELDED: &str = "YIELDED_TO_TAKER";
+
+/// XEMM's side of the execution rights under `run`; the taker's side is `RunOptions::want`
+/// and `RunOptions::lease` (taker::arb).
+pub struct Rights {
+    /// `Some(id)`: the taker asks for the rights (an arbitrage passed its entry gate).
+    pub want: tokio::sync::watch::Receiver<Option<u64>>,
+    pub lease: tokio::sync::watch::Sender<Option<crate::taker::arb::ExecutionLease>>,
+}
+
+/// How long a grant lets the taker start an execution; one already started runs to its end.
+const GRANT_TTL_MS: i64 = 3_000;
+
+/// XEMM's turn in `run`, one regime at a time (Hummingbot's XEMM with the taker's arbitrage
+/// in between): quote (`Idle`); on the taker's request cancel both sides and wait until
+/// nothing rests or is in flight (`Yielding`); grant (`Granted`); after the hand-back re-read
+/// the positions the taker changed (`Resuming`) before quoting again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Yield {
+    Idle,
+    Yielding { id: u64, since_ns: i64, fills: u32 },
+    Granted { id: u64, at_ns: i64 },
+    /// `seen`: the generation of the last snapshot read after `released_ns` (0: none yet).
+    Resuming { id: u64, released_ns: i64, seen: u64 },
+}
 // Keep a small cushion of Aster command-queue slots for risk-reducing commands
 // (targeted cancels, CancelAllBot, dead-man refresh). Optional quote churn must
 // not be allowed to consume the entire bounded queue and then block a cancel.
@@ -688,6 +713,8 @@ pub struct Strategy {
     logical_ids: HashMap<MarketId, Cloid>,
     maker_coverage: HashMap<String, MakerCoverage>,
     uncertain_makers: std::collections::HashSet<String>,
+    rights: Option<Rights>,
+    yield_state: Yield,
     correction_needed: std::collections::HashSet<MarketId>,
     correction_attempts: HashMap<MarketId, u32>,
     hedge_readiness: Option<super::exec::hyperliquid::HedgeReadiness>,
@@ -846,6 +873,8 @@ impl Strategy {
             logical_ids: HashMap::new(),
             maker_coverage: HashMap::new(),
             uncertain_makers: std::collections::HashSet::new(),
+            rights: None,
+            yield_state: Yield::Idle,
             correction_needed: std::collections::HashSet::new(),
             correction_attempts: HashMap::new(),
             hedge_readiness: None,
@@ -929,6 +958,63 @@ impl Strategy {
 
     pub fn set_pause_flag(&mut self, f: Arc<std::sync::atomic::AtomicBool>) {
         self.pause_flag = Some(f);
+    }
+
+    pub fn set_rights(&mut self, rights: Option<Rights>) {
+        self.rights = rights;
+    }
+
+    /// Nothing rests and nothing is in flight: Hummingbot's `ready_for_new_trades`, plus the
+    /// states only this engine has (uncertain cancels, sub-minimum partials, corrections).
+    fn settled(&self) -> bool {
+        self.orders.live_slots().is_empty() && self.uncertain_makers.is_empty() && self.pending.is_empty()
+            && self.correction_needed.is_empty() && !self.hedges.values().any(|h| h.unresolved()) && !self.has_orphan_hedge()
+    }
+
+    /// Advances the hand-over to the taker (see [`Yield`]); `want` is the taker's current
+    /// request. Runs after every event, so a settle or a release is acted on at once.
+    fn drive_yield(&mut self, want: Option<u64>, now_ns: i64) {
+        let ms = |since: i64| now_ns.saturating_sub(since) / 1_000_000;
+        match (self.yield_state, want) {
+            (Yield::Idle, Some(id)) => {
+                self.revoke_makers();
+                for m in self.markets.clone() { self.cancel_both_sides(&m, now_ns); }
+                self.yield_state = Yield::Yielding { id, since_ns: now_ns, fills: 0 };
+            }
+            (Yield::Yielding { id, since_ns, fills }, None) => {
+                self.journal.record(now_ns, "yield_withdrawn", None, serde_json::json!({"want_id": id, "waited_ms": ms(since_ns), "fills": fills}));
+                self.yield_state = Yield::Idle;
+            }
+            (Yield::Yielding { id, since_ns, fills }, Some(_)) if self.settled() => {
+                let market = self.markets[0].0.clone();
+                let expires_at = Utc::now() + chrono::Duration::milliseconds(GRANT_TTL_MS);
+                if let Some(rights) = &self.rights {
+                    rights.lease.send_replace(Some(crate::taker::arb::ExecutionLease { market, lease_id: format!("xemm-{id}"), expires_at }));
+                }
+                self.journal.record(now_ns, "yield", None, serde_json::json!({"want_id": id, "cancel_to_grant_ms": ms(since_ns), "fills": fills}));
+                self.yield_state = Yield::Granted { id, at_ns: now_ns };
+            }
+            (Yield::Granted { id, at_ns }, None) => {
+                if let Some(rights) = &self.rights { rights.lease.send_replace(None); }
+                if self.hedge_tx.try_send(HedgeCommand::RefreshNonce).is_err() { self.freeze(now_ns, "hedge_queue_send_failed"); }
+                self.journal.record(now_ns, "rights_returned", None, serde_json::json!({"want_id": id, "held_ms": ms(at_ns)}));
+                self.yield_state = Yield::Resuming { id, released_ns: now_ns, seen: 0 };
+            }
+            (Yield::Resuming { id, released_ns, seen }, _) => {
+                // The taker traded on the same accounts: adopt what the venues report after the
+                // hand-back, until two snapshots in a row agree (a venue cache may lag a fill).
+                let snap = self.account.load();
+                if snap.read_start_ns <= released_ns || snap.generation == seen { return; }
+                if seen != 0 && self.positions_reconciled() {
+                    self.journal.record(now_ns, "resumed", None, serde_json::json!({"want_id": id, "resume_ms": ms(released_ns)}));
+                    self.yield_state = Yield::Idle;
+                } else {
+                    self.adopt_reported_positions(now_ns);
+                    self.yield_state = Yield::Resuming { id, released_ns, seen: snap.generation };
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Mark startup reconciliation complete — quoting may begin (still gated by feeds/cooldown).
@@ -1646,6 +1732,7 @@ impl Strategy {
     /// [`note_quote_gate`](Self::note_quote_gate).
     fn maker_gate_reason(&self, market: &MarketId, now_ns: i64) -> Option<&'static str> {
         if self.draining { return Some("QUIESCING"); }
+        if self.yield_state != Yield::Idle { return Some(MAKER_GATE_YIELDED); }
         if self.pause_flag.as_ref().is_some_and(|p| p.load(std::sync::atomic::Ordering::Acquire)) {
             return Some(MAKER_GATE_NETWORK_PAUSE);
         }
@@ -1737,6 +1824,8 @@ impl Strategy {
                     // The gate-closed cancel pulls quotes, and offline the deadman does: a
                     // cancel-all sweep would only fail every 2 s through an outage.
                     && r != MAKER_GATE_NETWORK_PAUSE
+                    // Yielding cancels both sides itself.
+                    && r != MAKER_GATE_YIELDED
                     && (self.cfg.live.cancel_all_on_gate_close
                         || (user_stream_stale && self.cfg.live.cancel_all_on_user_stream_stale));
                 if should_sweep {
@@ -2310,6 +2399,7 @@ impl Strategy {
                     .map(|q| q + fill.last_fill_qty * fill.last_fill_px)
             } else { None };
             self.maker_coverage.insert(fill.client_id.clone(), MakerCoverage { logical_id, qty: fill.cum_filled_qty, quote });
+            if let Yield::Yielding { fills, .. } = &mut self.yield_state { *fills += 1; }
             let mut delta_fill = fill.clone();
             delta_fill.last_fill_qty = delta;
             self.process_maker_delta(&delta_fill, logical_id, now_ns).await;
@@ -2789,7 +2879,9 @@ impl Strategy {
             }
             self.freeze_and_sweep(now_ns, "pending_limit");
         }
-        self.recover_orphans(now_ns);
+        // While the taker holds or just returned the rights, its trade would read as a
+        // position mismatch here; `drive_yield` re-reads the positions instead.
+        if matches!(self.yield_state, Yield::Idle | Yield::Yielding { .. }) { self.recover_orphans(now_ns); }
         self.publish_execution_queries();
         if self.cfg.live.aster.deadman_enabled && !self.draining {
             for m in self.markets.clone() {
@@ -2986,7 +3078,9 @@ pub async fn run_strategy(
     let mut last_diag_ns: i64 = 0; // throttle for the quote diagnostic (see log_quote_diag)
     let mut dirty_idx_buf = Vec::with_capacity(strat.markets.len());
     let mut dirty_market_buf = Vec::with_capacity(strat.markets.len());
+    let mut want = strat.rights.as_ref().map(|r| r.want.clone());
     loop {
+        strat.drive_yield(want.as_ref().and_then(|w| *w.borrow()), mono_now_ns());
         // BIASED: the latency-critical fill->hedge and hedge-event arms are polled FIRST, so a
         // pending maker fill deterministically preempts the reprice-all-markets (`wake`) and cold
         // `on_tick` work instead of waiting behind it (random select could schedule them first).
@@ -3002,6 +3096,11 @@ pub async fn run_strategy(
             }
             Some(ev) = exec_events.recv() => {
                 dispatch_execution_event(&mut strat, ev, mono_now_ns()).await;
+            }
+            // Only wakes the loop: `drive_yield` reads the request at the top. A taker gone
+            // (closed channel) reads as no request.
+            changed = async { match want.as_mut() { Some(w) => w.changed().await, None => std::future::pending().await } } => {
+                if changed.is_err() { want = None; }
             }
             _ = tick.tick() => {
                 let now_ns = mono_now_ns();
@@ -4688,6 +4787,46 @@ lighter_symbol = "BTC"
         strat.handle_maker_order_progress(m.clone(),Side::Buy,client,"17".into(),dec!(0.5),Some(dec!(50)),true,1700000000000,now+5).await;
         let HedgeCommand::Hedge { intent,.. }=hrx.try_recv().unwrap() else {panic!("hedge expected")}; assert_eq!(intent.qty,dec!(0.5));
         assert!(strat.uncertain_makers.is_empty() && !strat.frozen);
+    }
+
+    #[tokio::test]
+    async fn yield_cancels_grants_once_settled_and_resumes_after_two_post_release_snapshots() {
+        let account=AccountState::default(); let (etx,mut erx)=tokio::sync::mpsc::channel(16); let (htx,mut hrx)=tokio::sync::mpsc::channel(16);
+        let mut strat=live_strat(etx,htx,account.clone()); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
+        let ((_want_tx,want),(lease,granted))=(tokio::sync::watch::channel(None),tokio::sync::watch::channel(None));
+        strat.set_rights(Some(Rights { want, lease })); strat.mark_cache.insert(m.clone(),dec!(100));
+        let quotes:Vec<String>=[(Side::Buy,9900),(Side::Sell,10100)].into_iter().map(|(side,px)| {
+            let client=strat.orders.next_client_id(&m,side).unwrap(); strat.orders.on_place_sent(&m,side,client.clone(),px,500,now);
+            strat.handle_exec_event(ExecEvent::PlaceAck { client_id: client.clone(), venue_order_id: px.to_string() }, now+1); client
+        }).collect();
+        // The taker asks: both quotes are cancelled and the gate closes.
+        strat.drive_yield(Some(1),now+2);
+        let cancels=std::iter::from_fn(|| erx.try_recv().ok()).filter(|c| matches!(c, ExecCommand::Cancel { .. })).count();
+        assert_eq!((cancels,strat.maker_gate_reason(&m,now+2)),(2,Some(MAKER_GATE_YIELDED)));
+        // One cancel lands, the other finds its quote filled: no grant until that fill is hedged.
+        strat.handle_exec_event(ExecEvent::CancelAck { client_id: quotes[0].clone() }, now+3);
+        strat.handle_exec_event(ExecEvent::CancelFilledOrExpired { client_id: quotes[1].clone() }, now+3);
+        strat.drive_yield(Some(1),now+4); assert!(granted.borrow().is_none(), "an uncertain quote");
+        strat.handle_maker_order_progress(m.clone(),Side::Sell,quotes[1].clone(),"10100".into(),dec!(0.5),Some(dec!(50)),true,1700000000000,now+5).await;
+        let HedgeCommand::Hedge { intent, aggressive_px, .. }=hrx.try_recv().unwrap() else {panic!("hedge expected")};
+        strat.drive_yield(Some(1),now+6); assert!(granted.borrow().is_none(), "a hedge in flight");
+        strat.handle_exec_event(ExecEvent::ExecutionProgress { cloid: intent.cloid, cumulative_qty: intent.qty, cumulative_quote_usd: Some(intent.qty*aggressive_px),
+            cumulative_fee_usd: Some(Decimal::ZERO), terminal: true, venue_order_id: None, event_time_ms: None }, now+7);
+        strat.drive_yield(Some(1),now+8);
+        assert_eq!(granted.borrow().as_ref().map(|l| l.lease_id.clone()), Some("xemm-1".to_string()));
+        // The hand-back revokes the lease and re-reads the Lighter nonce the taker used.
+        let released=now+9; strat.drive_yield(None,released);
+        assert!(granted.borrow().is_none() && matches!(hrx.try_recv(), Ok(HedgeCommand::RefreshNonce)));
+        // The taker bought 0.13 on Aster and sold it on Lighter. A read from before the hand-back
+        // does not count, and a read may still lag the taker's legs: XEMM quotes again only once
+        // two reads in a row agree.
+        for (read_ns,aster,lighter,resumed) in [(released-1,dec!(-0.5),dec!(0.5),false),(released+1,dec!(-0.5),dec!(0.5),false),
+            (released+2,dec!(-0.37),dec!(0.5),false),(released+3,dec!(-0.37),dec!(0.37),false),(released+4,dec!(-0.37),dec!(0.37),true)] {
+            account.publish(funded_snapshot(read_ns,aster,lighter)); strat.drive_yield(None,released+5);
+            assert_eq!(strat.yield_state==Yield::Idle,resumed,"read at {}",read_ns-released);
+        }
+        assert_eq!((strat.aster_pos[&m].qty,strat.hl_pos[&m].qty),(dec!(-0.37),dec!(0.37)));
+        assert!(!strat.frozen && strat.maker_gate_reason(&m,released+5)!=Some(MAKER_GATE_YIELDED));
     }
 
     // --- circuit breaker ---

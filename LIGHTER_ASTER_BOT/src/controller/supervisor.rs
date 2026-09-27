@@ -1,14 +1,16 @@
-//! The supervisor loop: runs the engine tasks, hands execution rights between them and halts
-//! fail-closed. A port of orchestrator.py's `run`/`tick`/`fast_tick`/`ensure_bot` (7d47337)
-//! without the process plumbing:
-//! * every 250 ms (`fast_tick`): reap finished engines and consume a fresh confirmed reduce
-//!   burst — extend the lease in reduce mode, or stop XEMM and promote the standby observer;
-//! * every `poll_sec` (`tick`): poll the statuses, update the loss stops, decide, switch.
+//! The supervisor loop: runs both engine tasks for the whole session and halts fail-closed.
+//! * at start: both venues verified clear, then XEMM and the taker spawned once;
+//! * every 250 ms: an engine that exited halts the bot;
+//! * every `poll_sec` (`tick`): poll the statuses, update the loss stops and the network pause.
 //!
-//! Stopping an engine is its own bounded graceful drain (XEMM cancels, hedges, corrects and
-//! verifies), awaited in full: there is no kill ladder. An engine that fails or outlives
-//! `ENGINE_STOP_TIMEOUT` halts the bot instead of switching, and execution rights move only
-//! after the previous holder has stopped and both venues show no open orders.
+//! Execution rights move between the engines without the supervisor, through the two watch
+//! channels of [`EngineIo`]: XEMM quotes until the taker asks for the rights (an arbitrage
+//! passed its entry gate), then cancels, settles and grants them; the taker trades and hands
+//! them back.
+//!
+//! Stopping is each engine's own bounded graceful drain, XEMM first so the taker's final check
+//! sees no resting quote, awaited in full: there is no kill ladder. An engine that fails or
+//! outlives `ENGINE_STOP_TIMEOUT` makes the stop an error.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -19,71 +21,60 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use rust_decimal_macros::dec;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::regime::{py_decimal, Bot, Decision, ReduceLease, Regime, Target, TakerMode, TAKER_BOT, XEMM_BOT};
-use super::risk::{EquityTracker, RealizedTrades};
+use super::risk::{py_decimal, EquityTracker, RealizedTrades};
 use super::{iso, ControllerCfg, EventLog};
 use crate::config::LiveMode;
-use crate::taker::arb::{ExecutionLease, ReduceSignal};
+use crate::taker::arb::ExecutionLease;
 use crate::taker::pnl::write_json_atomic;
 
 const FAST_POLL: Duration = Duration::from_millis(250);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(25);
-/// Consecutive ticks without the required status before the network pause.
+/// Consecutive ticks without both statuses before the network pause.
 const MAX_STATUS_FAILURES: u32 = 3;
 /// Consecutive good status ticks (4 x poll_sec, ~60 s) before a network pause lifts: a
 /// flapping network must not resume two-leg trades that a drop can leave half-filled.
 const STABLE_TICKS: u32 = 4;
-/// A failed poll of the idle engine is not retried for this long.
-const INACTIVE_STATUS_BACKOFF: Duration = Duration::from_secs(60);
-const ORDERS_CLEAR_TIMEOUT: Duration = Duration::from_secs(5);
 /// At startup, long enough for the Aster deadman countdown (`deadman_countdown_ms`, 10 s in
 /// bot.toml) to cancel orders left by a crashed process.
 const STARTUP_ORDERS_CLEAR_TIMEOUT: Duration = Duration::from_secs(15);
 /// Above XEMM's worst-case bounded drain (~190 s: 5 quiesce + 4x2 sends + 70 + 65 + 30 verify
 /// + 5 journal + 5 trip retry). Compose's stop_grace_period (460 s) covers a status tick in
-/// progress (2 x STATUS_TIMEOUT) plus this for the active engine and again for the observer.
+/// progress (2 x STATUS_TIMEOUT) plus this for XEMM and again for the taker.
 const ENGINE_STOP_TIMEOUT: Duration = Duration::from_secs(200);
-/// The third spontaneous exit of the active engine, counting only exits under 10 minutes of
-/// uptime, halts (no time window, as in orchestrator.py).
-const CRASH_LOOP_EXITS: u32 = 3;
-const SHORT_UPTIME_SEC: i64 = 600;
-/// A standby observer that exits is restarted after 60, 120, 240, then 300 s.
-const OBSERVER_RESTART_BASE_SEC: i64 = 60;
-const OBSERVER_RESTART_MAX_SEC: i64 = 300;
 const DIVERGENCE_EVENT_INTERVAL_SEC: i64 = 1800;
 
-/// What an engine task runs as. The observer is a reduce-only taker in standby: it trades
-/// only under the lease and publishes confirmed reduce bursts; a promotion turns it into the
-/// active `Taker(Reduce)` in place.
+/// Bot labels kept from the two-process era: persisted state and reports use them.
+pub const TAKER_BOT: &str = "LIGHTER_ASTER_TAKER_ARB";
+pub const XEMM_BOT: &str = "XEMM_LIGHTER_ASTER";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    Taker(TakerMode),
+pub enum Bot {
+    Taker,
     Xemm,
-    Observer,
 }
 
-impl Role {
+impl Bot {
     pub fn label(self) -> &'static str {
         match self {
-            Role::Taker(TakerMode::Normal) => "taker",
-            Role::Taker(TakerMode::Reduce) => "reduce_taker",
-            Role::Xemm => "xemm",
-            Role::Observer => "observer",
+            Bot::Taker => TAKER_BOT,
+            Bot::Xemm => XEMM_BOT,
         }
     }
 }
 
-/// The channels every reduce-capable taker (observer, reduce taker) is started with.
+/// What the engines share: the execution-rights handshake and the network pause.
 #[derive(Clone)]
 pub struct EngineIo {
-    pub lease: watch::Receiver<Option<ExecutionLease>>,
-    pub signals: watch::Sender<Option<ReduceSignal>>,
+    /// Taker → XEMM: `Some(id)` asks for the execution rights, `None` hands them back.
+    pub want: watch::Sender<Option<u64>>,
+    /// XEMM → taker: the rights, granted once no quote rests and nothing is in flight.
+    pub lease: watch::Sender<Option<ExecutionLease>>,
     /// Network pause: while set, no engine opens new exposure (taker entries, XEMM quotes);
     /// in-flight executions, hedges, recovery and shutdown carry on.
     pub paused: Arc<AtomicBool>,
@@ -91,7 +82,7 @@ pub struct EngineIo {
 
 /// What the supervisor drives: the real engines in production, fakes in tests.
 pub trait Engines {
-    fn spawn(&mut self, role: Role, io: &EngineIo, stop: CancellationToken) -> JoinHandle<Result<()>>;
+    fn spawn(&mut self, bot: Bot, io: &EngineIo, stop: CancellationToken) -> JoinHandle<Result<()>>;
     /// The engine's status report as JSON (`taker::status` / `livebot::status`).
     fn status(&self, bot: Bot) -> impl Future<Output = Result<Value>>;
 }
@@ -123,17 +114,12 @@ impl Files {
 }
 
 struct Task {
-    role: Role,
+    bot: Bot,
     stop: CancellationToken,
     handle: JoinHandle<Result<()>>,
-    started_at: DateTime<Utc>,
 }
 
 impl Task {
-    fn running(&self) -> bool {
-        !self.handle.is_finished()
-    }
-
     /// Cancels the engine and awaits its own graceful drain.
     async fn stop(mut self) -> Result<()> {
         self.stop.cancel();
@@ -142,13 +128,9 @@ impl Task {
             Err(_) => {
                 // Dropping the handle would leave it running (a parked dry run would trade on).
                 self.handle.abort();
-                bail!("{} did not stop within {}s", self.role.label(), ENGINE_STOP_TIMEOUT.as_secs())
+                bail!("{} did not stop within {}s", self.bot.label(), ENGINE_STOP_TIMEOUT.as_secs())
             }
         }
-    }
-
-    async fn join(self) -> Result<()> {
-        flatten(self.handle.await)
     }
 }
 
@@ -160,13 +142,6 @@ fn error_text(result: &Result<()>) -> Value {
     result.as_ref().err().map_or(Value::Null, |error| json!(format!("{error:#}")))
 }
 
-fn slot(bot: Bot) -> usize {
-    match bot {
-        Bot::Taker => 0,
-        Bot::Xemm => 1,
-    }
-}
-
 pub struct Supervisor<E: Engines> {
     cfg: ControllerCfg,
     market: String,
@@ -174,26 +149,13 @@ pub struct Supervisor<E: Engines> {
     files: Files,
     engines: E,
     events: EventLog,
-    regime: Regime,
-    /// The task of the engine holding execution rights (`regime.active`).
-    active: Option<Task>,
-    observer: Option<Task>,
+    /// Both engines, XEMM first (the stop order).
+    tasks: Vec<Task>,
     io: EngineIo,
-    lease_tx: watch::Sender<Option<ExecutionLease>>,
-    signal_rx: watch::Receiver<Option<ReduceSignal>>,
-    /// Consume-once: a burst is used only if newer than the last one used.
-    last_signal_at: Option<DateTime<Utc>>,
-    leases_granted: u64,
     status_failures: u32,
-    /// Set while no engine may open new exposure, because the status became unreadable.
+    /// Set while no engine may open new exposure, because a status became unreadable.
     paused_since: Option<DateTime<Utc>>,
     stable_ticks: u32,
-    backoff_until: [Option<Instant>; 2],
-    active_exit_count: u32,
-    observer_exit_count: u32,
-    observer_retry_after: Option<DateTime<Utc>>,
-    mode_started_at: DateTime<Utc>,
-    switch_counts: [u64; 2],
     equity: EquityTracker,
     trades: RealizedTrades,
     equity_failures: u32,
@@ -217,8 +179,6 @@ impl<E: Engines> Supervisor<E> {
         stop: CancellationToken,
     ) -> Self {
         let now = Utc::now();
-        let (lease_tx, lease_rx) = watch::channel(None);
-        let (signal_tx, signal_rx) = watch::channel(None);
         let equity = EquityTracker::load(
             &market,
             files.baseline.clone(),
@@ -230,29 +190,17 @@ impl<E: Engines> Supervisor<E> {
         );
         let trades = RealizedTrades::new(&market, now, taker_ledger, crate::live_report::inferred_journal_path(&files.xemm_stem));
         Self {
-            regime: Regime::new(cfg.thresholds()),
             cfg,
             market,
             run_mode,
             files,
             engines,
             events,
-            active: None,
-            observer: None,
-            io: EngineIo { lease: lease_rx, signals: signal_tx, paused: Arc::new(AtomicBool::new(false)) },
-            lease_tx,
-            signal_rx,
-            last_signal_at: None,
-            leases_granted: 0,
+            tasks: Vec::new(),
+            io: EngineIo { want: watch::channel(None).0, lease: watch::channel(None).0, paused: Arc::new(AtomicBool::new(false)) },
             status_failures: 0,
             paused_since: None,
             stable_ticks: 0,
-            backoff_until: [None, None],
-            active_exit_count: 0,
-            observer_exit_count: 0,
-            observer_retry_after: None,
-            mode_started_at: now,
-            switch_counts: [0, 0],
             equity,
             trades,
             equity_failures: 0,
@@ -272,9 +220,17 @@ impl<E: Engines> Supervisor<E> {
         if let Err(status) = self.verify_orders_clear(STARTUP_ORDERS_CLEAR_TIMEOUT).await {
             self.safe_halt("startup_orders_not_clear", json!({"xemm_status": status})).await;
         }
+        if !self.stopping() {
+            for bot in [Bot::Xemm, Bot::Taker] {
+                let stop = CancellationToken::new();
+                let handle = self.engines.spawn(bot, &self.io, stop.clone());
+                self.events.emit("bot_started_engine", json!({"bot": bot.label()}));
+                self.tasks.push(Task { bot, stop, handle });
+            }
+        }
         let mut next_tick = Instant::now();
         while !self.stopping() {
-            self.fast_tick().await;
+            self.check_exits().await;
             if !self.stopping() && Instant::now() >= next_tick {
                 self.tick().await;
                 next_tick = Instant::now() + Duration::from_secs(self.cfg.poll_sec);
@@ -287,99 +243,29 @@ impl<E: Engines> Supervisor<E> {
                 _ = self.stop.cancelled() => {}
             }
         }
-        // Active writer first, then the observer.
-        self.events.emit("bot_stopping", json!({"active_bot": self.regime.active.map(Bot::label)}));
-        let active = self.stop_active("shutdown").await;
-        let observer = self.stop_observer("shutdown").await;
+        self.events.emit("bot_stopping", json!({"rights": self.rights()}));
+        let stopped = self.stop_engines("shutdown").await;
         if let Some(reason) = self.halted {
             bail!("safe halt: {reason} (see {})", self.files.breaker.display());
         }
         if self.events.unwritable() {
             bail!("event log {} is unwritable", self.files.events.display());
         }
-        active.and(observer).map_err(|error| error.context("engine stop unresolved"))
+        stopped.map_err(|error| error.context("engine stop unresolved"))
     }
 
     fn stopping(&self) -> bool {
         self.halted.is_some() || self.shutdown || self.stop.is_cancelled()
     }
 
-    async fn fast_tick(&mut self) {
-        self.check_exits().await;
-        if self.stopping() || self.paused_since.is_some() {
-            return;
-        }
-        let Some(signal) = self.fresh_signal() else { return };
-        match (self.regime.active, self.regime.taker_mode) {
-            (Some(Bot::Taker), TakerMode::Reduce) => {
-                self.last_signal_at = Some(signal.timestamp);
-                self.extend_lease("fresh_reduce_signal", Some(&signal));
-            }
-            (Some(Bot::Xemm), _) => {
-                self.last_signal_at = Some(signal.timestamp);
-                self.activate_reduce(signal).await;
-            }
-            // A burst seen by a normal taker or at bootstrap is left unconsumed.
-            _ => {}
-        }
-    }
-
-    fn fresh_signal(&self) -> Option<ReduceSignal> {
-        let signal = self.signal_rx.borrow().clone()?;
-        if signal.status != "confirmed" || signal.market != self.market || signal.samples < self.cfg.reduce_burst_min_samples {
-            return None;
-        }
-        if self.last_signal_at.is_some_and(|last| signal.timestamp <= last) {
-            return None;
-        }
-        let age_ms = (Utc::now() - signal.timestamp).num_milliseconds();
-        (0..=self.cfg.reduce_signal_fresh_ms).contains(&age_ms).then_some(signal)
-    }
-
-    /// XEMM → reduce taker: stop XEMM (full drain), verify both venues clear, grant the lease,
-    /// then promote the warm observer (or cold-start a reduce taker).
-    async fn activate_reduce(&mut self, signal: ReduceSignal) {
-        self.events.emit("reduce_burst_switch_start", json!({"signal": signal}));
-        self.regime.clear_confirm_windows();
-        if let Err(error) = self.stop_active("reduce_burst_signal").await {
-            return self.safe_halt("xemm_shutdown_unresolved", json!({"error": format!("{error:#}")})).await;
-        }
-        if let Err(status) = self.verify_orders_clear(ORDERS_CLEAR_TIMEOUT).await {
-            return self.safe_halt("xemm_orders_not_clear_for_reduce_arb", json!({"xemm_status": status, "signal": signal})).await;
-        }
-        if self.stopping() {
-            return;
-        }
-        self.grant_lease("reduce_burst_signal", Some(&signal));
-        if let Some(dead) = self.observer.take_if(|task| !task.running()) {
-            self.on_observer_exit(dead).await;
-        }
-        let task = match self.observer.take() {
-            Some(observer) => {
-                self.events.emit("observer_promoted_to_reduce_arb", json!({"lease_id": self.regime.lease.as_ref().map(|l| &l.id)}));
-                Task { role: Role::Taker(TakerMode::Reduce), ..observer }
-            }
-            None => {
-                self.events.emit("reduce_standby_missing_starting_cold", json!({"signal": signal}));
-                self.spawn(Role::Taker(TakerMode::Reduce))
-            }
-        };
-        self.active = Some(task);
-        self.set_active(Bot::Taker, TakerMode::Reduce);
+    /// Who holds the execution rights now.
+    fn rights(&self) -> &'static str {
+        if self.io.lease.borrow().is_some() { "taker" } else { "xemm" }
     }
 
     async fn tick(&mut self) {
-        self.check_exits().await;
-        if self.stopping() {
-            return;
-        }
-        let (taker, mut xemm) = self.poll_statuses().await;
-        let required = match self.regime.active {
-            Some(Bot::Taker) => taker.is_some(),
-            Some(Bot::Xemm) => xemm.is_some(),
-            None => taker.is_some() || xemm.is_some(),
-        };
-        if !required {
+        let (taker, xemm) = (self.read_status(Bot::Taker).await, self.read_status(Bot::Xemm).await);
+        if taker.is_none() || xemm.is_none() {
             // Unreadable status is almost always the network: halting cannot drain or cancel
             // without it either, so pause new exposure and wait for it to come back.
             self.status_failures += 1;
@@ -393,92 +279,35 @@ impl<E: Engines> Supervisor<E> {
             return;
         }
         self.status_failures = 0;
-        let new_taker_trades = self.trades.poll(&mut self.events);
-        if self.regime.active == Some(Bot::Taker) && self.regime.taker_mode == TakerMode::Reduce && new_taker_trades > 0 {
-            self.extend_lease("reduce_trade", None);
-        }
+        self.trades.poll(&mut self.events);
         let sample = self.record_equity(taker.as_ref(), xemm.as_ref());
         if let Some(reason) = self.equity.breach().or_else(|| self.trades.breach(self.cfg.max_loss_usdc)) {
             return self.safe_halt("pnl_breaker", json!({"breaker_reason": reason, "pnl_sample": sample})).await;
         }
-        // Loss stops run on every readable status; switching waits for a stable network.
         if let Some(since) = self.paused_since {
             self.stable_ticks += 1;
-            if self.stable_ticks < STABLE_TICKS {
-                return;
-            }
-            self.paused_since = None;
-            self.io.paused.store(false, Ordering::Release);
-            self.events.emit("network_resume", json!({"paused_secs": (Utc::now() - since).num_seconds()}));
-        }
-        let decision = self.regime.decide(taker.as_ref(), xemm.as_ref(), Instant::now(), Utc::now());
-        let target = match decision.target {
-            Target::SafeHalt => return self.safe_halt(decision.reason, Value::Object(decision.details)).await,
-            Target::Bot(bot) => bot,
-        };
-        if target == Bot::Xemm && xemm.is_none() {
-            xemm = self.read_status(Bot::Xemm, true).await;
-            match &xemm {
-                None => {
-                    self.events.emit("xemm_switch_deferred_no_status", json!({"reason": decision.reason}));
-                    return self.write_state(taker.as_ref(), None, &decision);
-                }
-                Some(status) if status.get("reduce_position_only") != Some(&Value::Bool(true)) => {
-                    let flag = status.get("reduce_position_only").cloned();
-                    return self.safe_halt("xemm_reduce_position_only_disabled", json!({"reduce_position_only": flag})).await;
-                }
-                Some(_) => {}
+            if self.stable_ticks >= STABLE_TICKS {
+                self.paused_since = None;
+                self.io.paused.store(false, Ordering::Release);
+                self.events.emit("network_resume", json!({"paused_secs": (Utc::now() - since).num_seconds()}));
             }
         }
-        self.ensure_bot(target, decision.reason, &decision.details, decision.taker_mode.unwrap_or(TakerMode::Normal)).await;
-        if self.stopping() {
-            return;
-        }
-        self.ensure_observer_for(target).await;
-        if self.stopping() {
-            return;
-        }
-        self.write_state(taker.as_ref(), xemm.as_ref(), &decision);
+        self.write_state(taker.as_ref(), xemm.as_ref(), Value::Null);
     }
 
-    /// The taker only while it holds the rights; with XEMM active XEMM is required and the idle
-    /// taker is read too (for resume); at bootstrap XEMM is read only if the taker failed.
-    async fn poll_statuses(&mut self) -> (Option<Value>, Option<Value>) {
-        match self.regime.active {
-            Some(Bot::Taker) => (self.read_status(Bot::Taker, false).await, None),
-            Some(Bot::Xemm) => {
-                let xemm = self.read_status(Bot::Xemm, false).await;
-                (self.read_status(Bot::Taker, true).await, xemm)
-            }
-            None => {
-                let taker = self.read_status(Bot::Taker, false).await;
-                let xemm = if taker.is_none() { self.read_status(Bot::Xemm, true).await } else { None };
-                (taker, xemm)
-            }
-        }
-    }
-
-    async fn read_status(&mut self, bot: Bot, inactive: bool) -> Option<Value> {
-        let index = slot(bot);
-        if inactive && self.backoff_until[index].is_some_and(|until| Instant::now() < until) {
-            return None;
-        }
+    async fn read_status(&mut self, bot: Bot) -> Option<Value> {
         let failure = match tokio::time::timeout(STATUS_TIMEOUT, self.engines.status(bot)).await {
             Ok(Ok(mut status)) if status.get("market").and_then(Value::as_str) == Some(self.market.as_str()) => {
                 if let Some(map) = status.as_object_mut() {
                     map.entry("bot").or_insert_with(|| json!(bot.label()));
                 }
-                self.backoff_until[index] = None;
                 return Some(status);
             }
             Ok(Ok(status)) => json!({"error": "status for another market", "market": status.get("market")}),
             Ok(Err(error)) => json!({"error": format!("{error:#}")}),
             Err(_) => json!({"error": "timeout"}),
         };
-        self.events.emit("status_read_failed", json!({"bot": bot.label(), "inactive": inactive, "failure": failure}));
-        if inactive {
-            self.backoff_until[index] = Some(Instant::now() + INACTIVE_STATUS_BACKOFF);
-        }
+        self.events.emit("status_read_failed", json!({"bot": bot.label(), "failure": failure}));
         None
     }
 
@@ -488,7 +317,7 @@ impl<E: Engines> Supervisor<E> {
         let until = Instant::now() + deadline;
         let mut last = Value::Null;
         loop {
-            if let Some(status) = self.read_status(Bot::Xemm, false).await {
+            if let Some(status) = self.read_status(Bot::Xemm).await {
                 let count = |venue: &str| status.pointer(&format!("/accounts/{venue}_open_orders")).and_then(Value::as_u64);
                 if count("aster") == Some(0) && count("lighter") == Some(0) {
                     return Ok(());
@@ -503,9 +332,7 @@ impl<E: Engines> Supervisor<E> {
     }
 
     /// The drawdown stop samples the taker's marked equity when its status has one, else
-    /// XEMM's. The orchestrator sampled the active engine, so each switch swapped equity
-    /// calculators under one baseline; this keeps one definition unless the taker status is
-    /// unavailable.
+    /// XEMM's, so one definition holds unless the taker status is unavailable.
     fn record_equity(&mut self, taker: Option<&Value>, xemm: Option<&Value>) -> Value {
         let now = Utc::now();
         let equity_of = |status: Option<&Value>| status.and_then(|s| py_decimal(s.pointer("/accounts/total_equity_usd")));
@@ -523,11 +350,9 @@ impl<E: Engines> Supervisor<E> {
             (None, None) => None,
         };
         let Some((label, equity, status)) = source else {
-            if taker.is_some() || xemm.is_some() {
-                self.equity_failures += 1;
-                if self.equity_failures == 3 {
-                    self.events.emit("equity_feed_starving", json!({"consecutive_failures": self.equity_failures}));
-                }
+            self.equity_failures += 1;
+            if self.equity_failures == 3 {
+                self.events.emit("equity_feed_starving", json!({"consecutive_failures": self.equity_failures}));
             }
             return Value::Null;
         };
@@ -537,231 +362,40 @@ impl<E: Engines> Supervisor<E> {
         }
         self.equity_source = Some(label);
         let accounts = status.and_then(|s| s.get("accounts")).cloned().unwrap_or(Value::Null);
-        self.equity.record(equity, label, &accounts, self.regime.active.map(Bot::label), now, &mut self.events)
+        self.equity.record(equity, label, &accounts, now, &mut self.events)
     }
 
-    async fn ensure_bot(&mut self, target: Bot, reason: &'static str, details: &Map<String, Value>, mode: TakerMode) {
-        let running = self.active.as_ref().is_some_and(Task::running);
-        if self.regime.active == Some(target) && running && (target != Bot::Taker || self.regime.taker_mode == mode) {
-            return;
+    /// Stops XEMM, then the taker; the first failure is returned once both were tried.
+    async fn stop_engines(&mut self, reason: &str) -> Result<()> {
+        let mut result = Ok(());
+        for task in std::mem::take(&mut self.tasks) {
+            let bot = task.bot;
+            let stopped = task.stop().await;
+            self.events.emit("bot_stopped", json!({"bot": bot.label(), "reason": reason, "error": error_text(&stopped)}));
+            result = result.and(stopped);
         }
-        self.check_exits().await;
-        if self.stopping() {
-            return;
-        }
-        let stopping_xemm_for_taker = self.regime.active == Some(Bot::Xemm) && target == Bot::Taker;
-        let why = format!("switch_to_{}", target.label());
-        if target == Bot::Taker {
-            if let Err(error) = self.stop_observer(&why).await {
-                return self.safe_halt("observer_shutdown_unresolved", json!({"error": format!("{error:#}")})).await;
-            }
-        }
-        if let Err(error) = self.stop_active(&why).await {
-            return self.safe_halt("bot_shutdown_unresolved", json!({"error": format!("{error:#}")})).await;
-        }
-        if stopping_xemm_for_taker {
-            if let Err(status) = self.verify_orders_clear(ORDERS_CLEAR_TIMEOUT).await {
-                return self.safe_halt("xemm_orders_not_clear_on_resume", json!({"xemm_status": status})).await;
-            }
-        }
-        // A stop asked for during the drain starts nothing new.
-        if self.stopping() {
-            return;
-        }
-        let role = if target == Bot::Xemm { Role::Xemm } else { Role::Taker(mode) };
-        let task = self.spawn(role);
-        self.events.emit("bot_switched", json!({"bot": target.label(), "role": role.label(), "reason": reason, "details": details}));
-        self.active = Some(task);
-        self.regime.clear_confirm_windows();
-        self.set_active(target, mode);
-    }
-
-    async fn ensure_observer_for(&mut self, target: Bot) {
-        let unwanted = if !self.cfg.observer {
-            Some("observer_disabled")
-        } else if target != Bot::Xemm {
-            Some("active_taker")
-        } else {
-            None
-        };
-        if let Some(reason) = unwanted {
-            if let Err(error) = self.stop_observer(reason).await {
-                self.safe_halt("observer_shutdown_unresolved", json!({"error": format!("{error:#}")})).await;
-            }
-            return;
-        }
-        if let Some(dead) = self.observer.take_if(|task| !task.running()) {
-            self.on_observer_exit(dead).await;
-        }
-        if self.observer.is_some() || self.observer_retry_after.is_some_and(|at| Utc::now() < at) {
-            return;
-        }
-        self.observer = Some(self.spawn(Role::Observer));
-    }
-
-    fn spawn(&mut self, role: Role) -> Task {
-        let stop = CancellationToken::new();
-        let handle = self.engines.spawn(role, &self.io, stop.clone());
-        self.events.emit("bot_started_engine", json!({"role": role.label()}));
-        Task { role, stop, handle, started_at: Utc::now() }
-    }
-
-    fn set_active(&mut self, bot: Bot, mode: TakerMode) {
-        self.regime.active = Some(bot);
-        self.regime.taker_mode = if bot == Bot::Taker { mode } else { TakerMode::Normal };
-        self.mode_started_at = Utc::now();
-        self.switch_counts[slot(bot)] += 1;
-    }
-
-    /// Stops the engine holding the rights; the reduce lease is revoked before its stop.
-    async fn stop_active(&mut self, reason: &str) -> Result<()> {
-        if self.regime.active == Some(Bot::Taker) && self.regime.taker_mode == TakerMode::Reduce {
-            self.revoke_lease(reason);
-        }
-        let result = match self.active.take() {
-            Some(task) => self.stop_task(task, reason).await,
-            None => Ok(()),
-        };
-        self.regime.active = None;
-        self.regime.taker_mode = TakerMode::Normal;
         result
     }
 
-    /// An observer that already exited takes the restart backoff instead of failing the stop.
-    async fn stop_observer(&mut self, reason: &str) -> Result<()> {
-        match self.observer.take() {
-            Some(task) if !task.running() => {
-                self.on_observer_exit(task).await;
-                Ok(())
-            }
-            Some(task) => self.stop_task(task, reason).await,
-            None => Ok(()),
-        }
-    }
-
-    async fn stop_task(&mut self, task: Task, reason: &str) -> Result<()> {
-        let role = task.role;
-        let result = task.stop().await;
-        self.events.emit("bot_stopped", json!({"role": role.label(), "reason": reason, "error": error_text(&result)}));
-        result
-    }
-
+    /// Both engines run for the whole session: one that exits, cleanly or not, halts the bot.
     async fn check_exits(&mut self) {
-        if let Some(task) = self.active.take_if(|task| !task.running()) {
-            let (role, started_at) = (task.role, task.started_at);
-            let reduce = role == Role::Taker(TakerMode::Reduce);
-            let result = task.join().await;
-            self.events.emit("bot_exited", json!({"role": role.label(), "error": error_text(&result)}));
-            if reduce {
-                self.revoke_lease("active_reduce_taker_exited");
-            }
-            let bot = self.regime.active.map_or("none", Bot::label);
-            self.regime.active = None;
-            self.regime.taker_mode = TakerMode::Normal;
-            self.regime.clear_confirm_windows();
-            if let Err(error) = result {
-                let details = json!({"bot": bot, "role": role.label(), "error": format!("{error:#}"), "reduce_mode": reduce});
-                return self.safe_halt("active_bot_exited_nonzero", details).await;
-            }
-            let uptime = (Utc::now() - started_at).num_seconds();
-            self.active_exit_count = if uptime >= SHORT_UPTIME_SEC { 0 } else { self.active_exit_count + 1 };
-            if self.active_exit_count >= CRASH_LOOP_EXITS {
-                let details = json!({"bot": bot, "consecutive_short_exits": self.active_exit_count, "last_uptime_sec": uptime});
-                return self.safe_halt("active_bot_crash_loop", details).await;
-            }
-        }
-        if let Some(task) = self.observer.take_if(|task| !task.running()) {
-            self.on_observer_exit(task).await;
-        }
+        let Some(index) = self.tasks.iter().position(|task| task.handle.is_finished()) else { return };
+        let task = self.tasks.remove(index);
+        let details = json!({"bot": task.bot.label(), "error": error_text(&flatten(task.handle.await))});
+        self.events.emit("bot_exited", details.clone());
+        self.safe_halt("engine_exited", details).await;
     }
 
-    /// Observer exits never halt; they back off 60/120/240/300 s.
-    async fn on_observer_exit(&mut self, task: Task) {
-        let started_at = task.started_at;
-        let result = task.join().await;
-        let now = Utc::now();
-        if (now - started_at).num_seconds() >= SHORT_UPTIME_SEC {
-            self.observer_exit_count = 0;
-        }
-        self.observer_exit_count += 1;
-        let retry_sec = (OBSERVER_RESTART_BASE_SEC << (self.observer_exit_count - 1).min(3)).min(OBSERVER_RESTART_MAX_SEC);
-        self.observer_retry_after = Some(now + chrono::Duration::seconds(retry_sec));
-        self.events.emit("observer_restart_delayed", json!({
-            "error": error_text(&result), "retry_sec": retry_sec, "consecutive_exits": self.observer_exit_count,
-        }));
-    }
-
-    /// A fresh lease (new id, cap from now) unless one is held; either way the expiry becomes
-    /// `now + reduce_lease_sec`, capped.
-    fn grant_lease(&mut self, reason: &str, signal: Option<&ReduceSignal>) {
-        let now = Utc::now();
-        if self.regime.lease.is_none() {
-            self.leases_granted += 1;
-            self.regime.lease = Some(ReduceLease {
-                id: format!("reduce-{}-{}-{}", self.market, now.format("%Y%m%dT%H%M%S%.6fZ"), self.leases_granted),
-                started_at: now,
-                expires_at: now,
-                max_expires_at: now + chrono::Duration::seconds(self.cfg.reduce_lease_max_sec),
-            });
-        }
-        let lease = self.regime.lease.as_mut().expect("lease set above");
-        lease.expires_at = (now + chrono::Duration::seconds(self.cfg.reduce_lease_sec)).min(lease.max_expires_at);
-        let lease = lease.clone();
-        self.publish_lease(&lease);
-        self.events.emit("reduce_lease_granted", json!({
-            "reason": reason, "lease_id": lease.id, "expires_at": iso(lease.expires_at),
-            "max_expires_at": iso(lease.max_expires_at), "signal": signal,
-        }));
-    }
-
-    /// Extends only when that moves the expiry by more than a second (never once capped).
-    fn extend_lease(&mut self, reason: &str, signal: Option<&ReduceSignal>) {
-        let Some(lease) = self.regime.lease.as_mut() else {
-            return self.grant_lease(reason, signal);
-        };
-        let now = Utc::now();
-        // An expired lease stays expired: the next decision hands the rights back to XEMM.
-        if lease.expires_at <= now {
-            return;
-        }
-        let desired = (now + chrono::Duration::seconds(self.cfg.reduce_lease_sec)).min(lease.max_expires_at);
-        if desired <= lease.expires_at + chrono::Duration::seconds(1) {
-            return;
-        }
-        lease.expires_at = desired;
-        let lease = lease.clone();
-        self.publish_lease(&lease);
-        self.events.emit("reduce_lease_extended", json!({"reason": reason, "lease_id": lease.id, "expires_at": iso(lease.expires_at)}));
-    }
-
-    fn revoke_lease(&mut self, reason: &str) {
-        self.lease_tx.send_replace(None);
-        if let Some(lease) = self.regime.lease.take() {
-            self.events.emit("reduce_lease_revoked", json!({"reason": reason, "lease_id": lease.id}));
-        }
-    }
-
-    fn publish_lease(&self, lease: &ReduceLease) {
-        self.lease_tx.send_replace(Some(ExecutionLease {
-            market: self.market.clone(),
-            lease_id: lease.id.clone(),
-            expires_at: lease.expires_at,
-        }));
-    }
-
-    /// Stops the active writer, then the observer, and latches the breaker file that
-    /// refuses the next start until `--ack-breaker`.
+    /// Stops both engines and latches the breaker file that refuses the next start until
+    /// `--ack-breaker`.
     async fn safe_halt(&mut self, reason: &'static str, details: Value) {
         if self.halted.is_some() {
             return;
         }
         self.halted = Some(reason);
         self.events.emit("safe_halt", json!({"reason": reason, "details": details}));
-        if let Err(error) = self.stop_active("safe_halt").await {
-            self.events.emit("stop_failed", json!({"stage": "active", "error": format!("{error:#}")}));
-        }
-        if let Err(error) = self.stop_observer("safe_halt").await {
-            self.events.emit("stop_failed", json!({"stage": "observer", "error": format!("{error:#}")}));
+        if let Err(error) = self.stop_engines("safe_halt").await {
+            self.events.emit("stop_failed", json!({"error": format!("{error:#}")}));
         }
         let breaker = json!({
             "active": true, "triggered_at": iso(Utc::now()), "market": self.market, "reason": reason,
@@ -770,36 +404,17 @@ impl<E: Engines> Supervisor<E> {
         if let Err(error) = write_json_atomic(&self.files.breaker, &breaker, true) {
             self.events.emit("breaker_file_write_failed", json!({"path": self.files.breaker.display().to_string(), "error": format!("{error:#}")}));
         }
-        let details = match details {
-            Value::Object(map) => map,
-            other => Map::from_iter([("details".to_owned(), other)]),
-        };
-        let decision = Decision { target: Target::SafeHalt, reason, taker_mode: None, details };
-        self.write_state(None, None, &decision);
+        self.write_state(None, None, json!({"reason": reason, "details": details}));
     }
 
     /// `bot-<M>.state.json`: read by combined_pnl.py (and trade_history.py through it) and
-    /// bot_stats.py (`active_bot`, `accounts.{taker,xemm}.total_equity_usd`, `pnl`) and by
-    /// operators.
-    fn write_state(&mut self, taker: Option<&Value>, xemm: Option<&Value>, decision: &Decision) {
-        let now = Utc::now();
+    /// bot_stats.py (`rights`, `accounts.{taker,xemm}.total_equity_usd`, `pnl`) and by
+    /// operators. `halt` is set once a safe halt latched.
+    fn write_state(&mut self, taker: Option<&Value>, xemm: Option<&Value>, halt: Value) {
         let field = |status: Option<&Value>, key: &str| status.and_then(|s| s.get(key)).cloned().unwrap_or(Value::Null);
-        let lease = self.regime.lease.as_ref();
         let state = json!({
-            "timestamp": iso(now), "market": self.market, "run_mode": self.run_mode.as_str(),
-            "active_bot": self.regime.active.map(Bot::label),
-            "active_taker_mode": (self.regime.active == Some(Bot::Taker)).then(|| self.regime.taker_mode.as_str()),
-            "observer": {
-                "enabled": self.cfg.observer, "running": self.observer.as_ref().is_some_and(Task::running),
-                "retry_after": self.observer_retry_after.map(iso),
-            },
-            "reduce_lease": {
-                "id": lease.map(|l| &l.id), "active": self.regime.lease_active(now), "started_at": lease.map(|l| iso(l.started_at)),
-                "expires_at": lease.map(|l| iso(l.expires_at)), "max_expires_at": lease.map(|l| iso(l.max_expires_at)),
-            },
-            "mode_age_sec": (now - self.mode_started_at).num_seconds(),
-            "switch_counts": {TAKER_BOT: self.switch_counts[0], XEMM_BOT: self.switch_counts[1]},
-            "decision": decision.to_json(),
+            "timestamp": iso(Utc::now()), "market": self.market, "run_mode": self.run_mode.as_str(),
+            "rights": self.rights(), "halt": halt,
             "pnl": self.equity.summary(),
             "trades": self.trades.summary(),
             "positions": {"taker": field(taker, "positions"), "xemm": field(xemm, "positions")},
@@ -813,266 +428,95 @@ impl<E: Engines> Supervisor<E> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     use super::*;
 
-    /// How a fake engine behaves once asked to stop.
-    #[derive(Clone, Copy)]
-    enum OnStop {
-        /// Drains for this long, then returns Ok.
-        Drain(Duration),
-        Fail,
-        Hang,
-    }
-
     #[derive(Clone, Default)]
     struct Shared {
-        statuses: Arc<Mutex<HashMap<&'static str, Value>>>,
-        spawned: Arc<Mutex<Vec<Role>>>,
-        /// Set when the fake XEMM finishes its drain.
-        xemm_drained: Arc<AtomicBool>,
-        /// Whether XEMM had drained when a reduce taker first saw a lease.
-        lease_seen_after_drain: Arc<Mutex<Option<bool>>>,
-        io: Arc<Mutex<Option<EngineIo>>>,
+        statuses: Arc<Mutex<Vec<(Bot, Value)>>>,
+        /// Engine stops, in order.
+        stopped: Arc<Mutex<Vec<Bot>>>,
     }
 
+    /// Engines that run until stopped; with `taker_fails` the taker instead fails at once.
     struct Fake {
         shared: Shared,
-        on_stop: HashMap<&'static str, OnStop>,
-        /// Engines that return Ok on their own right after starting.
-        exit_at_once: bool,
+        taker_fails: bool,
     }
 
     impl Engines for Fake {
-        fn spawn(&mut self, role: Role, io: &EngineIo, stop: CancellationToken) -> JoinHandle<Result<()>> {
-            self.shared.spawned.lock().unwrap().push(role);
-            *self.shared.io.lock().unwrap() = Some(io.clone());
-            let on_stop = *self.on_stop.get(role.label()).unwrap_or(&OnStop::Drain(Duration::ZERO));
-            let (shared, exit_at_once) = (self.shared.clone(), self.exit_at_once);
-            let mut lease = io.lease.clone();
+        fn spawn(&mut self, bot: Bot, _io: &EngineIo, stop: CancellationToken) -> JoinHandle<Result<()>> {
+            let (shared, fails) = (self.shared.clone(), self.taker_fails && bot == Bot::Taker);
             tokio::spawn(async move {
-                if exit_at_once {
-                    return Ok(());
-                }
-                if matches!(role, Role::Observer | Role::Taker(TakerMode::Reduce)) {
-                    let shared = shared.clone();
-                    tokio::spawn(async move {
-                        while lease.changed().await.is_ok() {
-                            if lease.borrow().is_some() {
-                                let drained = shared.xemm_drained.load(Ordering::SeqCst);
-                                shared.lease_seen_after_drain.lock().unwrap().get_or_insert(drained);
-                            }
-                        }
-                    });
+                if fails {
+                    return Err(anyhow!("taker failed"));
                 }
                 stop.cancelled().await;
-                match on_stop {
-                    OnStop::Drain(time) => {
-                        tokio::time::sleep(time).await;
-                        if role == Role::Xemm {
-                            shared.xemm_drained.store(true, Ordering::SeqCst);
-                        }
-                        Ok(())
-                    }
-                    OnStop::Fail => Err(anyhow!("drain verification failed")),
-                    OnStop::Hang => std::future::pending().await,
-                }
+                shared.stopped.lock().unwrap().push(bot);
+                Ok(())
             })
         }
 
         async fn status(&self, bot: Bot) -> Result<Value> {
-            let key = if bot == Bot::Taker { "taker" } else { "xemm" };
-            self.shared.statuses.lock().unwrap().get(key).cloned().ok_or_else(|| anyhow!("{key} status unavailable"))
+            let statuses = self.shared.statuses.lock().unwrap();
+            statuses.iter().find(|(b, _)| *b == bot).map(|(_, s)| s.clone()).ok_or_else(|| anyhow!("{} status unavailable", bot.label()))
         }
     }
 
-    /// A taker margin-limited at the default clips (min available 40 - buffer 25 < 26).
-    fn blocked_taker() -> Value {
-        json!({"market": "HYPE", "desired_notional_usd": "13", "required_gross_edge_bps": "6", "margin_buffer_usd": "25",
-               "opportunities": [], "positions": {"abs_position_notional_usd": "150", "headroom_notional_usd": "50"},
-               "accounts": {"aster_available_usd": "40", "lighter_available_usd": "40", "total_equity_usd": "200"}})
-    }
-
-    fn xemm_status(open_orders: u64) -> Value {
-        json!({"market": "HYPE", "reduce_position_only": true, "desired_notional_usd": "13",
-               "positions": {"abs_position_notional_usd": "150"},
-               "accounts": {"aster_open_orders": open_orders, "lighter_open_orders": 0, "total_equity_usd": "200"}})
-    }
-
-    fn supervisor(on_stop: &[(&'static str, OnStop)], exit_at_once: bool) -> (Supervisor<Fake>, Shared, PathBuf) {
+    fn supervisor(taker_fails: bool) -> (Supervisor<Fake>, Shared, PathBuf) {
         let dir = crate::dryrun::tests::temp_dir("bot-supervisor");
         let shared = Shared::default();
-        let fake = Fake { shared: shared.clone(), on_stop: on_stop.iter().copied().collect(), exit_at_once };
         let files = Files::new(&dir, "HYPE");
         let events = EventLog::new(files.events.clone());
+        let fake = Fake { shared: shared.clone(), taker_fails };
         let sup = Supervisor::new(ControllerCfg::default(), "HYPE".into(), LiveMode::Live, files, dir.join("trades_HYPE.jsonl"), fake, events, CancellationToken::new());
         (sup, shared, dir)
     }
 
-    fn set_status(shared: &Shared, key: &'static str, status: Value) {
-        shared.statuses.lock().unwrap().insert(key, status);
-    }
-
-    fn event_kinds(dir: &Path) -> Vec<String> {
-        let text = std::fs::read_to_string(dir.join("bot-HYPE.events.jsonl")).unwrap_or_default();
-        text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).map(|row| row["kind"].as_str().unwrap().to_owned()).collect()
-    }
-
-    fn signal(age_ms: i64) -> ReduceSignal {
-        let at = Utc::now() - chrono::Duration::milliseconds(age_ms);
-        ReduceSignal { timestamp: at, market: "HYPE".into(), status: "confirmed", samples: 3, window_ms: 2000, first_seen: at, last_seen: at, best: Default::default() }
-    }
-
-    fn publish(shared: &Shared, signal: ReduceSignal) {
-        shared.io.lock().unwrap().as_ref().unwrap().signals.send_replace(Some(signal));
-    }
-
-    /// Bootstrap on a blocked taker → XEMM plus the standby observer.
-    async fn start_on_xemm(sup: &mut Supervisor<Fake>, shared: &Shared) {
-        set_status(shared, "taker", blocked_taker());
-        set_status(shared, "xemm", xemm_status(0));
-        sup.tick().await;
-        assert_eq!(sup.regime.active, Some(Bot::Xemm));
-        assert_eq!(*shared.spawned.lock().unwrap(), [Role::Xemm, Role::Observer]);
+    fn set_statuses(shared: &Shared) {
+        let status = json!({"market": "HYPE", "accounts": {"aster_open_orders": 0, "lighter_open_orders": 0, "total_equity_usd": "200"}});
+        *shared.statuses.lock().unwrap() = vec![(Bot::Xemm, status.clone()), (Bot::Taker, status)];
     }
 
     #[tokio::test(start_paused = true)]
-    async fn reduce_rights_move_only_after_xemm_drained_and_orders_clear() {
-        let (mut sup, shared, dir) = supervisor(&[("xemm", OnStop::Drain(Duration::from_secs(3)))], false);
-        start_on_xemm(&mut sup, &shared).await;
-        let burst = signal(10);
-        publish(&shared, burst.clone());
-        sup.fast_tick().await;
-        // Let the fake engines' tasks observe the published lease.
-        tokio::time::sleep(Duration::from_millis(1)).await;
-        assert_eq!(sup.regime.active, Some(Bot::Taker));
-        assert_eq!(sup.regime.taker_mode, TakerMode::Reduce);
-        assert_eq!(*shared.lease_seen_after_drain.lock().unwrap(), Some(true), "the lease must follow XEMM's drain");
-        assert_eq!(*shared.spawned.lock().unwrap(), [Role::Xemm, Role::Observer], "the warm observer is promoted, not restarted");
-        let lease = sup.io.lease.borrow().clone().expect("lease granted");
-        // The same burst is consumed once; a newer one extends the lease in reduce mode.
-        sup.fast_tick().await;
-        assert_eq!(sup.regime.active, Some(Bot::Taker));
-        tokio::time::advance(Duration::from_secs(2)).await;
-        let later = ReduceSignal { timestamp: Utc::now(), ..burst };
-        publish(&shared, later.clone());
-        sup.fast_tick().await;
-        assert_eq!(sup.last_signal_at, Some(later.timestamp));
-        assert_eq!(sup.io.lease.borrow().as_ref().unwrap().lease_id, lease.lease_id);
-        assert!(event_kinds(&dir).contains(&"reduce_lease_granted".to_owned()));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn failed_xemm_drain_halts_without_granting_the_lease() {
-        let (mut sup, shared, dir) = supervisor(&[("xemm", OnStop::Fail)], false);
-        start_on_xemm(&mut sup, &shared).await;
-        publish(&shared, signal(10));
-        sup.fast_tick().await;
-        assert_eq!(sup.halted, Some("xemm_shutdown_unresolved"));
-        assert!(sup.io.lease.borrow().is_none());
+    async fn an_engine_exit_halts_and_stops_xemm_before_the_taker() {
+        let (sup, shared, dir) = supervisor(true);
+        set_statuses(&shared);
+        let error = sup.run().await.expect_err("an engine exit is a halt");
+        assert!(format!("{error:#}").contains("engine_exited"), "{error:#}");
+        assert_eq!(*shared.stopped.lock().unwrap(), [Bot::Xemm]);
         assert!(dir.join("bot-HYPE.breaker.json").exists());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
 
-    #[tokio::test(start_paused = true)]
-    async fn resting_orders_after_the_drain_block_the_lease() {
-        let (mut sup, shared, dir) = supervisor(&[], false);
-        start_on_xemm(&mut sup, &shared).await;
-        set_status(&shared, "xemm", xemm_status(1));
-        publish(&shared, signal(10));
-        sup.fast_tick().await;
-        assert_eq!(sup.halted, Some("xemm_orders_not_clear_for_reduce_arb"));
-        assert!(sup.io.lease.borrow().is_none());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn stale_or_foreign_bursts_are_ignored() {
-        let (mut sup, shared, dir) = supervisor(&[], false);
-        start_on_xemm(&mut sup, &shared).await;
-        publish(&shared, signal(60_001));
-        sup.fast_tick().await;
-        publish(&shared, ReduceSignal { market: "ETH".into(), ..signal(10) });
-        sup.fast_tick().await;
-        publish(&shared, ReduceSignal { samples: 2, ..signal(10) });
-        sup.fast_tick().await;
-        assert_eq!(sup.regime.active, Some(Bot::Xemm));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn near_flat_in_reduce_mode_returns_to_a_normal_taker_after_revoking_the_lease() {
-        let (mut sup, shared, dir) = supervisor(&[], false);
-        start_on_xemm(&mut sup, &shared).await;
-        publish(&shared, signal(10));
-        sup.fast_tick().await;
-        let mut flat = blocked_taker();
-        flat["positions"]["abs_position_notional_usd"] = json!("12");
-        set_status(&shared, "taker", flat);
-        sup.tick().await;
-        assert_eq!((sup.regime.active, sup.regime.taker_mode), (Some(Bot::Taker), TakerMode::Normal));
-        assert!(sup.io.lease.borrow().is_none());
-        assert_eq!(*shared.spawned.lock().unwrap(), [Role::Xemm, Role::Observer, Role::Taker(TakerMode::Normal)]);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn an_expired_lease_returns_to_xemm() {
-        let (mut sup, shared, dir) = supervisor(&[], false);
-        start_on_xemm(&mut sup, &shared).await;
-        publish(&shared, signal(10));
-        sup.fast_tick().await;
-        sup.regime.lease.as_mut().unwrap().expires_at = Utc::now() - chrono::Duration::seconds(1);
-        sup.tick().await;
-        assert_eq!(sup.regime.active, Some(Bot::Xemm));
-        assert!(sup.io.lease.borrow().is_none());
-        assert_eq!(shared.spawned.lock().unwrap().last(), Some(&Role::Observer));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn an_engine_that_never_stops_halts_instead_of_switching() {
-        let (mut sup, shared, dir) = supervisor(&[("xemm", OnStop::Hang)], false);
-        start_on_xemm(&mut sup, &shared).await;
-        publish(&shared, signal(10));
-        sup.fast_tick().await;
-        assert_eq!(sup.halted, Some("xemm_shutdown_unresolved"));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn three_short_clean_exits_halt_as_a_crash_loop() {
-        let (mut sup, shared, dir) = supervisor(&[], true);
-        set_status(&shared, "taker", blocked_taker());
-        set_status(&shared, "xemm", xemm_status(0));
-        for _ in 0..3 {
-            sup.tick().await;
-            tokio::task::yield_now().await;
-            sup.check_exits().await;
+        // A clean stop drains XEMM first, then the taker.
+        let (sup, shared, clean) = supervisor(false);
+        set_statuses(&shared);
+        let stop = sup.stop.clone();
+        let running = tokio::spawn(sup.run());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        stop.cancel();
+        running.await.unwrap().unwrap();
+        assert_eq!(*shared.stopped.lock().unwrap(), [Bot::Xemm, Bot::Taker]);
+        for dir in [dir, clean] {
+            std::fs::remove_dir_all(dir).unwrap();
         }
-        assert_eq!(sup.halted, Some("active_bot_crash_loop"));
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test(start_paused = true)]
     async fn unreadable_status_pauses_and_a_stable_network_resumes() {
-        let (mut sup, shared, dir) = supervisor(&[], false);
+        let (mut sup, shared, dir) = supervisor(false);
         let paused = sup.io.paused.clone();
         for _ in 0..3 {
             sup.tick().await;
         }
         assert!(sup.halted.is_none() && paused.load(Ordering::Acquire), "an outage pauses, never halts");
-        set_status(&shared, "taker", blocked_taker());
+        set_statuses(&shared);
         for _ in 0..STABLE_TICKS - 1 {
             sup.tick().await;
         }
-        shared.statuses.lock().unwrap().remove("taker");
+        shared.statuses.lock().unwrap().pop();
         sup.tick().await; // a drop inside the window restarts it
-        set_status(&shared, "taker", blocked_taker());
+        set_statuses(&shared);
         for _ in 0..STABLE_TICKS - 1 {
             sup.tick().await;
             assert!(paused.load(Ordering::Acquire), "still inside the stability window");

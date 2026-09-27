@@ -9,9 +9,9 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::regime::{Bot, TakerMode};
-use super::supervisor::{EngineIo, Engines, Role};
+use super::supervisor::{Bot, EngineIo, Engines};
 use super::BotConfig;
+use crate::livebot::strategy::Rights;
 use crate::taker::arb::RunOptions;
 
 pub struct LiveEngines {
@@ -20,9 +20,6 @@ pub struct LiveEngines {
     maker_cfg: crate::config::Config,
     maker_markets: Vec<crate::config::MarketCfg>,
     xemm_stem: PathBuf,
-    reduce_cooldown_ms: u64,
-    reduce_burst_min_samples: usize,
-    reduce_burst_window_ms: i64,
     taker_status: crate::taker::status::StatusPoller,
     xemm_status: crate::livebot::status::StatusPoller,
 }
@@ -43,37 +40,27 @@ impl LiveEngines {
             maker_cfg: cfg.maker.clone(),
             maker_markets,
             xemm_stem,
-            reduce_cooldown_ms: cfg.controller.reduce_cooldown_ms,
-            reduce_burst_min_samples: cfg.controller.reduce_burst_min_samples,
-            reduce_burst_window_ms: cfg.controller.reduce_burst_window_ms,
         })
     }
 }
 
 impl Engines for LiveEngines {
-    fn spawn(&mut self, role: Role, io: &EngineIo, stop: CancellationToken) -> JoinHandle<Result<()>> {
-        let (cfg, markets) = (self.taker_cfg.clone(), self.taker_markets.clone());
+    fn spawn(&mut self, bot: Bot, io: &EngineIo, stop: CancellationToken) -> JoinHandle<Result<()>> {
         let pause = io.paused.clone();
-        match role {
-            Role::Xemm => {
+        match bot {
+            Bot::Xemm => {
                 let (cfg, markets, stem) = (self.maker_cfg.clone(), self.maker_markets.clone(), self.xemm_stem.clone());
-                tokio::spawn(async move { crate::livebot::run(&cfg, markets, stem, pause, stop).await })
+                let rights = Rights { want: io.want.subscribe(), lease: io.lease.clone() };
+                tokio::spawn(async move { crate::livebot::run(&cfg, markets, stem, pause, Some(rights), stop).await })
             }
-            Role::Taker(TakerMode::Normal) => {
-                let options = RunOptions { pause: Some(pause), ..RunOptions::default() };
-                tokio::spawn(crate::taker::arb::run(cfg, markets, options, stop))
-            }
-            Role::Taker(TakerMode::Reduce) | Role::Observer => {
+            Bot::Taker => {
                 let options = RunOptions {
-                    lease: Some(io.lease.clone()),
-                    reduce_signals: Some(io.signals.clone()),
-                    reduce_cooldown_ms: self.reduce_cooldown_ms,
-                    reduce_signal_min_samples: self.reduce_burst_min_samples,
-                    reduce_signal_window_ms: self.reduce_burst_window_ms,
+                    lease: Some(io.lease.subscribe()),
+                    want: Some(io.want.clone()),
                     pause: Some(pause),
                     ..RunOptions::default()
                 };
-                tokio::spawn(crate::taker::arb::run(cfg, markets, options, stop))
+                tokio::spawn(crate::taker::arb::run(self.taker_cfg.clone(), self.taker_markets.clone(), options, stop))
             }
         }
     }

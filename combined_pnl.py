@@ -213,13 +213,12 @@ def default_state_path(roots: tuple[Path, Path], market: str) -> Path:
 
 
 def latest_capital_from_state(path: Path) -> tuple[Decimal | None, str | None]:
-    """The active engine's equity in the controller state, else the other engine's."""
+    """The taker's equity in the controller state, else XEMM's: both read the same accounts."""
     if not path.exists():
         return None, None
     state = json.loads(path.read_text(encoding="utf-8"))
     accounts = state.get("accounts") or {}
-    taker_first = state.get("active_bot") == "LIGHTER_ASTER_TAKER_ARB"
-    for key in (["taker", "xemm"] if taker_first else ["xemm", "taker"]):
+    for key in ("taker", "xemm"):
         equity = dec((accounts.get(key) or {}).get("total_equity_usd"), Decimal("-1"))
         if equity > 0:
             return equity, f"{path}:{key}.total_equity_usd"

@@ -147,6 +147,9 @@ pub enum HedgeCommand {
         intent: HedgeIntent,
         aggressive_px: Decimal,
     },
+    /// Hard-refresh the Lighter nonce: under `run` the taker signs with the same API key, so
+    /// XEMM re-reads the nonce after each taker turn. Queued, so later hedges use the new one.
+    RefreshNonce,
     /// Drain and stop the worker.
     Shutdown,
 }

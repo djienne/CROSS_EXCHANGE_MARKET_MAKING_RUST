@@ -721,9 +721,9 @@ pub(crate) mod tests {
         let (stop, stem) = (CancellationToken::new(), runs.join("bot-HYPE"));
         let xemm = tokio::spawn({
             let (cfg, stop, stem) = (cfg.maker.clone(), stop.clone(), stem.clone());
-            async move { crate::livebot::run(&cfg, maker_markets, stem, Default::default(), stop).await }
+            async move { crate::livebot::run(&cfg, maker_markets, stem, Default::default(), None, stop).await }
         });
-        // `run`'s standby taker observes beside XEMM, on the same account, with no lease.
+        // A taker waiting for a lease runs beside XEMM on the same account, as under `run`.
         let (_no_lease, lease) = tokio::sync::watch::channel(None);
         let (observer_stop, options) = (CancellationToken::new(), crate::taker::arb::RunOptions { lease: Some(lease), ..Default::default() });
         let observer = tokio::spawn(crate::taker::arb::run(cfg.taker.clone(), taker_markets.clone(), options, observer_stop.clone()));
@@ -746,8 +746,8 @@ pub(crate) mod tests {
         assert!(trade.aster_px.is_some_and(|px| px < dec!(99)), "the maker fill is at the bot's own bid: {trade:?}");
         assert_eq!(trade.lighter_px, Some(dec!(99)), "the hedge took the Lighter bid: {trade:?}");
         assert!(trade.last_mono_ns - trade.first_mono_ns >= 300_000_000, "the hedge waited out the taker delay: {trade:?}");
-        // A hand-back stops the standby first, while XEMM still quotes: having sent nothing, it
-        // stops cleanly whatever rests on the account.
+        // The waiting taker stops first, while XEMM still quotes: having sent nothing, it stops
+        // cleanly whatever rests on the account.
         let rest = xemm_aster(&cfg.maker.live.aster.base_url);
         tokio::time::timeout(Duration::from_secs(10), async {
             while rest.open_orders(None).await.unwrap().is_empty() {

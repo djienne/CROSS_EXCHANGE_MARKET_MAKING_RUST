@@ -1,7 +1,8 @@
-# One Lighter/Aster bot for one market: the taker-taker arbitrage engine ([taker]) and the
-# Aster-maker / Lighter-hedge engine ([maker], "XEMM"), with execution rights switched in
-# memory by the controller ([controller]). Every key is checked at startup; an unknown or
-# misplaced key fails the load.
+# One Lighter/Aster bot for one market: the Aster-maker / Lighter-hedge engine ([maker],
+# "XEMM") quotes, and when an arbitrage passes the taker-taker engine's entry gate ([taker]),
+# XEMM pulls its quotes and the taker trades, then XEMM quotes again. [controller] holds the
+# cross-engine loss stop. Every key is checked at startup; an unknown or misplaced key fails
+# the load.
 #
 # Run with (the mode is a command-line choice only):
 #   lighter_aster_bot run --config bot.toml --market HYPE --mode live
@@ -12,27 +13,6 @@
 
 [controller]
 poll_sec              = 15
-# Normal taker -> XEMM once the taker has been blocked (below the switch clips of position
-# headroom or free margin, or a profitable trade held back by them, with no executable
-# reducing trade) for blocked_confirm_sec.
-blocked_confirm_sec   = 90
-# XEMM -> normal taker once the taker has been ready (near flat, a reducing trade executable,
-# or no longer blocked at the resume clips) for resume_confirm_sec.
-resume_confirm_sec    = 45
-switch_headroom_clips = "2"
-switch_margin_clips   = "2"
-# resume_headroom_clips = "3"   # default: switch clips + 1 (hysteresis)
-# resume_margin_clips   = "3"
-near_flat_notional_usd = "0"    # 0 = one clip
-# While XEMM is active a reduce-only taker observes; a burst of reduce_burst_min_samples
-# reducing opportunities within reduce_burst_window_ms moves the rights to it under a lease.
-observer                 = true
-reduce_signal_fresh_ms   = 60000
-reduce_burst_min_samples = 3
-reduce_burst_window_ms   = 2000
-reduce_lease_sec         = 180
-reduce_lease_max_sec     = 300
-reduce_cooldown_ms       = 5000
 # Cross-engine stop, inclusive: marked equity drawdown from the persisted baseline, or the
 # realized PnL of both engines' trades (unverified gains never count). A trip writes
 # runs/bot-<MARKET>.breaker.json; restart needs --ack-breaker (a drawdown trip also
@@ -179,9 +159,9 @@ cancel_all_on_user_stream_stale = true
 
 [maker.live.quote]
 use_hot_integer_math               = true
-# Inventory-unwind mode: when flat, quote both sides; once cross-venue inventory exists, only post
-# the Aster maker side whose paired Lighter hedge reduces it. `run` requires true.
-reduce_position_only               = true
+# false: quote both sides, each fill hedged at once (Hummingbot's XEMM), within [maker.capital].
+# true: once cross-venue inventory exists, only post the side whose Lighter hedge reduces it.
+reduce_position_only               = false
 replace_immediately_if_unprofitable = true
 min_requote_interval_ms            = 150
 # Live safety cap for per-symbol replace churn. The separate Aster command budget below protects

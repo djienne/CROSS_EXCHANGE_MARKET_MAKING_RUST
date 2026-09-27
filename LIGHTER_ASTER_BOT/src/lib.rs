@@ -1,6 +1,6 @@
 //! Aster/Lighter bot. `run` (`controller`) trades one market with the
 //! taker–taker engine (`taker`) and the XEMM engine (`livebot`: quotes on Aster, hedges
-//! fills on Lighter), switching execution rights between them in memory.
+//! fills on Lighter), which hands the execution rights to the taker for each arbitrage.
 
 pub mod book;
 pub mod cli;

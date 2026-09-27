@@ -19,7 +19,7 @@ runs apart from the bot, with its own crate, image, container and data.
   - **XEMM:** the quote price, a fill only when trades print through the quote (those of one ms
     add up), the hedge latency and the distance gate (skipped behind a maker top thinner than the
     bot's depth). After a fill the market pauses 3 s; with inventory, only the side that reduces it
-    is quoted (`reduce_position_only`). A fill under the hedge venue's $10 minimum is held, then
+    is quoted (`reduce_position_only`, which the bot now ships off). A fill under the hedge venue's $10 minimum is held, then
     corrected by a taker order, from flat on the maker venue, and the market pauses 6 s more.
   - Both close their leftover inventory at the last window's mean basis, without fees or spread: a
     standing basis is paid back, not earned.

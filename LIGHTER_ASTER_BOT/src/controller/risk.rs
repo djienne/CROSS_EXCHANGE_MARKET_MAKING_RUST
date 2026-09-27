@@ -1,10 +1,9 @@
 //! Cross-engine loss stops, ported from orchestrator.py (`PnlTracker`, `TradeTracker`,
 //! `breaker_reason`). One limit (`max_loss_usdc`), two independent tests, both inclusive and
-//! evaluated every tick before the regime decision:
+//! evaluated every tick:
 //! * **equity drawdown** `last_equity - baseline <= -limit`. The baseline is one sample,
-//!   armed on the first sample once an engine is active and persisted, so a loss keeps
-//!   counting across restarts; a baseline not refreshed for `baseline_max_gap_hours` is
-//!   discarded.
+//!   armed on the first sample and persisted, so a loss keeps counting across restarts; a
+//!   baseline not refreshed for `baseline_max_gap_hours` is discarded.
 //! * **realized trade PnL** since startup: unverified gains never count, unverified losses
 //!   count in full.
 //!
@@ -15,6 +14,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::SystemTime;
 
 use anyhow::{bail, Result};
@@ -24,7 +24,6 @@ use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::regime::py_decimal;
 use super::{iso, EventLog};
 use crate::live_report::TradeSummary;
 use crate::taker::pnl::{append_json_line, write_json_atomic};
@@ -105,19 +104,17 @@ impl EquityTracker {
     }
 
     /// Records one equity sample computed by `source_bot`'s status. Arms the baseline on the
-    /// first sample with an engine active (a bootstrap sample may come from either engine),
-    /// refreshes the persisted file hourly, and appends the sample to the equity log.
+    /// first sample, refreshes the persisted file hourly, and appends the sample to the equity log.
     pub fn record(
         &mut self,
         equity: Decimal,
         source_bot: &str,
         accounts: &Value,
-        active_bot: Option<&str>,
         now: DateTime<Utc>,
         events: &mut EventLog,
     ) -> Value {
         match &self.baseline {
-            None if active_bot.is_some() => {
+            None => {
                 self.baseline = Some(BaselineFile {
                     market: self.market.clone(),
                     baseline_equity_usd: equity,
@@ -148,7 +145,7 @@ impl EquityTracker {
         self.last_equity = Some(equity);
         let baseline = self.baseline.as_ref().map(|b| b.baseline_equity_usd);
         let sample = json!({
-            "timestamp": iso(now), "market": self.market, "active_bot": active_bot, "source_bot": source_bot,
+            "timestamp": iso(now), "market": self.market, "source_bot": source_bot,
             "total_equity_usd": equity.normalize(), "baseline_equity_usd": baseline.map(|b| b.normalize()),
             "equity_pnl_usdc": baseline.map(|b| (equity - b).normalize()),
             "aster_equity_usd": accounts.get("aster_equity_usd"), "lighter_equity_usd": accounts.get("lighter_equity_usd"),
@@ -445,6 +442,19 @@ pub fn check_breaker(path: &Path, ack: bool, reset_baseline: bool, events: &mut 
     Ok(())
 }
 
+/// `Decimal(str(raw))` when finite, else `None` (economics.optional_decimal): how the retired
+/// orchestrator.py read engine reports, kept for the ledger's JSON numbers.
+pub fn py_decimal(raw: Option<&Value>) -> Option<Decimal> {
+    let text = match raw? {
+        Value::String(text) => text.trim().to_owned(),
+        Value::Number(number) => number.to_string(),
+        // str(True) / str([..]) / str({..}) are not decimals; None is unknown.
+        Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => return None,
+    };
+    // Plain and exponent forms; Infinity/NaN are not finite, so unknown as in the original.
+    Decimal::from_str(&text).ok().or_else(|| text.contains(['e', 'E']).then(|| Decimal::from_scientific(&text).ok()).flatten())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,21 +465,20 @@ mod tests {
     }
 
     #[test]
-    fn drawdown_stop_is_inclusive_and_arms_only_with_an_engine_active() {
+    fn drawdown_stop_is_inclusive_and_survives_a_restart() {
         let dir = temp_dir("bot-risk");
         let mut events = EventLog::new(dir.join("events.jsonl"));
         let now = Utc::now();
         let mut equity = tracker(&dir, now, &mut events);
-        equity.record(dec!(100), "T", &Value::Null, None, now, &mut events);
-        assert!(!dir.join("b.json").exists(), "a bootstrap sample must not arm the baseline");
-        equity.record(dec!(100), "T", &Value::Null, Some("T"), now, &mut events);
-        equity.record(dec!(85.01), "T", &Value::Null, Some("T"), now, &mut events);
+        equity.record(dec!(100), "T", &Value::Null, now, &mut events);
+        assert!(dir.join("b.json").exists(), "the first sample arms the baseline");
+        equity.record(dec!(85.01), "T", &Value::Null, now, &mut events);
         assert_eq!(equity.breach(), None);
-        equity.record(dec!(85), "T", &Value::Null, Some("T"), now, &mut events);
+        equity.record(dec!(85), "T", &Value::Null, now, &mut events);
         assert!(equity.breach().unwrap().starts_with("equity_drawdown"));
         // The baseline survives a restart, so the loss keeps counting.
         let mut reloaded = tracker(&dir, now + chrono::Duration::hours(1), &mut events);
-        reloaded.record(dec!(84), "X", &Value::Null, None, now, &mut events);
+        reloaded.record(dec!(84), "X", &Value::Null, now, &mut events);
         assert!(reloaded.breach().is_some());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -480,7 +489,7 @@ mod tests {
         let mut events = EventLog::new(dir.join("events.jsonl"));
         let armed = Utc::now() - chrono::Duration::days(5);
         let mut equity = tracker(&dir, armed, &mut events);
-        equity.record(dec!(100), "T", &Value::Null, Some("T"), armed, &mut events);
+        equity.record(dec!(100), "T", &Value::Null, armed, &mut events);
         assert!(tracker(&dir, Utc::now(), &mut events).baseline.is_none());
         assert!(!dir.join("b.json").exists());
         std::fs::remove_dir_all(dir).unwrap();

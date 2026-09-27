@@ -10,7 +10,7 @@ use std::path::PathBuf;
 #[command(
     name = "lighter_aster_bot",
     version,
-    about = "Aster/Lighter bot (`run`): taker-taker arbitrage and an XEMM inventory unwinder with execution rights switched in memory; plus probes, status and reports",
+    about = "Aster/Lighter bot (`run`): XEMM quoting that hands the execution rights to taker-taker arbitrage; plus probes, status and reports",
     after_help = "Taker engine on its own: `lighter_aster_bot taker --help`."
 )]
 pub struct Cli {
@@ -24,8 +24,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Run the bot for one market: the taker holds execution rights while it has margin; a
-    /// reduce-only XEMM unwinds inventory when it does not. Sends REAL orders in `--mode live`.
+    /// Run the bot for one market: XEMM quotes and hands the execution rights to the taker for
+    /// each arbitrage that passes its entry gate. Sends REAL orders in `--mode live`.
     Run {
         /// Market id, listed once in both [[taker.markets]] and [[maker.markets]] (e.g. HYPE).
         #[arg(long)]

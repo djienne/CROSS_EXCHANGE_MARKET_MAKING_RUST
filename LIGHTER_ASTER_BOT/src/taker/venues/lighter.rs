@@ -1779,8 +1779,8 @@ fn raw_price(px: Decimal, decimals: u32, side: Side) -> Result<i32> {
 
 /// Layout: 40 bits wall-clock ms | 7-bit counter | side bit. Collision-free ONLY within a
 /// single process on one account (assumption: one submitting process per account at a time —
-/// the `run` controller hands execution rights between its engines, and the standby observer submits
-/// only under a lease; other live writers are refused by the market lock). Within a process, two ids collide
+/// under `run` the taker submits only under XEMM's lease, while XEMM has nothing resting or in
+/// flight; other live writers are refused by the market lock). Within a process, two ids collide
 /// only if the 7-bit counter wraps inside one millisecond; the wrap guard below spins to
 /// the next millisecond instead (128+ orders per ms never happens in practice — this is a
 /// correctness backstop, not a hot path).

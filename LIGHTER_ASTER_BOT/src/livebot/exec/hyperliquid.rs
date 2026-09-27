@@ -1236,6 +1236,7 @@ pub async fn run_hl_worker(mut rx: Receiver<HedgeCommand>, tx: Sender<ExecEvent>
                 }
                 break;
             }
+            HedgeCommand::RefreshNonce => refresh_nonce(&ex, &mut waits).await,
             cmd => handle_hedge_cmd(&ex, &tx, &journal, &mut waits, cmd).await,
         }
     }
@@ -1248,6 +1249,14 @@ pub async fn run_hl_worker(mut rx: Receiver<HedgeCommand>, tx: Sender<ExecEvent>
         }
     }
     info!("lighter hedge worker stopped");
+}
+
+/// Hedges wait (`tx_ready`) until the nonce is re-read; a failed read is repaired in the
+/// background.
+async fn refresh_nonce(ex: &HlExchange, waits: &mut tokio::task::JoinSet<()>) {
+    ex.nonce_uncertain.store(true, Ordering::Release);
+    if ex.nonce.hard_refresh(&ex.rest).await.is_ok() { ex.nonce_uncertain.store(false, Ordering::Release); }
+    else { let ex = ex.clone(); waits.spawn(async move { repair_nonce(&ex).await }); }
 }
 
 async fn handle_hedge_cmd(ex: &HlExchange, tx: &Sender<ExecEvent>, journal: &Journal,
@@ -1277,11 +1286,7 @@ async fn handle_hedge_cmd(ex: &HlExchange, tx: &Sender<ExecEvent>, journal: &Jou
         HedgeSendOutcome::Terminal { ev, refresh_nonce_after_emit, proof } => {
             if let Some(proof) = proof { let _ = tx.send(ExecEvent::AttemptStarted { cloid, proof }).await; }
             let _ = tx.send(ev).await;
-            if refresh_nonce_after_emit {
-                ex.nonce_uncertain.store(true, Ordering::Release);
-                if ex.nonce.hard_refresh(&ex.rest).await.is_ok() { ex.nonce_uncertain.store(false, Ordering::Release); }
-                else { let ex = ex.clone(); waits.spawn(async move { repair_nonce(&ex).await }); }
-            }
+            if refresh_nonce_after_emit { refresh_nonce(ex, waits).await; }
         }
         HedgeSendOutcome::AwaitFills { token, rx, overflow, requested_qty, proof, ambiguous } => {
             intent.qty = requested_qty;
