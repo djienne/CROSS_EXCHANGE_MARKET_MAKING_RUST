@@ -1,7 +1,5 @@
 //! Credential loading. Live trading reads the `aster.env` / `lighter.env` dotenv files of
-//! [`env_files`], derives the venue ROLE for each address from the **key**, not from the
-//! (user-editable, sometimes mislabeled) field names, and validates the mapping before a single
-//! signed call. A dry run signs with a fixed identity instead ([`venue_creds`]).
+//! [`env_files`]; a dry run signs with a fixed identity instead ([`venue_creds`]).
 //!
 //! These files contain real private keys in plaintext — they MUST be gitignored and never
 //! logged. This module logs only public addresses, never key material.
@@ -95,47 +93,14 @@ impl AsterCreds {
         AsterCreds { user: dry_run_owner(), signer, key }
     }
 
-    /// Load + role-resolve from a dotenv file. `signer` = the address derived from `private_key`;
-    /// `user` = the address field (`wallet_address`/`subaccount_address`) that ISN'T the signer.
+    /// Load from a dotenv file: `API_USER` (the main account), `API_SIGNER` (the API wallet) and
+    /// `API_PRIVATE_KEY` (the API wallet's key). `EvmAsterSigner::new` checks that the signer is
+    /// the key's address before anything is signed.
     pub fn load(path: &Path) -> Result<Self> {
         let m = parse_env_file(path)?;
-        let key = parse_priv_key(m.get("private_key").context("aster env missing private_key")?)?;
-        let derived = address_from_priv(&key)?;
-        let derived_lc = address_hex(&derived); // lowercase 0x form
-
-        let mut signer: Option<String> = None;
-        let mut user: Option<String> = None;
-        for field in ["wallet_address", "subaccount_address"] {
-            if let Some(v) = m.get(field) {
-                let vb = parse_address(v)
-                    .with_context(|| format!("aster env {field} is not a valid address"))?;
-                if address_hex(&vb) == derived_lc {
-                    signer = Some(v.clone()); // preserve source case for the request field
-                } else {
-                    user = Some(v.clone());
-                }
-            }
-        }
-        // Cross-check: the env file must explicitly list the API-wallet (signer) address and it
-        // must match the private key. This catches a swapped/rotated key against a stale env
-        // file before anything is signed with the wrong identity. Deliberately strict — the
-        // signer address is NOT synthesized from the key alone.
-        let Some(signer) = signer else {
-            bail!(
-                "aster env cross-check failed: neither wallet_address nor subaccount_address \
-                 matches the private key's address {derived_lc}. Add the API-wallet address \
-                 (e.g. `subaccount_address={derived_lc}`) alongside the main-account address, \
-                 or fix private_key if it was rotated."
-            );
-        };
-        // The user (main account) is mandatory and cannot be the signer.
-        let user = user.ok_or_else(|| {
-            anyhow!(
-                "could not determine the Aster main-account (user) address from the env file: \
-                 no wallet_address/subaccount_address differs from the key's address {derived_lc}"
-            )
-        })?;
-        info!("aster credentials: user={user} signer={signer} (roles derived from the key)");
+        let (user, signer) = (required(&m, "API_USER")?, required(&m, "API_SIGNER")?);
+        let key = parse_priv_key(&required(&m, "API_PRIVATE_KEY")?)?;
+        info!("aster credentials: user={user} signer={signer}");
         Ok(AsterCreds { user, signer, key })
     }
 }
@@ -301,32 +266,21 @@ mod tests {
     }
 
     #[test]
-    fn aster_roles_derived_from_key_not_field_names() {
-        // Sample role layout: signer in subaccount_address, user in wallet_address.
-        let body = format!(
-            "wallet_name=xemm\nwallet_address={USER1}\nprivate_key={KEY1}\nsubaccount_address={ADDR1}\n"
-        );
-        let p = write_tmp("aster", &body);
+    fn aster_reads_user_signer_and_key_and_the_signer_checks_them() {
+        let body = |signer: &str| format!("API_USER={USER1}\nAPI_SIGNER={signer}\nAPI_PRIVATE_KEY={KEY1}\n");
+        let p = write_tmp("aster", &body(ADDR1));
         let c = AsterCreds::load(&p).unwrap();
-        assert_eq!(c.user.to_lowercase(), USER1);
-        assert_eq!(c.signer.to_lowercase(), ADDR1);
-        std::fs::remove_file(p).ok();
-    }
-
-    #[test]
-    fn aster_rejects_when_no_user_distinct_from_signer() {
-        let body = format!("private_key={KEY1}\nwallet_address={ADDR1}\nsubaccount_address={ADDR1}\n");
-        let p = write_tmp("aster-bad", &body);
-        assert!(AsterCreds::load(&p).is_err());
-        std::fs::remove_file(p).ok();
-    }
-
-    #[test]
-    fn aster_rejects_when_no_address_matches_key() {
-        let body = format!("private_key={KEY1}\nwallet_address={USER1}\nsubaccount_address=0x2222222222222222222222222222222222222222\n");
-        let p = write_tmp("aster-mismatch", &body);
-        assert!(AsterCreds::load(&p).is_err());
-        std::fs::remove_file(p).ok();
+        assert_eq!((c.user.as_str(), c.signer.as_str()), (USER1, ADDR1));
+        super::super::sign::EvmAsterSigner::new(c.user, c.signer, c.key).unwrap();
+        // A signer that is not the key's address loads, but no signer is built from it.
+        let p2 = write_tmp("aster-mismatch", &body("0x2222222222222222222222222222222222222222"));
+        let c = AsterCreds::load(&p2).unwrap();
+        assert!(super::super::sign::EvmAsterSigner::new(c.user, c.signer, c.key).is_err());
+        let p3 = write_tmp("aster-missing", &format!("API_USER={USER1}\nAPI_PRIVATE_KEY={KEY1}\n"));
+        assert!(format!("{:#}", AsterCreds::load(&p3).err().expect("refused")).contains("API_SIGNER"));
+        for p in [p, p2, p3] {
+            std::fs::remove_file(p).ok();
+        }
     }
 
     #[test]

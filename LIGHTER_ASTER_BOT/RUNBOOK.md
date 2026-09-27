@@ -41,8 +41,8 @@ cargo build --release --locked        # Rust 1.92; the Lighter signers exist for
 
 - `aster.env` and `lighter.env` sit in the working directory (or at `ASTER_ENV_PATH` /
   `LIGHTER_ENV_PATH`), mode `600`, with the keys of `aster.env.example` / `lighter.env.example`;
-  `run --mode live` refuses them if group/other can read them. `aster.env` must list the signer
-  address in `wallet_address`/`subaccount_address`, and that address must match the private key.
+  `run --mode live` refuses them if group/other can read them. `API_SIGNER` in `aster.env` must be
+  the address of `API_PRIVATE_KEY`.
 - Every process that signs for the same Aster API wallet must see the same `ASTER_NONCE_DIR`
   (default: the OS temp dir's `lighter-aster-nonces`), writable by the bot user. The nonces
   are clock-based and strictly increasing, so losing the directory at a reboot is safe; never
