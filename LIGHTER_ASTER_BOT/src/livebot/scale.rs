@@ -36,7 +36,7 @@ pub struct MarketScale {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotQtyScale {
     Aster,
-    Hyperliquid,
+    Hedge,
 }
 
 impl MarketScale {
@@ -322,7 +322,7 @@ fn fill(out: &mut [HotLevel; HOT_LEVELS], levels: &[crate::book::Level], scale: 
         let px_ticks = scale.price_to_ticks(lvl.px);
         let qty_lots = match qty_scale {
             HotQtyScale::Aster => scale.qty_to_lots(lvl.qty),
-            HotQtyScale::Hyperliquid => scale.hl_qty_to_lots(lvl.qty),
+            HotQtyScale::Hedge => scale.hl_qty_to_lots(lvl.qty),
         };
         if px_ticks <= 0 || qty_lots <= 0 {
             continue;
@@ -348,7 +348,7 @@ where
         let Some(px_ticks) = scale.price_str_to_ticks(px_s) else { continue };
         let qty_lots = match qty_scale {
             HotQtyScale::Aster => scale.qty_str_to_lots(qty_s),
-            HotQtyScale::Hyperliquid => scale.hl_qty_str_to_lots(qty_s),
+            HotQtyScale::Hedge => scale.hl_qty_str_to_lots(qty_s),
         };
         let Some(qty_lots) = qty_lots else { continue };
         if px_ticks <= 0 || qty_lots <= 0 {
@@ -371,7 +371,7 @@ fn fill_dec(
         let Some(px_ticks) = scale.price_dec_to_ticks(px) else { continue };
         let qty_lots = match qty_scale {
             HotQtyScale::Aster => scale.qty_dec_to_lots(qty),
-            HotQtyScale::Hyperliquid => scale.hl_qty_dec_to_lots(qty),
+            HotQtyScale::Hedge => scale.hl_qty_dec_to_lots(qty),
         };
         let Some(qty_lots) = qty_lots else { continue };
         if px_ticks <= 0 || qty_lots <= 0 {
@@ -451,8 +451,8 @@ pub(crate) mod tests {
         let scale = MarketScale::from_spec(&spec());
         let raw = [("100.04", "0.005"), ("100.041", "0.003"), ("99.9", "1.5"), ("99.8", "0.0004"), ("98.15", "0.25")];
         let decimals: Vec<(Decimal, Decimal)> = raw.iter().map(|(p,q)| (p.parse().unwrap(), q.parse().unwrap())).collect();
-        let decimal_book = build_hot_book_from_dec_levels_with_qty_scale(&decimals, &decimals, &scale, HotQtyScale::Hyperliquid, 123, 456);
-        let wire_book = build_hot_book_from_strs_with_qty_scale(raw, raw, &scale, HotQtyScale::Hyperliquid, 123, 456);
+        let decimal_book = build_hot_book_from_dec_levels_with_qty_scale(&decimals, &decimals, &scale, HotQtyScale::Hedge, 123, 456);
+        let wire_book = build_hot_book_from_strs_with_qty_scale(raw, raw, &scale, HotQtyScale::Hedge, 123, 456);
         for book in [decimal_book, wire_book] {
             let bids: Vec<_> = book.bids().iter().map(|l| (l.px_ticks, l.qty_lots)).collect();
             assert_eq!(bids, vec![(1000, 8), (999, 1500), (982, 250)]);
@@ -496,7 +496,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn hyperliquid_hot_quantities_use_hl_step() {
+    fn hedge_hot_quantities_use_the_hedge_step() {
         let mut spec = spec();
         spec.step = dec!(0.01);
         spec.hl_qty_step = dec!(0.001);
@@ -514,7 +514,7 @@ pub(crate) mod tests {
             [("100.0", "0.019")],
             [("100.1", "0.019")],
             &s,
-            HotQtyScale::Hyperliquid,
+            HotQtyScale::Hedge,
             100,
             1_700_000_000_000,
         );

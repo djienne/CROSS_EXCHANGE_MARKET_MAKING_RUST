@@ -16,7 +16,7 @@ use crate::types::{MarketId, RejectReason, Side};
 use super::account::{AccountSnapshot, Venue};
 use super::exec::aster::AsterRest;
 use super::exec::creds::{venue_creds, AsterCreds};
-use super::exec::hyperliquid::HlExchange;
+use super::exec::lighter::LighterExchange;
 use super::exec::sign::EvmAsterSigner;
 use super::reconcile::Reconciler;
 use super::scale::MarketScale;
@@ -146,19 +146,19 @@ impl StatusPoller {
             &selected,
             cfg.live.partials.lighter_min_notional,
             &cfg.live.aster.base_url,
-            &cfg.live.hyperliquid.base_url,
+            &cfg.live.lighter.base_url,
         )
         .await?;
         let spec = specs.first().context("no resolved market spec")?.clone();
         let (acreds, lcreds) = venue_creds(cfg.live.dry_run)?;
         let aster = build_aster(cfg, &specs, acreds)?;
-        let lighter = HlExchange::new_read_only(
-            cfg.live.hyperliquid.base_url.clone(),
-            Path::new(&cfg.live.hyperliquid.signers_dir),
+        let lighter = LighterExchange::new_read_only(
+            cfg.live.lighter.base_url.clone(),
+            Path::new(&cfg.live.lighter.signers_dir),
             &lcreds,
             &specs,
-            cfg.live.hyperliquid.fill_timeout_ms,
-            cfg.live.hyperliquid.ws_account_max_age_ms,
+            cfg.live.lighter.fill_timeout_ms,
+            cfg.live.lighter.ws_account_max_age_ms,
         )?;
         let reconciler = Reconciler::new(aster, lighter, &specs, cfg.live.max_book_staleness_ms);
         Ok(Self { cfg: cfg.clone(), spec, reconciler, http: rest_book::client()? })
@@ -170,7 +170,7 @@ impl StatusPoller {
             rest_book::fetch_aster_book_from_base(&self.http, &self.cfg.live.aster.base_url, &self.spec.aster_symbol, 20),
             rest_book::fetch_lighter_book_from_base(
                 &self.http,
-                &self.cfg.live.hyperliquid.base_url,
+                &self.cfg.live.lighter.base_url,
                 self.spec.lighter_market_id,
                 20
             ),
@@ -205,7 +205,7 @@ fn build_report(
     let now = Utc::now();
     let pos = PositionSnapshot {
         aster_qty: snapshot.reported_position(Venue::Aster, &spec.market_id),
-        lighter_qty: snapshot.reported_position(Venue::Hyperliquid, &spec.market_id),
+        lighter_qty: snapshot.reported_position(Venue::Hedge, &spec.market_id),
     };
     let mark = aster_book.mid().or_else(|| lighter_book.mid());
     StatusReport {
@@ -215,7 +215,7 @@ fn build_report(
         reduce_position_only: cfg.live.quote.reduce_position_only,
         mark_price: mark,
         desired_notional_usd: cfg.quote.desired_notional,
-        max_abs_position_notional_usd: cfg.capital.aster_cap_notional().min(cfg.capital.hyperliquid_cap_notional()),
+        max_abs_position_notional_usd: cfg.capital.aster_cap_notional().min(cfg.capital.lighter_cap_notional()),
         max_position_mismatch_usd: cfg.live.max_position_mismatch_usd,
         margin_buffer_usd: cfg.live.margin_guard.aster_safety_buffer_usd,
         positions: position_status(cfg, mark, pos),
@@ -233,7 +233,7 @@ fn position_status(cfg: &Config, mark: Option<Decimal>, pos: PositionSnapshot) -
     let net_mismatch_notional_usd = mark.map(|m| net_qty.abs() * m);
     let abs_position_notional_usd =
         mark.map(|m| pos.aster_qty.abs().max(pos.lighter_qty.abs()) * m);
-    let cap = cfg.capital.aster_cap_notional().min(cfg.capital.hyperliquid_cap_notional());
+    let cap = cfg.capital.aster_cap_notional().min(cfg.capital.lighter_cap_notional());
     let headroom_notional_usd = abs_position_notional_usd.map(|n| (cap - n).max(Decimal::ZERO));
     PositionStatus {
         aster_qty: pos.aster_qty,
@@ -254,7 +254,7 @@ fn account_status(snapshot: &AccountSnapshot, market: &MarketId) -> AccountStatu
     let lighter_open_orders = snapshot
         .open_orders
         .iter()
-        .filter(|o| o.venue == Venue::Hyperliquid && &o.market == market)
+        .filter(|o| o.venue == Venue::Hedge && &o.market == market)
         .count();
     AccountStatus {
         aster_available_usd: snapshot.aster_available_usd,
@@ -294,7 +294,7 @@ fn quote_status(
         aster_pos_qty: pos.aster_qty,
         hl_pos_qty: pos.lighter_qty,
         aster_cap_notional: cfg.capital.aster_cap_notional(),
-        hl_cap_notional: cfg.capital.hyperliquid_cap_notional(),
+        hl_cap_notional: cfg.capital.lighter_cap_notional(),
         enforce: cfg.capital.enforce_position_cap,
         reduce_position_only: cfg.live.quote.reduce_position_only,
     };

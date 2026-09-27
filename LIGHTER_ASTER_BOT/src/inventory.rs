@@ -13,8 +13,8 @@ use crate::types::Side;
 
 #[derive(Debug, Clone)]
 pub struct HedgeabilityRules {
-    pub hyperliquid_min_notional: Decimal,
-    pub hyperliquid_qty_step: Decimal,
+    pub hedge_min_notional: Decimal,
+    pub hedge_qty_step: Decimal,
 }
 
 #[derive(Debug, Clone)]
@@ -57,10 +57,10 @@ pub struct FillOutcome {
 /// notional, `lighter_min_notional`, rounded up to the size step, but at least one step).
 pub fn hl_min_hedge_qty(rules: &HedgeabilityRules, ref_px: Decimal) -> Decimal {
     if ref_px <= Decimal::ZERO {
-        return rules.hyperliquid_qty_step;
+        return rules.hedge_qty_step;
     }
-    let by_notional = ceil_to_step(rules.hyperliquid_min_notional / ref_px, rules.hyperliquid_qty_step);
-    by_notional.max(rules.hyperliquid_qty_step)
+    let by_notional = ceil_to_step(rules.hedge_min_notional / ref_px, rules.hedge_qty_step);
+    by_notional.max(rules.hedge_qty_step)
 }
 
 #[inline]
@@ -209,8 +209,8 @@ mod tests {
 
     fn rules() -> HedgeabilityRules {
         HedgeabilityRules {
-            hyperliquid_min_notional: dec!(10),
-            hyperliquid_qty_step: dec!(0.001),
+            hedge_min_notional: dec!(10),
+            hedge_qty_step: dec!(0.001),
         }
     }
 

@@ -152,7 +152,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 &selected,
                 cfg.live.partials.lighter_min_notional,
                 &cfg.live.aster.base_url,
-                &cfg.live.hyperliquid.base_url,
+                &cfg.live.lighter.base_url,
             )
             .await?;
             println!(

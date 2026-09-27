@@ -21,7 +21,7 @@ use crate::types::{MarketId, Side};
 use super::exec::aster::AsterRest;
 use super::exec::command::ExecEvent;
 use super::exec::creds::{AsterCreds, LighterCreds};
-use super::exec::hyperliquid::HlExchange;
+use super::exec::lighter::LighterExchange;
 
 /// Build the live Aster client for the given specs.
 fn build_aster(cfg: &Config, specs: &[MarketSpec]) -> Result<AsterRest> {
@@ -29,15 +29,15 @@ fn build_aster(cfg: &Config, specs: &[MarketSpec]) -> Result<AsterRest> {
 }
 
 /// Build the live Lighter client for the given specs.
-async fn build_hl(cfg: &Config, specs: &[MarketSpec]) -> Result<HlExchange> {
+async fn build_hl(cfg: &Config, specs: &[MarketSpec]) -> Result<LighterExchange> {
     let creds = LighterCreds::from_env()?;
-    HlExchange::new_lighter(
-        cfg.live.hyperliquid.base_url.clone(),
-        Path::new(&cfg.live.hyperliquid.signers_dir),
+    LighterExchange::new_lighter(
+        cfg.live.lighter.base_url.clone(),
+        Path::new(&cfg.live.lighter.signers_dir),
         creds,
         specs,
-        cfg.live.hyperliquid.fill_timeout_ms,
-        cfg.live.hyperliquid.ws_account_max_age_ms,
+        cfg.live.lighter.fill_timeout_ms,
+        cfg.live.lighter.ws_account_max_age_ms,
     )
     .await
 }
@@ -63,7 +63,7 @@ async fn resolve(cfg: &Config, target: &str) -> Result<(Vec<MarketCfg>, Vec<Mark
         &markets,
         cfg.live.partials.lighter_min_notional,
         &cfg.live.aster.base_url,
-        &cfg.live.hyperliquid.base_url,
+        &cfg.live.lighter.base_url,
     )
     .await?;
     Ok((markets, specs))
@@ -78,10 +78,10 @@ pub async fn run(cfg: &Config, check: &str, target: Option<String>, i_understand
         "aster-open-orders" => probe_aster_open_orders(cfg, &target).await,
         "aster-place-cancel" => probe_aster_place_cancel(cfg, &target).await,
         "leverage" | "live-leverage" => probe_leverage(cfg, &target).await,
-        "lighter-balance" | "hl-balance" => probe_hl_balance(cfg, &target).await,
+        "lighter-balance" => probe_hl_balance(cfg, &target).await,
         "lighter-open-orders" => probe_lighter_open_orders(cfg, &target).await,
-        "lighter-order-dry-run" | "hl-place-cancel" => probe_lighter_order_dry_run(cfg, &target).await,
-        "lighter-market" | "hl-market" => probe_hl_market(cfg, &target, i_understand_live, max_usd).await,
+        "lighter-order-dry-run" => probe_lighter_order_dry_run(cfg, &target).await,
+        "lighter-market" => probe_hl_market(cfg, &target, i_understand_live, max_usd).await,
         other => bail!(
             "unknown probe '{other}'. Available: aster-balance, aster-positions, aster-open-orders, \
              aster-place-cancel, leverage, lighter-balance, lighter-open-orders, lighter-order-dry-run, lighter-market"
@@ -96,7 +96,7 @@ async fn account_wide_aster(cfg: &Config) -> Result<AsterRest> {
         &markets[..1.min(markets.len())],
         cfg.live.partials.lighter_min_notional,
         &cfg.live.aster.base_url,
-        &cfg.live.hyperliquid.base_url,
+        &cfg.live.lighter.base_url,
     )
     .await?;
     build_aster(cfg, &specs)
@@ -297,7 +297,7 @@ async fn probe_hl_market(cfg: &Config, target: &str, i_understand_live: bool, ma
 }
 
 /// Native Lighter MARKET buy -> detected position size -> reduce-only MARKET sell to exactly flat.
-async fn hl_market_buy_then_sell(hl: &HlExchange, spec: &MarketSpec, max_usd: Decimal) -> Result<()> {
+async fn hl_market_buy_then_sell(hl: &LighterExchange, spec: &MarketSpec, max_usd: Decimal) -> Result<()> {
     let market = spec.market_id.clone();
     let mid = hl.mid(&spec.hl_coin).await?;
     // Size to clear the Lighter min notional with 2% to spare, rounded UP to the size decimals so
@@ -351,7 +351,7 @@ async fn hl_market_buy_then_sell(hl: &HlExchange, spec: &MarketSpec, max_usd: De
     Ok(())
 }
 
-async fn lighter_position(hl: &HlExchange, spec: &MarketSpec) -> Result<Decimal> {
+async fn lighter_position(hl: &LighterExchange, spec: &MarketSpec) -> Result<Decimal> {
     let st = hl.clearinghouse_state().await?;
     Ok(st
         .asset_positions
@@ -362,7 +362,7 @@ async fn lighter_position(hl: &HlExchange, spec: &MarketSpec) -> Result<Decimal>
 }
 
 async fn wait_for_position<F>(
-    hl: &HlExchange,
+    hl: &LighterExchange,
     spec: &MarketSpec,
     ok: F,
     timeout: std::time::Duration,
@@ -380,7 +380,7 @@ where
     }
 }
 
-async fn flatten_lighter_position(hl: &HlExchange, spec: &MarketSpec, attempts: usize) -> Result<Decimal> {
+async fn flatten_lighter_position(hl: &LighterExchange, spec: &MarketSpec, attempts: usize) -> Result<Decimal> {
     let market = spec.market_id.clone();
     let mut pos = lighter_position(hl, spec).await?;
     for _ in 0..attempts {

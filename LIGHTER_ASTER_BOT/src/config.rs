@@ -39,8 +39,7 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapitalCfg {
     pub aster_capital_usd: Decimal,
-    #[serde(alias = "lighter_capital_usd")]
-    pub hyperliquid_capital_usd: Decimal,
+    pub lighter_capital_usd: Decimal,
     pub leverage: Decimal,
     /// When true, clamp a quote to the remaining position headroom (or reject it
     /// if the headroom is below the minimum order size).
@@ -51,7 +50,7 @@ impl Default for CapitalCfg {
     fn default() -> Self {
         CapitalCfg {
             aster_capital_usd: Decimal::from(1000),
-            hyperliquid_capital_usd: Decimal::from(1000),
+            lighter_capital_usd: Decimal::from(1000),
             leverage: Decimal::ONE,
             enforce_position_cap: true,
         }
@@ -64,8 +63,8 @@ impl CapitalCfg {
         self.aster_capital_usd * self.leverage
     }
     /// Max position notional allowed on the Lighter hedge leg.
-    pub fn hyperliquid_cap_notional(&self) -> Decimal {
-        self.hyperliquid_capital_usd * self.leverage
+    pub fn lighter_cap_notional(&self) -> Decimal {
+        self.lighter_capital_usd * self.leverage
     }
 }
 
@@ -235,8 +234,8 @@ pub struct LiveCfg {
     pub partials: LivePartialsCfg,
     #[serde(default)]
     pub aster: LiveAsterCfg,
-    #[serde(default, alias = "lighter")]
-    pub hyperliquid: LiveHyperliquidCfg,
+    #[serde(default)]
+    pub lighter: LiveLighterCfg,
     #[serde(default)]
     pub circuit_breaker: LiveCircuitBreakerCfg,
     /// Proactive per-venue margin guard: cap each venue's position notional at its real free
@@ -392,7 +391,7 @@ impl LiveAsterCfg {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LiveHyperliquidCfg {
+pub struct LiveLighterCfg {
     #[serde(default = "default_hl_base_url")]
     pub base_url: String,
     #[serde(default = "default_lighter_signers_dir")]
@@ -413,9 +412,9 @@ pub struct LiveHyperliquidCfg {
     pub ws_account_max_age_ms: i64,
 }
 
-impl Default for LiveHyperliquidCfg {
+impl Default for LiveLighterCfg {
     fn default() -> Self {
-        LiveHyperliquidCfg {
+        LiveLighterCfg {
             base_url: default_hl_base_url(),
             signers_dir: default_lighter_signers_dir(),
             normal_slippage_bps: default_normal_slippage_bps(),
@@ -470,7 +469,7 @@ impl Default for LiveCfg {
             quote: LiveQuoteCfg::default(),
             partials: LivePartialsCfg::default(),
             aster: LiveAsterCfg::default(),
-            hyperliquid: LiveHyperliquidCfg::default(),
+            lighter: LiveLighterCfg::default(),
             circuit_breaker: LiveCircuitBreakerCfg::default(),
             margin_guard: LiveMarginGuardCfg::default(),
             dry_run: false,
@@ -505,15 +504,15 @@ impl LiveCfg {
         {
             bail!("live risk notionals must be non-negative");
         }
-        if self.hyperliquid.normal_slippage_bps < Decimal::ZERO
-            || self.hyperliquid.emergency_slippage_bps < Decimal::ZERO
+        if self.lighter.normal_slippage_bps < Decimal::ZERO
+            || self.lighter.emergency_slippage_bps < Decimal::ZERO
         {
             bail!("live.lighter slippage bps must be non-negative");
         }
-        if self.hyperliquid.emergency_slippage_bps < self.hyperliquid.normal_slippage_bps {
+        if self.lighter.emergency_slippage_bps < self.lighter.normal_slippage_bps {
             bail!("live.lighter.emergency_slippage_bps should be >= normal_slippage_bps");
         }
-        if self.hyperliquid.fill_timeout_ms <= 0 {
+        if self.lighter.fill_timeout_ms <= 0 {
             bail!("live.lighter.fill_timeout_ms must be positive");
         }
         if self.aster.deadman_enabled && self.aster.deadman_refresh_ms >= self.aster.deadman_countdown_ms {
@@ -664,9 +663,9 @@ fn default_aster_rate_limit_backoff_ms() -> i64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketCfg {
     pub aster_symbol: String,
-    #[serde(alias = "lighter_symbol")]
+    #[serde(rename = "lighter_symbol")]
     pub hl_coin: String,
-    /// Optional logical id; defaults to `lighter_symbol`/`hl_coin`.
+    /// Optional logical id; defaults to `lighter_symbol`.
     #[serde(default)]
     pub market_id: Option<String>,
 }
@@ -709,7 +708,7 @@ impl Config {
             "live.partials.max_pending_count",
             "live.quote.price_change_ticks_to_requote",
             "live.lighter.expires_after_ms",
-            "live.hyperliquid.expires_after_ms",
+            "live.lighter.expires_after_ms",
         ] {
             if retired.split('.').try_fold(&value, |v, key| v.get(key)).is_some() {
                 bail!("retired no-op setting {retired}; remove it (requote ticks belong in [quote])");
@@ -717,7 +716,7 @@ impl Config {
         }
         let cfg: Config = strict_from_toml(value)?;
         cfg.validate()?;
-        require_mainnet_origins(&cfg.live.aster.base_url, &cfg.live.hyperliquid.base_url)?;
+        require_mainnet_origins(&cfg.live.aster.base_url, &cfg.live.lighter.base_url)?;
         Ok(cfg)
     }
 
@@ -767,7 +766,7 @@ impl Config {
             bail!("live.max_book_staleness_ms must be non-negative");
         }
         if self.capital.aster_capital_usd <= Decimal::ZERO
-            || self.capital.hyperliquid_capital_usd <= Decimal::ZERO
+            || self.capital.lighter_capital_usd <= Decimal::ZERO
             || self.capital.leverage <= Decimal::ZERO
         {
             bail!("capital amounts and leverage must be positive");
@@ -906,7 +905,7 @@ lighter_symbol = "DOGE"
         assert_eq!(cfg.live.partials.policy, PartialPolicy::StrictEveryFillMustBeHedgeable);
         assert_eq!(cfg.live.partials.lighter_min_notional, dec!(10));
         assert_eq!(cfg.live.aster.base_url, "https://fapi.asterdex.com");
-        assert_eq!(cfg.live.hyperliquid.normal_slippage_bps, dec!(5));
+        assert_eq!(cfg.live.lighter.normal_slippage_bps, dec!(5));
         assert!(cfg.live.aster.deadman_refresh_ms < cfg.live.aster.deadman_countdown_ms);
         assert!(cfg.live.quote.reduce_position_only);
         assert_eq!(cfg.live.quote.effective_max_replaces_per_minute_per_symbol(), 100);
@@ -930,7 +929,7 @@ lighter_symbol = "DOGE"
         assert!(!cfg.live.cooldown_is_global());
         assert_eq!(cfg.live.partials.policy, PartialPolicy::AccumulateSubMin);
         assert_eq!(cfg.live.partials.lighter_min_notional, dec!(12));
-        assert_eq!(cfg.live.hyperliquid.emergency_slippage_bps, dec!(25));
+        assert_eq!(cfg.live.lighter.emergency_slippage_bps, dec!(25));
     }
 
     #[test]
@@ -996,7 +995,6 @@ lighter_symbol = "DOGE"
             "[live.partials]\nmax_pending_count=2",
             "[live.quote]\nprice_change_ticks_to_requote=2",
             "[live.lighter]\nexpires_after_ms=1000",
-            "[live.hyperliquid]\nexpires_after_ms=1000",
         ] {
             std::fs::write(&path, format!("{SAMPLE}\n{extra}\n")).unwrap();
             assert!(format!("{:#}", Config::load(&path).unwrap_err()).contains("retired no-op"));

@@ -157,7 +157,7 @@ pub async fn record(config: &Path, market: &str, dir: PathBuf, stop: Cancellatio
     let (taker_markets, _) = cfg.select(&market.to_ascii_uppercase())?;
     let market = &taker_markets[0];
     let aster_base = cfg.maker.live.aster.base_url.trim_end_matches('/').to_string();
-    let lighter_base = cfg.maker.live.hyperliquid.base_url.trim_end_matches('/').to_string();
+    let lighter_base = cfg.maker.live.lighter.base_url.trim_end_matches('/').to_string();
     let symbol = market.aster_symbol.to_ascii_uppercase();
     let http = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
     let get = move |url: String| {

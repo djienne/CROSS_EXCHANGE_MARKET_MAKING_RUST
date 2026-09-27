@@ -239,7 +239,7 @@ mod tests {
 
         // Publish a book on both => both stamps fresh => gate opens, none to reconnect.
         reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().publish(bk());
-        reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().publish(bk());
+        reg.cell(&"BTC".into(), VenueTag::Hedge).unwrap().publish(bk());
         let now2 = mono_now_ns();
         let reconnect = scan_once(&reg, &gate, 1_000, 1_000, now2);
         assert!(reconnect.is_empty());
@@ -262,7 +262,7 @@ mod tests {
         let reg = VenueRegistry::new(&["BTC".into()]);
         let gate = TradingGate::new();
         reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().publish(bk());
-        reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().publish(bk());
+        reg.cell(&"BTC".into(), VenueTag::Hedge).unwrap().publish(bk());
         let now = mono_now_ns();
 
         // Both fresh and not divergent => gate open, nothing to reconnect.
@@ -290,7 +290,7 @@ mod tests {
         let reg = VenueRegistry::new(&["BTC".into()]);
         let gate = TradingGate::new();
         reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().touch();
-        reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().touch();
+        reg.cell(&"BTC".into(), VenueTag::Hedge).unwrap().touch();
         let now = mono_now_ns();
         // Live connection => NO reconnect, but no book => gate CLOSED.
         let reconnect = scan_once(&reg, &gate, 60_000, 60_000, now);
@@ -298,7 +298,7 @@ mod tests {
         assert!(!gate.is_open());
         // Once books publish on both venues, the gate opens.
         reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().publish(bk());
-        reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().publish(bk());
+        reg.cell(&"BTC".into(), VenueTag::Hedge).unwrap().publish(bk());
         let now2 = mono_now_ns();
         assert!(scan_once(&reg, &gate, 60_000, 60_000, now2).is_empty());
         assert!(gate.is_open());
@@ -313,7 +313,7 @@ mod tests {
         let reg = VenueRegistry::new(&["BTC".into()]);
         let gate = TradingGate::new();
         reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().publish(bk());
-        reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().publish(bk());
+        reg.cell(&"BTC".into(), VenueTag::Hedge).unwrap().publish(bk());
         let now = mono_now_ns();
 
         // Fresh on both axes => gate open, nothing to reconnect.

@@ -45,7 +45,7 @@ pub fn spawn_venue_thread(
             let book: Arc<dyn BookTap> = cell;
             let qty_scale = match venue {
                 VenueTag::Aster => HotQtyScale::Aster,
-                VenueTag::Hyperliquid => HotQtyScale::Hyperliquid,
+                VenueTag::Hedge => HotQtyScale::Hedge,
             };
             let tap = Tap { book: Some(book), reconnect: Some(reconnect), scale, qty_scale };
             rt.block_on(async move {
@@ -69,7 +69,7 @@ async fn run_reader(
 ) {
     match venue {
         VenueTag::Aster => aster::run_with_tap(ws_url, symbol, tap).await,
-        VenueTag::Hyperliquid => {
+        VenueTag::Hedge => {
             // Fail LOUDLY on a malformed "market_id:label" symbol: the old fallback of
             // market_id 0 silently subscribed a real (wrong) Lighter market's book, only
             // caught ~90s later by book-check divergence.

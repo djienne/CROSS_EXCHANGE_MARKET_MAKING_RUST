@@ -56,8 +56,8 @@ pub fn classify(spec: &MarketSpec, ref_px: Decimal, desired_notional: Decimal) -
         };
     }
     let rules = HedgeabilityRules {
-        hyperliquid_min_notional: spec.hl_min_notional,
-        hyperliquid_qty_step: spec.hl_qty_step,
+        hedge_min_notional: spec.hl_min_notional,
+        hedge_qty_step: spec.hl_qty_step,
     };
     let hl_min = hl_min_hedge_qty(&rules, ref_px);
     // The smallest possible Aster fill is one lot (a large order can partial-fill a single

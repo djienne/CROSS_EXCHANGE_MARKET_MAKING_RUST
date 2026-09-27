@@ -44,7 +44,7 @@ impl VenueRegistry {
             market_to_idx.insert(m.clone(), idx);
             idx_to_market.push(m.clone());
 
-            for v in [VenueTag::Aster, VenueTag::Hyperliquid] {
+            for v in [VenueTag::Aster, VenueTag::Hedge] {
                 cells.insert((m.clone(), v), Arc::new(new_cell(idx)));
             }
         }
@@ -86,7 +86,7 @@ mod tests {
         let reg = VenueRegistry::new(&["BTC".into(), "DOGE".into()]);
         assert_eq!(reg.iter().count(), 4);
         assert!(reg.cell(&"BTC".into(), VenueTag::Aster).is_some());
-        assert!(reg.cell(&"BTC".into(), VenueTag::Hyperliquid).is_some());
+        assert!(reg.cell(&"BTC".into(), VenueTag::Hedge).is_some());
         assert!(reg.cell(&"ETH".into(), VenueTag::Aster).is_none());
     }
 

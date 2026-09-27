@@ -717,7 +717,7 @@ pub struct Strategy {
     yield_state: Yield,
     correction_needed: std::collections::HashSet<MarketId>,
     correction_attempts: HashMap<MarketId, u32>,
-    hedge_readiness: Option<super::exec::hyperliquid::HedgeReadiness>,
+    hedge_readiness: Option<super::exec::lighter::HedgeReadiness>,
     maker_epoch: Arc<std::sync::atomic::AtomicU64>,
     draining: bool,
     drain_control: Option<Arc<super::exec::command::DrainControl>>,
@@ -839,7 +839,7 @@ impl Strategy {
                         spec: Arc::new(s.clone()),
                         scale: MarketScale::from_spec(s),
                         aster_cell: registry.cell(&s.market_id, VenueTag::Aster).expect("market registry has Aster cell"),
-                        hedge_cell: registry.cell(&s.market_id, VenueTag::Hyperliquid).expect("market registry has hedge cell"),
+                        hedge_cell: registry.cell(&s.market_id, VenueTag::Hedge).expect("market registry has hedge cell"),
                         eligible: *eligibility.get(&s.market_id).unwrap_or(&false),
                     },
                 )
@@ -916,7 +916,7 @@ impl Strategy {
 
     pub fn set_drain_control(&mut self, control: Arc<super::exec::command::DrainControl>) { self.drain_control = Some(control); }
 
-    pub fn set_hedge_readiness(&mut self, readiness: super::exec::hyperliquid::HedgeReadiness) {
+    pub fn set_hedge_readiness(&mut self, readiness: super::exec::lighter::HedgeReadiness) {
         self.hedge_readiness = Some(readiness);
     }
 
@@ -1359,7 +1359,7 @@ impl Strategy {
     fn cell(&self, market: &MarketId, venue: VenueTag) -> Option<&crate::hotpath::VenueBook> {
         self.ctx.get(market).map(|ctx| match venue {
             VenueTag::Aster => ctx.aster_cell.as_ref(),
-            VenueTag::Hyperliquid => ctx.hedge_cell.as_ref(),
+            VenueTag::Hedge => ctx.hedge_cell.as_ref(),
         })
     }
 
@@ -1373,7 +1373,7 @@ impl Strategy {
     /// cannot make stale data look fresh. The returned Arc keeps the chosen book alive
     /// across subsequent &mut self work in the fill handler.
     fn fresh_hl_quote_book(&self, market: &MarketId, now_ns: i64) -> Option<SelectedHlBook> {
-        let cell = self.cell(market, VenueTag::Hyperliquid)?;
+        let cell = self.cell(market, VenueTag::Hedge)?;
         if cell.stream_down() || cell.is_divergent() { return None; }
         let max_stale_ms = self.cfg.live.max_book_staleness_ms;
 
@@ -1404,7 +1404,7 @@ impl Strategy {
         hedge_side: Side,
         hedge_qty: Decimal,
     ) -> Option<SelectedHlBook> {
-        let cell = self.cell(market, VenueTag::Hyperliquid)?;
+        let cell = self.cell(market, VenueTag::Hedge)?;
         if cell.stream_down() || cell.is_divergent() { return None; }
         let max_stale_ms = self.cfg.live.max_book_staleness_ms;
         let depth_multiple = self.cfg.quote.depth_liquidity_multiple;
@@ -1446,7 +1446,7 @@ impl Strategy {
         hedge_side: Side,
         hedge_qty: Decimal,
     ) -> Option<SelectedHlHotBook> {
-        let cell = self.cell(market, VenueTag::Hyperliquid)?;
+        let cell = self.cell(market, VenueTag::Hedge)?;
         if cell.stream_down() || cell.is_divergent() { return None; }
         let ctx = self.ctx.get(market)?;
         let max_stale_ns = self.cfg.live.max_book_staleness_ms * 1_000_000;
@@ -1493,7 +1493,7 @@ impl Strategy {
         hedge_qty: Decimal,
         selected: &SelectedHlHotBook,
     ) -> Option<SelectedHlBook> {
-        let cell = self.cell(market, VenueTag::Hyperliquid)?;
+        let cell = self.cell(market, VenueTag::Hedge)?;
         if cell.stream_down() || cell.is_divergent() { return None; }
         let max_stale_ms = self.cfg.live.max_book_staleness_ms;
         let depth_multiple = self.cfg.quote.depth_liquidity_multiple;
@@ -1658,7 +1658,7 @@ impl Strategy {
             // read young, but it is blind; close the gate immediately, not at age expiry.
             .is_some_and(|c| c.quote_age_ms(now_ns) <= max_stale && !c.is_divergent() && !c.stream_down());
         let hl_fresh = self
-            .cell(market, VenueTag::Hyperliquid)
+            .cell(market, VenueTag::Hedge)
             .is_some_and(|c| c.quote_age_ms(now_ns) <= max_stale && !c.is_divergent() && !c.stream_down());
         aster_fresh && hl_fresh
     }
@@ -1667,10 +1667,10 @@ impl Strategy {
         let a = self.aster_pos.get(market).copied().unwrap_or_default();
         let h = self.hl_pos.get(market).copied().unwrap_or_default();
         let mut a_cap = self.cfg.capital.aster_cap_notional();
-        let mut h_cap = self.cfg.capital.hyperliquid_cap_notional();
+        let mut h_cap = self.cfg.capital.lighter_cap_notional();
         if self.cfg.live.margin_guard.enabled {
             let snap = self.account.load();
-            let mark = self.book(market, VenueTag::Hyperliquid).and_then(|b| b.mid()).unwrap_or(Decimal::ZERO);
+            let mark = self.book(market, VenueTag::Hedge).and_then(|b| b.mid()).unwrap_or(Decimal::ZERO);
             let fresh = |origin: i64| origin > 0 && now_ns.saturating_sub(origin) / 1_000_000 <= self.cfg.live.max_account_snapshot_age_ms;
             let margin_cap = |venue, free: Decimal, buffer: Decimal, origin: i64| {
                 if !fresh(origin) || mark <= Decimal::ZERO { return Decimal::ZERO; }
@@ -1678,7 +1678,7 @@ impl Strategy {
             };
             a_cap = a_cap.min(margin_cap(Venue::Aster, snap.aster_available_usd,
                 self.cfg.live.margin_guard.aster_safety_buffer_usd, snap.aster_margin_source_ns));
-            h_cap = h_cap.min(margin_cap(Venue::Hyperliquid, snap.hl_withdrawable_usd,
+            h_cap = h_cap.min(margin_cap(Venue::Hedge, snap.hl_withdrawable_usd,
                 self.cfg.live.margin_guard.lighter_safety_buffer_usd, snap.hl_margin_source_ns));
         }
         PositionContext { aster_pos_qty: a.qty, hl_pos_qty: h.qty, aster_cap_notional: a_cap,
@@ -1694,11 +1694,11 @@ impl Strategy {
         let snap = self.account.load();
         let a = self.aster_pos.get(market).map(|p| p.qty).unwrap_or_default();
         let h = self.hl_pos.get(market).map(|p| p.qty).unwrap_or_default();
-        let mark = self.book(market, VenueTag::Hyperliquid).and_then(|b| b.mid()).unwrap_or(price)
-            .max(price) * (Decimal::ONE + self.cfg.live.hyperliquid.normal_slippage_bps / Decimal::from(10_000));
+        let mark = self.book(market, VenueTag::Hedge).and_then(|b| b.mid()).unwrap_or(price)
+            .max(price) * (Decimal::ONE + self.cfg.live.lighter.normal_slippage_bps / Decimal::from(10_000));
         for (venue, predicted, free, buffer, origin) in [
             (Venue::Aster, a, snap.aster_available_usd, self.cfg.live.margin_guard.aster_safety_buffer_usd, snap.aster_margin_source_ns),
-            (Venue::Hyperliquid, h, snap.hl_withdrawable_usd, self.cfg.live.margin_guard.lighter_safety_buffer_usd, snap.hl_margin_source_ns),
+            (Venue::Hedge, h, snap.hl_withdrawable_usd, self.cfg.live.margin_guard.lighter_safety_buffer_usd, snap.hl_margin_source_ns),
         ] {
             if origin <= 0 || now_ns.saturating_sub(origin) / 1_000_000 > self.cfg.live.max_account_snapshot_age_ms { return false; }
             let mut buys = Decimal::ZERO;
@@ -1712,7 +1712,7 @@ impl Strategy {
             for intent in self.hedges.values().filter(|i| &i.market == market && i.venue == venue && i.unresolved()) {
                 if intent.hedge_side == Side::Buy { buys += intent.remaining_qty(); } else { sells += intent.remaining_qty(); }
             }
-            if venue == Venue::Hyperliquid {
+            if venue == Venue::Hedge {
                 let pending = self.pending.get(market).map(|p| p.signed_qty).unwrap_or_default();
                 if pending < Decimal::ZERO { buys += -pending; } else { sells += pending; }
             }
@@ -1854,7 +1854,7 @@ impl Strategy {
         self.mark_cache.clear();
         for m in &self.markets {
             let mark = self
-                .book(m, VenueTag::Hyperliquid)
+                .book(m, VenueTag::Hedge)
                 .and_then(|b| b.mid())
                 .unwrap_or(Decimal::ZERO);
             if mark > Decimal::ZERO {
@@ -1877,7 +1877,7 @@ impl Strategy {
             let pred_a = self.aster_pos.get(m).map(|p| p.qty).unwrap_or(Decimal::ZERO);
             let rep_a = snap.reported_position(super::account::Venue::Aster, m);
             let pred_h = self.hl_pos.get(m).map(|p| p.qty).unwrap_or(Decimal::ZERO);
-            let rep_h = snap.reported_position(super::account::Venue::Hyperliquid, m);
+            let rep_h = snap.reported_position(super::account::Venue::Hedge, m);
             if position_mismatch(pred_a, rep_a, mark, tol) || position_mismatch(pred_h, rep_h, mark, tol) {
                 return false;
             }
@@ -1897,7 +1897,7 @@ impl Strategy {
                 continue;
             }
             let mark = self
-                .book(&h.market, VenueTag::Hyperliquid)
+                .book(&h.market, VenueTag::Hedge)
                 .and_then(|b| b.mid())
                 .unwrap_or(h.aster_fill_px);
             total_notional += h.remaining_qty() * mark.abs();
@@ -1918,7 +1918,7 @@ impl Strategy {
         for market in &self.markets {
             let decisions = self.registry.market_idx(market).map(|idx| self.gen_slots[idx.0 as usize].decisions).unwrap_or(["NOT_EVALUATED"; 2]);
             let aster_age_ms = self.cell(market, VenueTag::Aster).map(|c| c.quote_age_ms(now_ns)).unwrap_or(i64::MAX);
-            let lighter_age_ms = self.cell(market, VenueTag::Hyperliquid).map(|c| c.quote_age_ms(now_ns)).unwrap_or(i64::MAX);
+            let lighter_age_ms = self.cell(market, VenueTag::Hedge).map(|c| c.quote_age_ms(now_ns)).unwrap_or(i64::MAX);
             self.journal.typed(now_ns, "quote_diagnostic", Some(market.0.clone()), JournalDetail::Diagnostic(DiagnosticRecord {
                 gate: self.maker_gate_reason(market, now_ns).unwrap_or("OPEN"),
                 aster_qty: self.aster_pos.get(market).map(|p| p.qty).unwrap_or_default(),
@@ -1949,7 +1949,7 @@ impl Strategy {
         if !force {
             if let Some(idx) = self.registry.market_idx(market) {
                 let a_gen = self.cell(market, VenueTag::Aster).map_or(0, |c| c.quote_generation());
-                let h_gen = self.cell(market, VenueTag::Hyperliquid).map_or(0, |c| c.quote_generation());
+                let h_gen = self.cell(market, VenueTag::Hedge).map_or(0, |c| c.quote_generation());
                 let slot = &mut self.gen_slots[idx.0 as usize];
                 if a_gen == slot.last_aster_gen && h_gen == slot.last_hl_gen {
                     return;
@@ -1962,7 +1962,7 @@ impl Strategy {
         if self.cfg.live.quote.use_hot_integer_math && !force {
             if let (Some(a_cell), Some(h_cell)) = (
                 self.cell(market, VenueTag::Aster),
-                self.cell(market, VenueTag::Hyperliquid),
+                self.cell(market, VenueTag::Hedge),
             ) {
                 let a_arc = a_cell.load_hot();
                 let a_bbo_arc = a_cell.load_bbo_hot();
@@ -2016,7 +2016,7 @@ impl Strategy {
         }
         let (Some(a_cell), Some(h_cell)) = (
             self.cell(market, VenueTag::Aster),
-            self.cell(market, VenueTag::Hyperliquid),
+            self.cell(market, VenueTag::Hedge),
         ) else {
             return;
         };
@@ -2445,7 +2445,7 @@ impl Strategy {
         self.last_hot_action_ns.insert(fill.market.clone(), now_ns);
         self.cooldown.trigger(now_ns, self.cooldown_ns, &fill.market);
         let Some(ctx) = self.ctx.get(&fill.market) else { self.freeze_and_sweep(now_ns, "unknown_fill_market"); return };
-        let rules = HedgeabilityRules { hyperliquid_min_notional: ctx.spec.hl_min_notional, hyperliquid_qty_step: ctx.spec.hl_qty_step };
+        let rules = HedgeabilityRules { hedge_min_notional: ctx.spec.hl_min_notional, hedge_qty_step: ctx.spec.hl_qty_step };
         let step = ctx.spec.hl_qty_step;
         let mark = self.fresh_hl_quote_book(&fill.market, now_ns).and_then(|b| b.book.mid()).unwrap_or(fill.last_fill_px);
         let previous = self.pending.remove(&fill.market);
@@ -2466,7 +2466,7 @@ impl Strategy {
             let mut intent = HedgeIntent::with_qty(cloid, fill.market.clone(), hedge.hedge_side, qty, hedge.avg_aster_px, now_ns);
             intent.logical_id = logical_id;
             intent.arm_admission(self.cfg.live.max_unhedged_age_ms);
-            let slip = self.cfg.live.hyperliquid.normal_slippage_bps;
+            let slip = self.cfg.live.lighter.normal_slippage_bps;
             let source = self.fresh_hl_hedge_book_hot_first(&fill.market, now_ns, hedge.hedge_side, qty);
             intent.book_source = source.as_ref().map(|b| b.path.as_str(b.source));
             intent.book_age_ms = source.as_ref().map(|b| b.age_ms);
@@ -2630,7 +2630,7 @@ impl Strategy {
                 self.handle_definitive_reject(cloid, reason, true, now_ns);
             }
             ExecEvent::HedgeReject { cloid, reason } => {
-                let retry = super::exec::hyperliquid::hedge_reject_is_definitive_no_fill(&reason);
+                let retry = super::exec::lighter::hedge_reject_is_definitive_no_fill(&reason);
                 self.handle_definitive_reject(cloid, reason, retry, now_ns);
             }
             ExecEvent::ExecutionProgress { cloid, cumulative_qty, cumulative_quote_usd, cumulative_fee_usd, terminal, venue_order_id, event_time_ms } => {
@@ -2693,7 +2693,7 @@ impl Strategy {
         self.journal.progress(now_ns, h);
         let old = h.clone();
         if retryable && old.purpose == IntentPurpose::Hedge && old.attempts < 2 {
-            let slip = self.cfg.live.hyperliquid.emergency_slippage_bps;
+            let slip = self.cfg.live.lighter.emergency_slippage_bps;
             let px = self.fresh_hl_hedge_book_hot_first(&old.market, now_ns, old.hedge_side, old.remaining_qty())
                 .and_then(|b| crossing_hedge_px(&b.book, old.hedge_side, slip));
             if let Some(aggressive_px) = px {
@@ -2907,7 +2907,7 @@ impl Strategy {
             let last_action = self.last_hot_action_ns.get(&m).copied().unwrap_or(0).max(last_terminal);
             if snap.read_start_ns <= last_action { continue; }
             let rep_a = snap.reported_position(Venue::Aster, &m);
-            let rep_h = snap.reported_position(Venue::Hyperliquid, &m);
+            let rep_h = snap.reported_position(Venue::Hedge, &m);
             let pred_a = self.aster_pos.get(&m).map(|p| p.qty).unwrap_or_default();
             let pred_h = self.hl_pos.get(&m).map(|p| p.qty).unwrap_or_default();
             if pred_a != rep_a || pred_h != rep_h {
@@ -2985,13 +2985,13 @@ impl Strategy {
         let same_sign = |q: Decimal| q != Decimal::ZERO && (q > Decimal::ZERO) == (net > Decimal::ZERO);
         let a_qty = if same_sign(aster) { crate::decimal::floor_to_step(net.abs().min(aster.abs()), aster_step) } else { Decimal::ZERO };
         let h_qty = if same_sign(lighter) { crate::decimal::floor_to_step(net.abs().min(lighter.abs()), lighter_step) } else { Decimal::ZERO };
-        let slip = self.cfg.live.hyperliquid.emergency_slippage_bps;
+        let slip = self.cfg.live.lighter.emergency_slippage_bps;
         let selected = if a_qty > Decimal::ZERO {
             self.fresh_aster_touch_book(market, now_ns).and_then(|b| b.book.mid().map(|p| (Venue::Aster, a_qty, p, b.source.as_str(), b.age_ms)))
         } else { None }.or_else(|| {
             if h_qty <= Decimal::ZERO { return None; }
             self.fresh_hl_hedge_book_hot_first(market, now_ns, side, h_qty)
-                .and_then(|b| crossing_hedge_px(&b.book, side, slip).map(|p| (Venue::Hyperliquid, h_qty, p, b.path.as_str(b.source), b.age_ms)))
+                .and_then(|b| crossing_hedge_px(&b.book, side, slip).map(|p| (Venue::Hedge, h_qty, p, b.path.as_str(b.source), b.age_ms)))
         });
         let Some((venue, qty, price, source, age_ms)) = selected else { return };
         let cloid = self.orders.next_attempt_id(market);
@@ -3307,12 +3307,12 @@ mod tests {
         let hot = crate::livebot::scale::build_hot_book_with_qty_scale(
             &book,
             &scale,
-            crate::livebot::scale::HotQtyScale::Hyperliquid,
+            crate::livebot::scale::HotQtyScale::Hedge,
             recv_ns,
         );
         strat
             .registry
-            .cell(&m, VenueTag::Hyperliquid)
+            .cell(&m, VenueTag::Hedge)
             .unwrap()
             .publish_hot(book, hot);
     }
@@ -3323,12 +3323,12 @@ mod tests {
         let hot = crate::livebot::scale::build_hot_book_with_qty_scale(
             &book,
             &scale,
-            crate::livebot::scale::HotQtyScale::Hyperliquid,
+            crate::livebot::scale::HotQtyScale::Hedge,
             recv_ns,
         );
         strat
             .registry
-            .cell(&m, VenueTag::Hyperliquid)
+            .cell(&m, VenueTag::Hedge)
             .unwrap()
             .publish_bbo_hot(book, hot);
     }
@@ -3342,7 +3342,7 @@ mod tests {
         let m: MarketId = "BTC".into();
         strat
             .registry
-            .cell(&m, VenueTag::Hyperliquid)
+            .cell(&m, VenueTag::Hedge)
             .unwrap()
             .publish_bbo(hl_bbo_at(dec!(2), dec!(3), ts()));
 
@@ -3367,7 +3367,7 @@ mod tests {
         );
         strat
             .registry
-            .cell(&m, VenueTag::Hyperliquid)
+            .cell(&m, VenueTag::Hedge)
             .unwrap()
             .publish_bbo(crossed);
 
@@ -3385,7 +3385,7 @@ mod tests {
         let m: MarketId = "BTC".into();
         strat
             .registry
-            .cell(&m, VenueTag::Hyperliquid)
+            .cell(&m, VenueTag::Hedge)
             .unwrap()
             .publish_bbo(hl_bbo_at(dec!(0.2), dec!(0.2), ts()));
 
@@ -3404,7 +3404,7 @@ mod tests {
         let m: MarketId = "BTC".into();
         strat
             .registry
-            .cell(&m, VenueTag::Hyperliquid)
+            .cell(&m, VenueTag::Hedge)
             .unwrap()
             .publish_bbo(hl_bbo_at(dec!(2.1), dec!(2.1), ts()));
 
@@ -4002,7 +4002,7 @@ lighter_symbol = "BTC"
         // (freshness is the cell's mono publish stamp, not the book's embedded ts).
         let (ab, hb) = books();
         reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().publish(ab);
-        reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().publish(hb);
+        reg.cell(&"BTC".into(), VenueTag::Hedge).unwrap().publish(hb);
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
@@ -4041,7 +4041,7 @@ lighter_symbol = "BTC"
         let reg = Arc::new(VenueRegistry::new(&["BTC".into()]));
         let (ab, hb) = books();
         reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().publish(ab);
-        reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().publish(hb);
+        reg.cell(&"BTC".into(), VenueTag::Hedge).unwrap().publish(hb);
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
@@ -4062,10 +4062,10 @@ lighter_symbol = "BTC"
         reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().publish(ab2);
         assert!(strat.may_quote(&"BTC".into(), mono_now_ns()), "fresh snapshot must reopen the gate");
         // Same per-market behavior for the Lighter cell.
-        reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().mark_stream_down();
+        reg.cell(&"BTC".into(), VenueTag::Hedge).unwrap().mark_stream_down();
         assert!(!strat.may_quote(&"BTC".into(), mono_now_ns()));
         let (_, hb2) = books();
-        reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().publish(hb2);
+        reg.cell(&"BTC".into(), VenueTag::Hedge).unwrap().publish(hb2);
         assert!(strat.may_quote(&"BTC".into(), mono_now_ns()));
     }
 
@@ -4073,11 +4073,11 @@ lighter_symbol = "BTC"
     fn correction_waits_for_its_venue_and_reduces_only_the_net_delta() {
         let account=AccountState::default(); let (etx,mut erx)=tokio::sync::mpsc::channel(16); let (htx,mut hrx)=tokio::sync::mpsc::channel(16);
         let mut strat=live_strat(etx,htx,account); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
-        strat.registry.cell(&m,VenueTag::Hyperliquid).unwrap().mark_stream_down(); strat.dispatch_correction(&m,dec!(0.05),dec!(-0.95),dec!(1),now);
-        assert!(hrx.try_recv().is_err() && erx.try_recv().is_err()); let (_,book)=books(); strat.registry.cell(&m,VenueTag::Hyperliquid).unwrap().publish(book);
+        strat.registry.cell(&m,VenueTag::Hedge).unwrap().mark_stream_down(); strat.dispatch_correction(&m,dec!(0.05),dec!(-0.95),dec!(1),now);
+        assert!(hrx.try_recv().is_err() && erx.try_recv().is_err()); let (_,book)=books(); strat.registry.cell(&m,VenueTag::Hedge).unwrap().publish(book);
         strat.dispatch_correction(&m,dec!(0.05),dec!(-0.95),dec!(1),crate::hotpath::clock::mono_now_ns());
         let HedgeCommand::Hedge { intent,.. }=hrx.try_recv().unwrap() else {panic!("reduce-only hedge expected")};
-        assert_eq!((intent.venue,intent.purpose,intent.hedge_side,intent.qty),(Venue::Hyperliquid,IntentPurpose::ReduceDelta,Side::Sell,dec!(0.05)));
+        assert_eq!((intent.venue,intent.purpose,intent.hedge_side,intent.qty),(Venue::Hedge,IntentPurpose::ReduceDelta,Side::Sell,dec!(0.05)));
         assert!(erx.try_recv().is_err());
     }
 
@@ -4098,7 +4098,7 @@ lighter_symbol = "BTC"
         let reg = Arc::new(VenueRegistry::new(&["BTC".into()]));
         let (ab, hb) = books();
         reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().publish(ab);
-        reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().publish(hb);
+        reg.cell(&"BTC".into(), VenueTag::Hedge).unwrap().publish(hb);
         let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
@@ -4148,7 +4148,7 @@ lighter_symbol = "BTC"
         snap.source_ts_ns=src; snap.read_start_ns=src; snap.aster_margin_source_ns=src; snap.hl_margin_source_ns=src;
         snap.aster_available_usd=dec!(1000); snap.hl_withdrawable_usd=dec!(1000);
         snap.aster_equity_usd=dec!(1000); snap.hl_equity_usd=dec!(1000);
-        for (venue, qty) in [(Venue::Aster,a),(Venue::Hyperliquid,h)] {
+        for (venue, qty) in [(Venue::Aster,a),(Venue::Hedge,h)] {
             let pos = crate::livebot::account::ScaledPosition { venue, market:"BTC".into(), signed_qty:qty, entry_px:dec!(100) };
             if venue==Venue::Aster { snap.aster_positions.push(pos); } else { snap.hl_positions.push(pos); }
         }
@@ -4165,7 +4165,7 @@ lighter_symbol = "BTC"
         let reg = Arc::new(VenueRegistry::new(&["BTC".into()]));
         let (ab, hb) = books();
         reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().publish(ab);
-        reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().publish(hb);
+        reg.cell(&"BTC".into(), VenueTag::Hedge).unwrap().publish(hb);
         Strategy::new(full_cfg(), &specs, &elig, reg, account, Journal::null(), SessionId::from_tag("t"), etx, htx)
     }
 
@@ -4708,7 +4708,7 @@ lighter_symbol = "BTC"
         }
         if hl.0 != Decimal::ZERO {
             s.hl_positions =
-                vec![ScaledPosition { venue: Venue::Hyperliquid, market: m.clone(), signed_qty: hl.0, entry_px: hl.1 }];
+                vec![ScaledPosition { venue: Venue::Hedge, market: m.clone(), signed_qty: hl.0, entry_px: hl.1 }];
         }
         s.source_ts_ns = src;
         s.read_start_ns = src - 1_000_000;

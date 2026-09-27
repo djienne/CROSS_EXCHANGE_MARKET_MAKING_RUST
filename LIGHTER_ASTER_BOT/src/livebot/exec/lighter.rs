@@ -1,5 +1,4 @@
-//! Lighter hedge worker. The module name is kept as `hyperliquid` to minimize churn in
-//! the existing strategy/reconciler code, but all live hedge I/O here goes to Lighter.
+//! Lighter hedge worker.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -175,7 +174,7 @@ fn own_trade_evidence(tr: &TradePayload, intent: &HedgeIntent, account: i64, ord
     // A submitted IOC cannot be the maker: preserve the fill but flag contradictory fee evidence.
     let fee_usd = if maker { None } else { fee_ticks.map(|r| notional * r / Decimal::from(1_000_000)) };
     Some(ExecutionTrade {
-        attempt_id: intent.cloid.to_hex(), logical_id: intent.logical_id.to_hex(), venue: Venue::Hyperliquid,
+        attempt_id: intent.cloid.to_hex(), logical_id: intent.logical_id.to_hex(), venue: Venue::Hedge,
         market: intent.market.0.clone(), side, trade_id: lighter_trade_key(tr), identity_complete: tr.trade_id.is_some_and(|id| id > 0), event_time_ms: if tr.transaction_time.or(tr.timestamp).is_some_and(|t| t > 0) { tr.event_time_ms().filter(|t| *t > 0) } else { None },
         order_id: (if ask { tr.ask_id } else { tr.bid_id }).map(|x| x.to_string()),
         client_order_index: index, qty, px, notional_usd: notional,
@@ -466,10 +465,10 @@ impl HedgeReadiness {
     }
 }
 
-/// Lighter-backed hedge exchange. The public type name is intentionally kept as `HlExchange`
+/// Lighter-backed hedge exchange. The public type name is intentionally kept as `LighterExchange`
 /// because many strategy/reconciler interfaces still use "HL" as shorthand for hedge leg.
 #[derive(Clone)]
-pub struct HlExchange {
+pub struct LighterExchange {
     rest: RestClient,
     tx_ws: Arc<TxWebSocket>,
     signer: Arc<Signer>,
@@ -491,7 +490,7 @@ pub struct HlExchange {
     ws_account_max_age: Duration,
 }
 
-impl HlExchange {
+impl LighterExchange {
     pub async fn new_lighter(
         base_url: String,
         signers_dir: &Path,
@@ -549,7 +548,7 @@ impl HlExchange {
             symbol_to_market.insert(s.hl_coin.to_ascii_uppercase(), s.market_id.clone());
             markets.insert(s.market_id.clone(), wire);
         }
-        Ok(HlExchange {
+        Ok(LighterExchange {
             rest,
             tx_ws,
             signer,
@@ -1223,7 +1222,7 @@ pub struct HlOpenOrder {
     pub sz: String,
 }
 
-pub async fn run_hl_worker(mut rx: Receiver<HedgeCommand>, tx: Sender<ExecEvent>, ex: HlExchange, journal: Journal) {
+pub async fn run_lighter_worker(mut rx: Receiver<HedgeCommand>, tx: Sender<ExecEvent>, ex: LighterExchange, journal: Journal) {
     info!("lighter hedge worker started");
     let mut waits = tokio::task::JoinSet::new();
     while let Some(cmd) = rx.recv().await {
@@ -1253,13 +1252,13 @@ pub async fn run_hl_worker(mut rx: Receiver<HedgeCommand>, tx: Sender<ExecEvent>
 
 /// Hedges wait (`tx_ready`) until the nonce is re-read; a failed read is repaired in the
 /// background.
-async fn refresh_nonce(ex: &HlExchange, waits: &mut tokio::task::JoinSet<()>) {
+async fn refresh_nonce(ex: &LighterExchange, waits: &mut tokio::task::JoinSet<()>) {
     ex.nonce_uncertain.store(true, Ordering::Release);
     if ex.nonce.hard_refresh(&ex.rest).await.is_ok() { ex.nonce_uncertain.store(false, Ordering::Release); }
     else { let ex = ex.clone(); waits.spawn(async move { repair_nonce(&ex).await }); }
 }
 
-async fn handle_hedge_cmd(ex: &HlExchange, tx: &Sender<ExecEvent>, journal: &Journal,
+async fn handle_hedge_cmd(ex: &LighterExchange, tx: &Sender<ExecEvent>, journal: &Journal,
     waits: &mut tokio::task::JoinSet<()>, cmd: HedgeCommand) {
     let HedgeCommand::Hedge { mut intent, aggressive_px, .. } = cmd else { return };
     let cloid = intent.cloid;
@@ -1320,7 +1319,7 @@ struct ResolutionContext {
 }
 
 /// The send/nonce owner is separate from observation and cold history requests.
-async fn resolve_attempt(ex: HlExchange, tx: Sender<ExecEvent>, journal: Journal, intent: HedgeIntent,
+async fn resolve_attempt(ex: LighterExchange, tx: Sender<ExecEvent>, journal: Journal, intent: HedgeIntent,
     token: u64, rx: Receiver<FillUpdate>, overflow: Arc<AtomicBool>, ambiguous: bool) {
     let index = intent.cloid.to_lighter_client_order_index();
     let _route = FillRouteGuard { fills: ex.fills.clone(), client_order_index: index, token };
@@ -1345,7 +1344,7 @@ async fn resolve_attempt(ex: HlExchange, tx: Sender<ExecEvent>, journal: Journal
 
 /// Re-reads the venue's nonce until it answers: one failed read must not leave the executor
 /// dark for good (an uncertain nonce stops quoting as well as hedging).
-async fn repair_nonce(ex: &HlExchange) {
+async fn repair_nonce(ex: &LighterExchange) {
     while ex.nonce.hard_refresh(&ex.rest).await.is_err() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -1428,7 +1427,7 @@ fn terminal_order_qty(order: &RemoteOrder, index: i64, account: i64, market: Opt
     order.filled_base_amount.as_deref()?.parse::<Decimal>().ok().filter(|q| *q >= Decimal::ZERO)
 }
 
-impl HlExchange {
+impl LighterExchange {
     async fn terminal_order_and_trades(&self, intent: &HedgeIntent) -> Result<Option<(RemoteOrder, Vec<TradePayload>)>> {
         let market_id = self.wire(&intent.market)?.market_index as u32;
         let auth = generate_ws_auth_token(&self.signer, self.api_key_index)?;

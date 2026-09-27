@@ -108,7 +108,7 @@ const WARM_TIMEOUT: Duration = Duration::from_secs(60);
 /// run saved there. Returns once both replicas hold a book.
 pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::config::MarketCfg, runs_dir: &Path) -> Result<Venues> {
     let aster_base = cfg.maker.live.aster.base_url.trim_end_matches('/').to_string();
-    let lighter_base = cfg.maker.live.hyperliquid.base_url.trim_end_matches('/').to_string();
+    let lighter_base = cfg.maker.live.lighter.base_url.trim_end_matches('/').to_string();
     let http = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
     let fetch = |url: String| {
         let request = http.get(url);
@@ -184,7 +184,7 @@ pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::
     let lighter_fees = [fees[1].maker, fees[1].taker];
     let lighter_url = serve(dry.lighter_port, lighter::Lighter::new(venues.clone(), order_books, vec![detail], lighter_fees, leverage)).await?;
     let live = &mut cfg.maker.live;
-    (live.aster.base_url, live.hyperliquid.base_url, live.dry_run) = (aster_url.clone(), lighter_url.clone(), true);
+    (live.aster.base_url, live.lighter.base_url, live.dry_run) = (aster_url.clone(), lighter_url.clone(), true);
     let taker = &mut cfg.taker.venues;
     (taker.aster_base_url, taker.lighter_base_url, taker.dry_run) = (aster_url.clone(), lighter_url.clone(), true);
     cfg.taker.pnl.persist_dir = runs_dir.to_string_lossy().into_owned();
@@ -633,7 +633,7 @@ pub(crate) mod tests {
         std::fs::write(dir.join("bot.toml"), include_str!("../../bot.toml")).unwrap();
         let mut cfg = BotConfig::load(&dir.join("bot.toml")).unwrap();
         cfg.maker.live.aster.base_url = market.aster.clone();
-        cfg.maker.live.hyperliquid.base_url = market.lighter.clone();
+        cfg.maker.live.lighter.base_url = market.lighter.clone();
         let fixed = |ms: f64| Latency::try_from([ms, ms]).unwrap();
         cfg.dry_run = Some(DryRunCfg {
             shift_ms: 300,

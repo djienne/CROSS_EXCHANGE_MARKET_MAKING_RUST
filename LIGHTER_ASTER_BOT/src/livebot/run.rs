@@ -113,7 +113,7 @@ pub async fn run(
         &markets,
         cfg.live.partials.lighter_min_notional,
         &cfg.live.aster.base_url,
-        &cfg.live.hyperliquid.base_url,
+        &cfg.live.lighter.base_url,
     )
     .await?;
     let eligibility = classify_markets(&specs, cfg).await;
@@ -137,7 +137,7 @@ pub async fn run(
     let mut venue_handles = Vec::new();
     let spec_by_id: HashMap<MarketId, &MarketSpec> = specs.iter().map(|s| (s.market_id.clone(), s)).collect();
     let aster_ws = crate::connectors::aster::ws_root(&cfg.live.aster.base_url);
-    let lighter_ws = crate::lighter::ws::stream_url(&cfg.live.hyperliquid.base_url);
+    let lighter_ws = crate::lighter::ws::stream_url(&cfg.live.lighter.base_url);
     let mut core_hint = 0usize;
     for m in &markets {
         let id = m.id();
@@ -149,7 +149,7 @@ pub async fn run(
         for (venue, ws_url, symbol) in [
             (VenueTag::Aster, &aster_ws, m.aster_symbol.to_lowercase()),
             (
-                VenueTag::Hyperliquid,
+                VenueTag::Hedge,
                 &lighter_ws,
                 spec_by_id
                     .get(&id)
@@ -190,7 +190,7 @@ pub async fn run(
                     BookCheckTarget { market: id.clone(), venue: VenueTag::Aster, symbol: m.aster_symbol.to_uppercase() },
                     BookCheckTarget {
                         market: id.clone(),
-                        venue: VenueTag::Hyperliquid,
+                        venue: VenueTag::Hedge,
                         symbol: spec_by_id
                             .get(&id)
                             .map(|s| s.lighter_market_id.to_string())
@@ -208,7 +208,7 @@ pub async fn run(
             max_concurrent_requests: cfg.book_check.max_concurrent_requests,
             max_rest_snapshot_age_ms: cfg.book_check.max_rest_snapshot_age_ms,
             aster_base_url: cfg.live.aster.base_url.clone(),
-            hl_base_url: cfg.live.hyperliquid.base_url.clone(),
+            hl_base_url: cfg.live.lighter.base_url.clone(),
         };
         let sd = feeds_shutdown.clone();
         Some(
@@ -494,7 +494,7 @@ async fn classify_markets(specs: &[MarketSpec], cfg: &Config) -> HashMap<MarketI
         let ref_px = match &client {
             Some(c) => rest_book::fetch_lighter_book_from_base(
                 c,
-                &cfg.live.hyperliquid.base_url,
+                &cfg.live.lighter.base_url,
                 s.lighter_market_id,
                 cfg.book_check.depth_limit,
             )
@@ -549,7 +549,7 @@ async fn setup_live_planes(
 
     use super::exec::aster::{run_aster_worker, AsterRest};
     use super::exec::creds::venue_creds;
-    use super::exec::hyperliquid::{run_hl_worker, HlExchange};
+    use super::exec::lighter::{run_lighter_worker, LighterExchange};
     use super::exec::sign::{AsterSigner, EvmAsterSigner};
     use super::reconcile::Reconciler;
     use super::scale::MarketScale;
@@ -583,14 +583,14 @@ async fn setup_live_planes(
             cfg.live.aster.effective_max_rest_requests_per_minute(),
         )
     };
-    let signers_dir = Path::new(&cfg.live.hyperliquid.signers_dir);
-    let hedge = HlExchange::new_lighter(
-        cfg.live.hyperliquid.base_url.clone(),
+    let signers_dir = Path::new(&cfg.live.lighter.signers_dir);
+    let hedge = LighterExchange::new_lighter(
+        cfg.live.lighter.base_url.clone(),
         signers_dir,
         hcreds,
         specs,
-        cfg.live.hyperliquid.fill_timeout_ms,
-        cfg.live.hyperliquid.ws_account_max_age_ms,
+        cfg.live.lighter.fill_timeout_ms,
+        cfg.live.lighter.ws_account_max_age_ms,
     )
     .await?;
 
@@ -657,7 +657,7 @@ async fn setup_live_planes(
     // supervisor that only awaits the two real tasks at shutdown.
     let etx = events_tx.clone();
     let aster_worker_task = tokio::spawn(run_aster_worker(exec_rx, exec_prio_rx, etx, worker_aster));
-    let hl_worker_task = tokio::spawn(run_hl_worker(hedge_rx, events_tx.clone(), worker_hl, journal.clone()));
+    let hl_worker_task = tokio::spawn(run_lighter_worker(hedge_rx, events_tx.clone(), worker_hl, journal.clone()));
     let worker_task = tokio::spawn(async move {
         let (aster, hedge) = tokio::join!(aster_worker_task, hl_worker_task);
         aster.map_err(|e| anyhow::anyhow!("Aster worker failed: {e}"))?;

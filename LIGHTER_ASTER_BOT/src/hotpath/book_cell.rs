@@ -17,14 +17,15 @@ use crate::hot_types::HotBook;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VenueTag {
     Aster,
-    Hyperliquid,
+    /// The hedge venue's book.
+    Hedge,
 }
 
 impl VenueTag {
     pub fn as_str(self) -> &'static str {
         match self {
             VenueTag::Aster => "aster",
-            VenueTag::Hyperliquid => "hyperliquid",
+            VenueTag::Hedge => "hedge",
         }
     }
 }

@@ -133,7 +133,7 @@ async fn fetch_one(
             )
             .await
         }
-        VenueTag::Hyperliquid => match target.symbol.parse::<u32>() {
+        VenueTag::Hedge => match target.symbol.parse::<u32>() {
             Ok(market_id) => {
                 rest_book::fetch_lighter_book_from_base(client, &params.hl_base_url, market_id, params.depth_limit).await
             }

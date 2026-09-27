@@ -41,7 +41,7 @@ pub struct MakerPermit {
     books: Option<[(Arc<crate::hotpath::VenueBook>, u64); 2]>,
     epoch: Arc<AtomicU64>,
     expected_epoch: u64,
-    hedge_readiness: Option<super::hyperliquid::HedgeReadiness>,
+    hedge_readiness: Option<super::lighter::HedgeReadiness>,
 }
 impl std::fmt::Debug for MakerPermit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -50,7 +50,7 @@ impl std::fmt::Debug for MakerPermit {
 }
 impl MakerPermit {
     pub fn new(books: [(Arc<crate::hotpath::VenueBook>, u64); 2], epoch: Arc<AtomicU64>, deadline_ns: i64,
-        hedge_readiness: Option<super::hyperliquid::HedgeReadiness>) -> Self {
+        hedge_readiness: Option<super::lighter::HedgeReadiness>) -> Self {
         let expected_epoch = epoch.load(Ordering::Acquire);
         Self { admission: Admission::new(deadline_ns), books: Some(books), epoch, expected_epoch, hedge_readiness }
     }
@@ -136,8 +136,7 @@ pub fn is_priority_cmd(cmd: &ExecCommand) -> bool {
     )
 }
 
-/// Strategy → Lighter hedge worker (the module keeps its historical
-/// `hyperliquid` name; there is no Hyperliquid venue).
+/// Strategy → Lighter hedge worker.
 #[derive(Debug, Clone)]
 pub enum HedgeCommand {
     /// Send an aggressive IOC hedge for this intent at `aggressive_px`, which the sender has

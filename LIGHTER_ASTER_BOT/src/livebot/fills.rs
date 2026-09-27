@@ -257,7 +257,7 @@ impl HedgeIntent {
             cloid,
             logical_id: cloid,
             market,
-            venue: Venue::Hyperliquid,
+            venue: Venue::Hedge,
             purpose: IntentPurpose::Hedge,
             admission: Admission::new(i64::MAX),
             terminal: false,

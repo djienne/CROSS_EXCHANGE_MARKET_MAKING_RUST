@@ -14,8 +14,9 @@ use crate::types::{MarketId, Side};
 #[serde(rename_all = "lowercase")]
 pub enum Venue {
     Aster,
+    /// The hedge venue (Lighter).
     #[serde(rename = "lighter")]
-    Hyperliquid,
+    Hedge,
 }
 
 /// A reconciled signed position on one venue for one market. `signed_qty > 0` long.
@@ -121,7 +122,7 @@ impl AccountSnapshot {
     pub fn reported_position(&self, venue: Venue, market: &MarketId) -> Decimal {
         let list = match venue {
             Venue::Aster => &self.aster_positions,
-            Venue::Hyperliquid => &self.hl_positions,
+            Venue::Hedge => &self.hl_positions,
         };
         list.iter()
             .find(|p| &p.market == market)
@@ -216,7 +217,7 @@ mod tests {
                 entry_px: dec!(100),
             }],
             hl_positions: vec![ScaledPosition {
-                venue: Venue::Hyperliquid,
+                venue: Venue::Hedge,
                 market: "BTC".into(),
                 signed_qty: dec!(-0.5),
                 entry_px: dec!(100),
@@ -251,7 +252,7 @@ mod tests {
     fn reported_position_lookup() {
         let s = snap();
         assert_eq!(s.reported_position(Venue::Aster, &"BTC".into()), dec!(0.5));
-        assert_eq!(s.reported_position(Venue::Hyperliquid, &"BTC".into()), dec!(-0.5));
+        assert_eq!(s.reported_position(Venue::Hedge, &"BTC".into()), dec!(-0.5));
         assert_eq!(s.reported_position(Venue::Aster, &"ETH".into()), dec!(0)); // absent
     }
 

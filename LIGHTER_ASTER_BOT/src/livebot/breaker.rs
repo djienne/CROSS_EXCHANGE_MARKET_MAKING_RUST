@@ -205,7 +205,7 @@ pub fn residual_positions(
     let mut out = Vec::new();
     for m in markets {
         let aster_qty = snap.reported_position(Venue::Aster, m);
-        let hl_qty = snap.reported_position(Venue::Hyperliquid, m);
+        let hl_qty = snap.reported_position(Venue::Hedge, m);
         if aster_qty == Decimal::ZERO && hl_qty == Decimal::ZERO {
             continue;
         }
@@ -304,7 +304,7 @@ mod tests {
             };
             match venue {
                 Venue::Aster => s.aster_positions.push(pos),
-                Venue::Hyperliquid => s.hl_positions.push(pos),
+                Venue::Hedge => s.hl_positions.push(pos),
             }
         }
         s
@@ -316,7 +316,7 @@ mod tests {
         // Flat everywhere → empty.
         assert!(residual_positions(&residual_snap(&[]), &markets).is_empty());
         // Delta-neutral pair → one line with net 0.
-        let s = residual_snap(&[("HYPE", Venue::Aster, dec!(0.5)), ("HYPE", Venue::Hyperliquid, dec!(-0.5))]);
+        let s = residual_snap(&[("HYPE", Venue::Aster, dec!(0.5)), ("HYPE", Venue::Hedge, dec!(-0.5))]);
         let lines = residual_positions(&s, &markets);
         assert_eq!(
             lines,
@@ -325,7 +325,7 @@ mod tests {
         // NET imbalance is flagged via a nonzero net; untraded markets ignored.
         let s = residual_snap(&[
             ("HYPE", Venue::Aster, dec!(0.5)),
-            ("HYPE", Venue::Hyperliquid, dec!(-0.2)),
+            ("HYPE", Venue::Hedge, dec!(-0.2)),
             ("DOGE", Venue::Aster, dec!(9)), // not in `markets` — operator's business
         ]);
         let lines = residual_positions(&s, &markets);
@@ -333,7 +333,7 @@ mod tests {
         assert_eq!(lines[0].market, "HYPE");
         assert_eq!(lines[0].net_qty, dec!(0.3));
         // One-legged residual on the second traded market also reports.
-        let s = residual_snap(&[("ETH", Venue::Hyperliquid, dec!(-1))]);
+        let s = residual_snap(&[("ETH", Venue::Hedge, dec!(-1))]);
         let lines = residual_positions(&s, &markets);
         assert_eq!(lines, vec![ResidualLine { market: "ETH".into(), aster_qty: dec!(0), hl_qty: dec!(-1), net_qty: dec!(-1) }]);
     }

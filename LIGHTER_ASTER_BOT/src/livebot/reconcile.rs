@@ -19,7 +19,7 @@ use crate::types::{MarketId, Side};
 
 use super::account::{AccountSnapshot, AccountState, OpenOrderSnapshot, ScaledPosition, Venue};
 use super::exec::aster::{AsterBalanceRow, AsterOpenOrder, AsterPositionRow, AsterRest};
-use super::exec::hyperliquid::HlExchange;
+use super::exec::lighter::LighterExchange;
 
 /// USD-pegged collateral assets counted at face value in the wallet sum.
 fn is_usd_stable_asset(asset: &str) -> bool {
@@ -164,7 +164,7 @@ fn parse_untraded_row_decimal(raw: &str, field: &str) -> Option<Decimal> {
 /// Reads both venues and publishes [`AccountSnapshot`]s.
 pub struct Reconciler {
     aster: AsterRest,
-    hl: HlExchange,
+    hl: LighterExchange,
     /// Aster UPPER symbol → market id.
     aster_sym_to_market: HashMap<String, MarketId>,
     /// Lighter symbol → market id.
@@ -178,7 +178,7 @@ pub struct Reconciler {
 }
 
 impl Reconciler {
-    pub fn new(aster: AsterRest, hl: HlExchange, specs: &[MarketSpec], mark_max_age_ms: i64) -> Self {
+    pub fn new(aster: AsterRest, hl: LighterExchange, specs: &[MarketSpec], mark_max_age_ms: i64) -> Self {
         let mut aster_sym_to_market = HashMap::new();
         let mut hl_coin_to_market = HashMap::new();
         for s in specs {
@@ -280,7 +280,7 @@ impl Reconciler {
                 continue;
             }
             hl_positions.push(ScaledPosition {
-                venue: Venue::Hyperliquid,
+                venue: Venue::Hedge,
                 market: market.clone(),
                 signed_qty: qty,
                 entry_px: parse_optional_decimal_field(ap.position.entry_px.as_deref(), &format!("lighter.assetPositions[{idx}].entryPx"))?,
@@ -331,7 +331,7 @@ impl Reconciler {
         for o in &hloo {
             if let Some(market) = self.hl_coin_to_market.get(&o.coin) {
                 open_orders.push(OpenOrderSnapshot {
-                    venue: Venue::Hyperliquid,
+                    venue: Venue::Hedge,
                     market: market.clone(),
                     side: if o.side.eq_ignore_ascii_case("A") { Side::Sell } else { Side::Buy },
                     price: parse_decimal_field(&o.limit_px, "lighter.openOrders.limitPx")?,
@@ -451,7 +451,7 @@ impl Reconciler {
         Ok(())
     }
 
-    pub fn hedge_readiness(&self) -> super::exec::hyperliquid::HedgeReadiness { self.hl.readiness() }
+    pub fn hedge_readiness(&self) -> super::exec::lighter::HedgeReadiness { self.hl.readiness() }
 
     async fn resolve_aster_attempts(&self, account: &AccountState, events: &tokio::sync::mpsc::Sender<super::exec::command::ExecEvent>) {
         for intent in account.pending_exec().iter() {
@@ -653,7 +653,7 @@ mod tests {
 
     fn hl_pos(market: &str, qty: &str, entry: &str) -> ScaledPosition {
         ScaledPosition {
-            venue: Venue::Hyperliquid,
+            venue: Venue::Hedge,
             market: MarketId(market.to_string()),
             signed_qty: qty.parse().unwrap(),
             entry_px: entry.parse().unwrap(),
