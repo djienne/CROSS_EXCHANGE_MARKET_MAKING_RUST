@@ -231,11 +231,16 @@ impl Client {
     }
 
     /// `open`, `filled`, `canceled`, `rejected`, ..., or `unknownOid` (never accepted, or not
-    /// yet: only past its `expiresAfter` does that prove it never will be).
-    pub async fn order_status(&self, cloid: &str) -> Result<String> {
+    /// yet: only past its `expiresAfter` does that prove it never will be), and the size filled.
+    pub async fn order_status(&self, cloid: &str) -> Result<(String, Decimal)> {
         let reply = self.info(json!({"type": "orderStatus", "user": self.account(), "oid": cloid})).await?;
-        reply.pointer("/order/status").or(reply.get("status")).and_then(Value::as_str).map(str::to_owned)
-            .with_context(|| format!("orderStatus without a status: {reply}"))
+        let status = reply.pointer("/order/status").or(reply.get("status")).and_then(Value::as_str).map(str::to_owned)
+            .with_context(|| format!("orderStatus without a status: {reply}"))?;
+        let filled = match reply.pointer("/order/order") {
+            Some(order) => dec(&order["origSz"])? - dec(&order["sz"])?,
+            None => Decimal::ZERO,
+        };
+        Ok((status, filled))
     }
 
     /// The account's fills since `start_ms`, oldest first.

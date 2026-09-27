@@ -454,14 +454,16 @@ impl LighterBook {
     }
 }
 
-#[derive(Clone)]
+/// Whether the hedge venue can take an order now. Hyperliquid, reached over REST with nonces
+/// from the clock, always can.
+#[derive(Clone, Default)]
 pub struct HedgeReadiness {
-    socket: Arc<TxWebSocket>,
+    socket: Option<Arc<TxWebSocket>>,
     nonce_uncertain: Arc<AtomicBool>,
 }
 impl HedgeReadiness {
     pub fn is_ready(&self) -> bool {
-        self.socket.is_ready() && !self.nonce_uncertain.load(Ordering::Acquire)
+        self.socket.as_ref().is_none_or(|s| s.is_ready()) && !self.nonce_uncertain.load(Ordering::Acquire)
     }
 }
 
@@ -571,7 +573,7 @@ impl LighterExchange {
     pub fn tx_ready(&self) -> bool { self.tx_ws.is_ready() && !self.nonce_uncertain.load(Ordering::Acquire) }
 
     pub fn readiness(&self) -> HedgeReadiness {
-        HedgeReadiness { socket: self.tx_ws.clone(), nonce_uncertain: self.nonce_uncertain.clone() }
+        HedgeReadiness { socket: Some(self.tx_ws.clone()), nonce_uncertain: self.nonce_uncertain.clone() }
     }
 
     fn wire(&self, market: &MarketId) -> Result<&LighterMarketWire> {

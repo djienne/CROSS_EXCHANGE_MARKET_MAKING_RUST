@@ -2,7 +2,7 @@
 //! WebSocket-driven books. This is a slow reconciliation aid (seconds cadence), NOT
 //! on the quote hot path: it confirms each venue's WS feed is building the book
 //! faithfully (no parse drift, stuck snapshot, or wrong symbol). Aster uses the
-//! Binance-style futures depth endpoint; Lighter uses `orderBookOrders`.
+//! Binance-style futures depth endpoint; Lighter uses `orderBookOrders`, Hyperliquid `l2Book`.
 
 use std::time::Duration;
 
@@ -86,6 +86,21 @@ pub async fn fetch_lighter_book_from_base(client: &reqwest::Client, base_url: &s
     Ok(OrderBook::from_levels(bids, asks, Utc::now(), Utc::now()))
 }
 
+/// Hyperliquid's `l2Book` (/info weight 2, up to 20 levels a side), stamped with its `time`.
+pub async fn fetch_hyperliquid_book(client: &reqwest::Client, base_url: &str, coin: &str) -> Result<OrderBook> {
+    let book = crate::hyperliquid::client::info(client, base_url, serde_json::json!({"type": "l2Book", "coin": coin})).await?;
+    let time = book["time"].as_i64().with_context(|| format!("Hyperliquid l2Book {coin} without a time"))?;
+    Ok(OrderBook::from_levels(lighter_rows(book.pointer("/levels/0")), lighter_rows(book.pointer("/levels/1")), ms_to_dt(time), Utc::now()))
+}
+
+/// The REST book of `spec`'s hedge venue.
+pub async fn fetch_hedge_book(client: &reqwest::Client, live: &crate::config::LiveCfg, spec: &crate::markets::MarketSpec, limit: u32) -> Result<OrderBook> {
+    match spec.hedge {
+        crate::config::HedgeVenue::Lighter => fetch_lighter_book_from_base(client, &live.lighter.base_url, spec.lighter_market_id, limit).await,
+        crate::config::HedgeVenue::Hyperliquid => fetch_hyperliquid_book(client, &live.hyperliquid.base_url, &spec.hl_coin).await,
+    }
+}
+
 fn parse_pairs(rows: &[[String; 2]]) -> Vec<(Decimal, Decimal)> {
     rows.iter()
         .filter_map(|r| match (parse_dec(&r[0]), parse_dec(&r[1])) {
@@ -95,6 +110,7 @@ fn parse_pairs(rows: &[[String; 2]]) -> Vec<(Decimal, Decimal)> {
         .collect()
 }
 
+/// Lighter rows (`price`/`remaining_base_amount`) or Hyperliquid's (`px`/`sz`).
 fn lighter_rows(v: Option<&serde_json::Value>) -> Vec<(Decimal, Decimal)> {
     let Some(rows) = v.and_then(|v| v.as_array()) else {
         return Vec::new();

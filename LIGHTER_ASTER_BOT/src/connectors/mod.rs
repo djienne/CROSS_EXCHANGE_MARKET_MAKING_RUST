@@ -1,4 +1,4 @@
-//! Live market-data connectors (Aster + Lighter) and one-shot REST spec fetch.
+//! Live market-data connectors (Aster, Lighter, Hyperliquid) and one-shot REST spec fetch.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,6 +11,7 @@ use crate::book::{OrderBook, PriceLevel};
 use chrono::{DateTime, Utc};
 
 pub mod aster;
+pub mod hyperliquid;
 pub mod lighter;
 pub mod rest_book;
 pub mod rest_specs;

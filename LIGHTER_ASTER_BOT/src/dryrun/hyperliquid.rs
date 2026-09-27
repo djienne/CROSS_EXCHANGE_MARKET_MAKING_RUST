@@ -1,17 +1,20 @@
 //! The simulated Hyperliquid perpetuals venue: the `/info` reads and `/exchange` actions of the
 //! bot's client (`crate::hyperliquid::client`), answered by the matching core in Hyperliquid's
-//! shapes. Weights follow Hyperliquid's docs (1200 a minute per IP). Signatures and nonces are
+//! shapes, and the public `l2Book`/`bbo` streams on `/ws`. Weights follow Hyperliquid's docs (1200 a minute per IP). Signatures and nonces are
 //! not checked: the only verifier would be our own hash, which the client's tests pin to the
 //! Python SDK.
 
 use anyhow::Context;
+use futures_util::{SinkExt, StreamExt};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use super::clock::wall_us;
+use super::feed::Follower;
 use super::matching::{End, Envelope, Fill, Order, OrderRef, OrderSpec, Reject, Reply, Request, Status, Tif, Venue};
 use super::server::{self, Handler, Response};
 use super::Venues;
@@ -70,7 +73,7 @@ fn status_str(o: &Order) -> &'static str {
 fn fill_json(f: &Fill) -> Value {
     json!({
         "coin": f.market, "px": f.price, "sz": f.qty, "side": side_str(f.side), "time": f.at_us / 1_000,
-        "oid": f.order_id, "cloid": f.client_id, "crossed": !f.maker, "fee": f.fee, "feeToken": "USDC",
+        "oid": f.order_id, "cloid": f.client_id, "crossed": !f.maker, "fee": f.fee, "feeToken": "USDC", "tid": f.id,
     })
 }
 
@@ -224,9 +227,41 @@ impl Handler for Hyperliquid {
         }
     }
 
-    async fn websocket(&self, _lane: u64, request: server::Request, ws: WebSocketStream<TcpStream>) {
-        tracing::warn!("dry-run Hyperliquid: no websocket at {}", request.path);
-        drop(ws);
+    /// Public streams, as a Tokyo bot receives them.
+    async fn websocket(&self, lane: u64, _request: server::Request, mut ws: WebSocketStream<TcpStream>) {
+        let mut follower = self.venues.follower(Venue::Hyperliquid, lane, false);
+        loop {
+            let text = tokio::select! {
+                incoming = ws.next() => match incoming {
+                    Some(Ok(Message::Text(text))) => on_text(&text, &mut follower),
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => return,
+                    Some(Ok(_)) => continue,
+                },
+                frame = follower.next() => match frame {
+                    Some(text) => text.to_string(),
+                    None => {
+                        let _ = ws.close(None).await;
+                        return;
+                    }
+                },
+            };
+            if ws.send(Message::Text(text)).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Answers a `/ws` request: a subscription to a stream the upstream carries, or the app ping.
+fn on_text(text: &str, follower: &mut Follower) -> String {
+    let msg: Value = serde_json::from_str(text).unwrap_or_default();
+    let sub = &msg["subscription"];
+    match msg["method"].as_str() {
+        Some("ping") => json!({"channel": "pong"}).to_string(),
+        Some("subscribe") if follower.subscribe(&format!("{}/{}", sub["type"].as_str().unwrap_or_default(), sub["coin"].as_str().unwrap_or_default())) => {
+            json!({"channel": "subscriptionResponse", "data": msg}).to_string()
+        }
+        _ => json!({"channel": "error", "data": format!("Invalid subscription {text}")}).to_string(),
     }
 }
 
@@ -249,7 +284,7 @@ mod tests {
     const META: &str = r#"{"universe":[{"name":"BTC","szDecimals":5},{"name":"HYPE","szDecimals":2}]}"#;
 
     /// The bot's own client against the simulated venue: every read and action it sends,
-    /// answered in Hyperliquid's shapes.
+    /// answered in Hyperliquid's shapes; then its book connector on the venue's streams.
     #[tokio::test]
     async fn hyperliquid_answers_the_bots_own_client() {
         let fixed = Latency::try_from([1.0, 1.0]).unwrap();
@@ -262,9 +297,10 @@ mod tests {
         core.trust_feed();
         let filters = Filters { tick: dec!(0.0001), step: dec!(0.01), min_qty: dec!(0.01), min_notional: dec!(10), percent_price: None, sig_figs: Some(5) };
         core.add_market(Venue::Hyperliquid, "HYPE", Some(20), filters);
-        let hubs = [(); 2].map(|()| Arc::new(Mutex::new(Hub::new(300_000, Vec::new()))));
+        let streams = [vec![], vec!["l2Book/HYPE".to_string(), "bbo/HYPE".to_string()]];
+        let hubs = streams.map(|streams| Arc::new(Mutex::new(Hub::new(300_000, streams))));
         let (inputs, feed) = mpsc::unbounded_channel();
-        let venues = Venues::start(core, feed, hubs, [Latency::ZERO; 2], 1, None);
+        let venues = Venues::start(core, feed, hubs.clone(), [Latency::ZERO; 2], 1, None);
         let book = BookUpdate::Replace { bids: vec![(dec!(40), dec!(5))], asks: vec![(dec!(40.01), dec!(5))] };
         let event = FeedEvent::Book(book);
         inputs.send(Input::Frame { venue: Venue::Hyperliquid, market: "HYPE".into(), exch_us: wall_us() - 300_000, event }).unwrap();
@@ -280,11 +316,11 @@ mod tests {
         let cloid = "0x00000000000000000000000000000001";
         assert!(matches!(client.place(&asset, true, dec!(39.5), dec!(0.5), Wire::Alo, false, cloid).await, Placed::Resting { .. }));
         assert!(client.open_orders().await.unwrap().iter().any(|o| o["cloid"] == cloid));
-        assert_eq!(client.order_status(cloid).await.unwrap(), "open");
+        assert_eq!(client.order_status(cloid).await.unwrap().0, "open");
         client.cancel(&asset, cloid).await.unwrap();
-        assert_eq!(client.order_status(cloid).await.unwrap(), "canceled");
+        assert_eq!(client.order_status(cloid).await.unwrap().0, "canceled");
         assert!(client.cancel(&asset, cloid).await.is_err(), "already canceled");
-        assert_eq!(client.order_status("0x00000000000000000000000000000009").await.unwrap(), "unknownOid");
+        assert_eq!(client.order_status("0x00000000000000000000000000000009").await.unwrap(), ("unknownOid".into(), dec!(0)));
         let crossing = client.place(&asset, true, dec!(40.02), dec!(0.5), Wire::Alo, false, "0x02").await;
         assert!(matches!(&crossing, Placed::Rejected(e) if e.starts_with("Post only")), "{crossing:?}");
 
@@ -306,6 +342,47 @@ mod tests {
         assert!(client.fills_since(wall_us() / 1_000 + 1).await.unwrap().is_empty(), "only the fills since startTime");
         let missed = client.place(&asset, true, dec!(30), dec!(0.5), Wire::Ioc, false, "0x05").await;
         assert!(matches!(&missed, Placed::Rejected(e) if e.starts_with("Order could not immediately match")), "{missed:?}");
-        assert_eq!(client.order_status("0x05").await.unwrap(), "iocCancelRejected");
+        assert_eq!(client.order_status("0x05").await.unwrap(), ("iocCancelRejected".into(), dec!(0)));
+        assert_eq!(client.order_status("0x03").await.unwrap(), ("filled".into(), dec!(0.5)));
+
+        // Each upstream l2Book fills the connector's L2 slot, each bbo its BBO slot, with the
+        // venue's time moved by the shift (so received about as fresh as sent).
+        let cell = Arc::new(crate::hotpath::VenueBook::new());
+        let tap = crate::connectors::Tap { book: Some(cell.clone()), reconnect: None, scale: None, qty_scale: crate::livebot::scale::HotQtyScale::Hedge };
+        tokio::spawn(crate::connectors::hyperliquid::run_with_tap(crate::connectors::hyperliquid::ws_url(&base), "HYPE".into(), tap));
+        let upstream = |channel: &str, data: Value| {
+            let frame = super::super::feed::hyperliquid_frame(&json!({"channel": channel, "data": data}).to_string(), 300_000);
+            super::super::feed::forward(frame.unwrap().unwrap(), &hubs[1], &inputs);
+        };
+        let level = |px: &str, sz: &str| json!({"px": px, "sz": sz, "n": 1});
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while cell.load().is_none() || cell.load_bbo().is_none() {
+                let time = wall_us() / 1_000;
+                upstream("l2Book", json!({"coin": "HYPE", "time": time, "levels": [[level("40", "5"), level("39.9", "7")], [level("40.01", "5")]]}));
+                upstream("bbo", json!({"coin": "HYPE", "time": time, "bbo": [level("40.005", "1"), level("40.01", "5")]}));
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the connector gets both books");
+        let (l2, bbo) = (cell.load().unwrap(), cell.load_bbo().unwrap());
+        let top = |book: &crate::book::OrderBook| [book.bids[0], book.asks[0]].map(|l| (l.px, l.qty));
+        assert_eq!((l2.bids.len(), top(&l2)), (2, [(dec!(40), dec!(5)), (dec!(40.01), dec!(5))]));
+        assert_eq!(top(&bbo), [(dec!(40.005), dec!(1)), (dec!(40.01), dec!(5))]);
+        let age_ms = (l2.local_recv_ts - l2.exch_ts).num_milliseconds();
+        assert!((0..200).contains(&age_ms), "a shifted frame arrives as fresh as sent: {age_ms} ms");
+        // The core takes the same frames (the bbo overlays the l2Book), as the bot's REST read sees.
+        let http = reqwest::Client::new();
+        let rest_top = || async {
+            let book = crate::connectors::rest_book::fetch_hyperliquid_book(&http, &base, "HYPE").await.unwrap();
+            (book.bids[0].px, book.asks[0].px)
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while rest_top().await != (dec!(40.005), dec!(40.01)) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the core follows the upstream frames");
     }
 }

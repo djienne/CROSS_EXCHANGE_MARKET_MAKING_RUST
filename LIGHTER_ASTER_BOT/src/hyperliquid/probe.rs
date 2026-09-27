@@ -76,12 +76,12 @@ async fn place_cancel(client: &Client, asset: &Asset, max_usd: Decimal) -> Resul
     let checks = async {
         ensure!(matches!(placed, Placed::Resting { .. }), "the order does not rest");
         ensure!(client.open_orders().await?.iter().any(|o| o["cloid"] == id.as_str()), "the order is not in openOrders");
-        ensure!(client.order_status(&id).await? == "open", "orderStatus is not open");
+        ensure!(client.order_status(&id).await?.0 == "open", "orderStatus is not open");
         let at = Instant::now();
         client.cancel(asset, &id).await?;
         println!("cancelled in {} ms", at.elapsed().as_millis());
-        ensure!(client.order_status(&id).await? == "canceled", "orderStatus is not canceled");
-        ensure!(client.order_status(&cloid()).await? == "unknownOid", "an unused cloid is not unknownOid");
+        ensure!(client.order_status(&id).await?.0 == "canceled", "orderStatus is not canceled");
+        ensure!(client.order_status(&cloid()).await?.0 == "unknownOid", "an unused cloid is not unknownOid");
         Ok::<_, anyhow::Error>(())
     }.await;
     if checks.is_err() && !matches!(placed, Placed::Rejected(_)) {
@@ -100,7 +100,7 @@ async fn filled(client: &Client, placed: Placed, id: &str, since_ms: i64) -> Res
         Placed::Unknown(_) => {}
     }
     let deadline = Instant::now() + std::time::Duration::from_millis(ORDER_TTL_MS + 2_000);
-    while client.order_status(id).await? == "unknownOid" && Instant::now() < deadline {
+    while client.order_status(id).await?.0 == "unknownOid" && Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     let fills = client.fills_since(since_ms).await?;

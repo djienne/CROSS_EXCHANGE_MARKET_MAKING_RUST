@@ -6,11 +6,12 @@
 //! - [`sign`] — signer traits + monotonic nonces + the real Aster signer.
 //! - [`creds`] — `aster.env`/`lighter.env` loading + key-derived role resolution.
 //! - [`crypto`] — golden-tested Aster EIP-712 signing primitives.
-//! - [`aster`] / [`lighter`] — the GATED live workers (real funds; signer-gated).
+//! - [`aster`] / [`lighter`] / [`hyperliquid`] — the GATED live workers (real funds; signer-gated).
 
 pub mod aster;
 pub mod command;
 pub mod creds;
 pub mod crypto;
+pub mod hyperliquid;
 pub mod lighter;
 pub mod sign;

@@ -111,6 +111,8 @@ basis_buffer_bps     = "1.0"
 funding_buffer_bps   = "0.0"
 aster_maker_fee_bps        = "0.0"
 taker_fee_bps              = "0.0"
+# The hedge fee of a market hedged on Hyperliquid (the account's userCrossRate, probe 2026-09-27).
+hyperliquid_taker_fee_bps  = "4.5"
 
 [maker.quote]
 # $13 per side: > Lighter's $10 min and the $5 Aster min, <= the $15 small-risk cap.
@@ -217,6 +219,13 @@ max_cumulative_loss_usdc = "10"
 aster_symbol = "HYPEUSDT"
 lighter_symbol      = "HYPE"
 
+# HYPE hedged on Hyperliquid; its own lock, journal and simulated state by market id.
+[[maker.markets]]
+market_id    = "HYPE-HL"
+aster_symbol = "HYPEUSDT"
+lighter_symbol = "HYPE"
+hedge_venue  = "hyperliquid"
+
 [[maker.markets]]
 aster_symbol = "BNBUSDT"
 lighter_symbol      = "BNB"
@@ -254,6 +263,11 @@ aster_feed_ms        = [5, 30]
 lighter_feed_ms      = [5, 30]
 aster_user_stream_ms = [10, 50]
 lighter_account_ms   = [5, 30]
+# A market hedged on Hyperliquid (lighter_port and lighter_balance_usdc serve its hedge venue).
+# Hyperliquid states a 0.2 s median end to end (one block) from Tokyo; from this host an IOC took
+# ~0.9 s with the network to Tokyo (probe 2026-09-27). Its feed is an estimate; calibrate both.
+hyperliquid_rtt_ms  = [200, 500]
+hyperliquid_feed_ms = [5, 30]
 # Hidden size ahead of us at our price, as a multiple of the visible size (Aster offers a HIDDEN
 # time in force); calibrate from the prints the visible book cannot explain.
 hidden_queue_multiplier = "0.5"

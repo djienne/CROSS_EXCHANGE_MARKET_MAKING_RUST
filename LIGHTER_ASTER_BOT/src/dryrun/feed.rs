@@ -4,7 +4,7 @@
 //! timestamp moved +D. The bot so sees Tokyo-fresh data by its own, unchanged clocks.
 //!
 //! The venues' own field names are parsed here (Aster `E`/`T`, Lighter `timestamp` in ms and
-//! `last_updated_at` in µs); everything downstream works in µs.
+//! `last_updated_at` in µs, Hyperliquid `time` in ms); everything downstream works in µs.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -39,9 +39,11 @@ pub struct Seq {
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub venue: Venue,
-    /// The core's market key: the Aster symbol (`HYPEUSDT`) or the Lighter market index (`24`).
+    /// The core's market key: the Aster symbol (`HYPEUSDT`), the Lighter market index (`24`)
+    /// or the Hyperliquid coin (`HYPE`).
     pub market: String,
-    /// Aster stream (`hypeusdt@depth20@100ms`) or Lighter channel (`order_book/24`).
+    /// Aster stream (`hypeusdt@depth20@100ms`), Lighter channel (`order_book/24`) or
+    /// Hyperliquid subscription (`l2Book/HYPE`).
     pub stream: String,
     /// When the venue's engine made the change (µs, unshifted).
     pub engine_us: i64,
@@ -49,7 +51,7 @@ pub struct Frame {
     pub publish_us: i64,
     pub event: FeedEvent,
     /// What the bot receives, timestamps already moved +D: the stream's `data` (Aster) or the
-    /// whole message (Lighter).
+    /// whole message (Lighter, Hyperliquid).
     pub text: Arc<str>,
     pub seq: Option<Seq>,
 }
@@ -74,6 +76,7 @@ fn levels(rows: &Value) -> Result<Vec<Level>> {
                 parse_dec(pair[0].as_str().context("price")?)?,
                 parse_dec(pair[1].as_str().context("size")?)?,
             )),
+            _ if row.get("px").is_some() => Ok((dec(row, "px")?, dec(row, "sz")?)),
             _ => Ok((dec(row, "price")?, dec(row, "size")?)),
         })
         .collect()
@@ -165,6 +168,35 @@ pub fn lighter_frame(text: &str, shift_us: i64) -> Result<Option<Frame>> {
         event,
         text: msg.to_string().into(),
         seq: Some(seq),
+    }))
+}
+
+/// Parses one upstream Hyperliquid message (`None` unless it is a two-sided `l2Book` or `bbo`).
+pub fn hyperliquid_frame(text: &str, shift_us: i64) -> Result<Option<Frame>> {
+    let mut msg: Value = serde_json::from_str(text).context("Hyperliquid frame is not JSON")?;
+    let channel = msg["channel"].as_str().unwrap_or_default().to_string();
+    let data = &mut msg["data"];
+    let update = match channel.as_str() {
+        "l2Book" => BookUpdate::Replace { bids: levels(&data["levels"][0])?, asks: levels(&data["levels"][1])? },
+        "bbo" if data["bbo"].as_array().is_some_and(|top| top.iter().any(Value::is_null)) => return Ok(None),
+        "bbo" => match levels(&data["bbo"])?[..] {
+            [bid, ask] => BookUpdate::Top { bid, ask },
+            _ => anyhow::bail!("Hyperliquid bbo is not a pair"),
+        },
+        _ => return Ok(None),
+    };
+    let coin = data["coin"].as_str().context("Hyperliquid book without a coin")?.to_string();
+    let time_us = data["time"].as_i64().context("Hyperliquid book without a time")? * 1_000;
+    shift_fields(data, &["time"], shift_us / 1_000);
+    Ok(Some(Frame {
+        venue: Venue::Hyperliquid,
+        stream: format!("{channel}/{coin}"),
+        market: coin,
+        engine_us: time_us,
+        publish_us: time_us,
+        event: FeedEvent::Book(update),
+        text: msg.to_string().into(),
+        seq: None,
     }))
 }
 
@@ -637,6 +669,74 @@ pub async fn lighter_upstream(url: String, markets: Vec<String>, shift_us: i64, 
         },
     )
     .await;
+}
+
+/// Hyperliquid closes a connection that sent nothing for 60 s; its ping is an app message.
+const HYPERLIQUID_PING: Duration = Duration::from_secs(20);
+
+/// Follows the real Hyperliquid `l2Book` and `bbo` of `coins` into the core and the bot's streams,
+/// reconnecting forever. Ponytail: no funding, so a simulated Hyperliquid position pays none
+/// (hourly on the venue; about $0.001 an hour on a $60 hedge at 11 % a year). Add it from
+/// `activeAssetCtx` if positions grow.
+pub async fn hyperliquid_upstream(ws_url: String, coins: Vec<String>, shift_us: i64, hub: Arc<Mutex<Hub>>, inputs: mpsc::UnboundedSender<Input>) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let started = Instant::now();
+        let mut last_us = None;
+        if let Err(e) = hyperliquid_session(&ws_url, &coins, shift_us, &hub, &inputs, &mut last_us).await {
+            tracing::warn!("dry-run upstream Hyperliquid: {e:#}");
+        }
+        if let Some(last_us) = last_us {
+            gap(Venue::Hyperliquid, &coins, last_us, &hub, &inputs);
+        }
+        if started.elapsed() >= Duration::from_secs(60) {
+            backoff = Duration::from_secs(1);
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(UPSTREAM_BACKOFF_MAX);
+    }
+}
+
+async fn hyperliquid_session(
+    url: &str,
+    coins: &[String],
+    shift_us: i64,
+    hub: &Mutex<Hub>,
+    inputs: &mpsc::UnboundedSender<Input>,
+    last_us: &mut Option<i64>,
+) -> Result<()> {
+    let (ws, _) = tokio_tungstenite::connect_async(url).await.context("connect")?;
+    let (mut write, mut read) = ws.split();
+    for coin in coins {
+        for kind in ["l2Book", "bbo"] {
+            let subscribe = json!({"method": "subscribe", "subscription": {"type": kind, "coin": coin}});
+            crate::connectors::send_guarded(&mut write, Message::Text(subscribe.to_string())).await?;
+        }
+    }
+    let mut ping = tokio::time::interval(HYPERLIQUID_PING);
+    let mut deadline = tokio::time::Instant::now() + UPSTREAM_IDLE;
+    loop {
+        tokio::select! {
+            msg = read.next() => {
+                deadline = tokio::time::Instant::now() + UPSTREAM_IDLE;
+                match msg.context("the upstream closed")?? {
+                    Message::Text(text) => match hyperliquid_frame(&text, shift_us) {
+                        Ok(Some(frame)) => {
+                            *last_us = (*last_us).max(Some(frame.engine_us));
+                            forward(frame, hub, inputs);
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!("dry-run upstream Hyperliquid: unreadable frame: {e:#}"),
+                    },
+                    Message::Ping(p) => crate::connectors::send_guarded(&mut write, Message::Pong(p)).await?,
+                    Message::Close(_) => return Ok(()),
+                    _ => {}
+                }
+            }
+            _ = ping.tick() => crate::connectors::send_guarded(&mut write, Message::Text(r#"{"method":"ping"}"#.into())).await?,
+            _ = tokio::time::sleep_until(deadline) => anyhow::bail!("silent upstream"),
+        }
+    }
 }
 
 /// How often the Aster funding estimate is polled: the last poll before a settlement sets its rate.

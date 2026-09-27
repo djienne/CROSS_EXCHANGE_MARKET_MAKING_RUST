@@ -131,7 +131,9 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             }
             let _lock = match (observe_only, selected.as_slice()) {
                 (false, [market]) => {
-                    Some(crate::controller::lock_market(std::path::Path::new(crate::controller::RUNS_DIR), &market.id().0)?)
+                    let runs = std::path::Path::new(crate::controller::RUNS_DIR);
+                    let aster = crate::controller::lock_market(runs, &format!("ASTER-{}", market.aster_symbol))?;
+                    Some((crate::controller::lock_market(runs, &market.id().0)?, aster))
                 }
                 _ => None,
             };

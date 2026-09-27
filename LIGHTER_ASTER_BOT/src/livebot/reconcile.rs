@@ -6,6 +6,7 @@
 //! into the predicted state. Runs once at startup (to gate clean-start) and then on a cold loop.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
@@ -19,7 +20,37 @@ use crate::types::{MarketId, Side};
 
 use super::account::{AccountSnapshot, AccountState, OpenOrderSnapshot, ScaledPosition, Venue};
 use super::exec::aster::{AsterBalanceRow, AsterOpenOrder, AsterPositionRow, AsterRest};
-use super::exec::lighter::LighterExchange;
+use super::exec::hyperliquid::HyperliquidHedge;
+use super::exec::lighter::{HedgeReadiness, HlClearinghouse, HlOpenOrder, LighterExchange};
+
+/// The hedge venue's account reads.
+#[derive(Clone)]
+pub enum HedgeAccount {
+    Lighter(LighterExchange),
+    Hyperliquid(Arc<HyperliquidHedge>),
+}
+
+impl From<LighterExchange> for HedgeAccount {
+    fn from(lighter: LighterExchange) -> Self {
+        HedgeAccount::Lighter(lighter)
+    }
+}
+
+impl HedgeAccount {
+    async fn clearinghouse_state(&self) -> Result<HlClearinghouse> {
+        match self {
+            HedgeAccount::Lighter(l) => l.clearinghouse_state().await,
+            HedgeAccount::Hyperliquid(h) => h.clearinghouse_state().await,
+        }
+    }
+
+    async fn open_orders_info(&self) -> Result<Vec<HlOpenOrder>> {
+        match self {
+            HedgeAccount::Lighter(l) => l.open_orders_info().await,
+            HedgeAccount::Hyperliquid(h) => h.open_orders_info().await,
+        }
+    }
+}
 
 /// USD-pegged collateral assets counted at face value in the wallet sum.
 fn is_usd_stable_asset(asset: &str) -> bool {
@@ -164,7 +195,7 @@ fn parse_untraded_row_decimal(raw: &str, field: &str) -> Option<Decimal> {
 /// Reads both venues and publishes [`AccountSnapshot`]s.
 pub struct Reconciler {
     aster: AsterRest,
-    hl: LighterExchange,
+    hl: HedgeAccount,
     /// Aster UPPER symbol → market id.
     aster_sym_to_market: HashMap<String, MarketId>,
     /// Lighter symbol → market id.
@@ -180,7 +211,7 @@ pub struct Reconciler {
 }
 
 impl Reconciler {
-    pub fn new(aster: AsterRest, hl: LighterExchange, specs: &[MarketSpec], mark_max_age_ms: i64) -> Self {
+    pub fn new(aster: AsterRest, hl: impl Into<HedgeAccount>, specs: &[MarketSpec], mark_max_age_ms: i64) -> Self {
         let mut aster_sym_to_market = HashMap::new();
         let mut hl_coin_to_market = HashMap::new();
         for s in specs {
@@ -189,7 +220,7 @@ impl Reconciler {
         }
         Reconciler {
             aster,
-            hl,
+            hl: hl.into(),
             aster_sym_to_market,
             hl_coin_to_market,
             mark_max_age_ms,
@@ -213,14 +244,15 @@ impl Reconciler {
     /// which would silently disable orphan recovery AND the breaker (see module note on
     /// `parse_untraded_row_decimal`).
     async fn lighter_mark(&self, market: &MarketId) -> Option<Decimal> {
-        if let Some((mid, age_ms)) = self.hl.cached_lighter_mid(market) {
+        let HedgeAccount::Lighter(lighter) = &self.hl else { return None };
+        if let Some((mid, age_ms)) = lighter.cached_lighter_mid(market) {
             if (0..=self.mark_max_age_ms).contains(&age_ms) && mid > Decimal::ZERO {
                 return Some(mid);
             }
         }
         // rest_mid bypasses the (stale) cache; 800ms keeps a worst-case cycle inside the
         // reconcile loop's `interval * 3` budget.
-        match tokio::time::timeout(Duration::from_millis(800), self.hl.rest_mid(market)).await {
+        match tokio::time::timeout(Duration::from_millis(800), lighter.rest_mid(market)).await {
             Ok(Ok(mid)) if mid > Decimal::ZERO => Some(mid),
             _ => None,
         }
@@ -302,7 +334,13 @@ impl Reconciler {
         // moved $8), so without this the combined equity bleeds 1:1 with price on a
         // delta-neutral book and false-trips the breaker (2026-07-04 incident).
         let mut hl_marks: HashMap<MarketId, Decimal> = HashMap::new();
+        // Hyperliquid's accountValue already moves with the uPnL: its legs count at their entry.
+        let upnl_in_equity = matches!(self.hl, HedgeAccount::Hyperliquid(_));
         for p in &hl_positions {
+            if upnl_in_equity {
+                hl_marks.insert(p.market.clone(), p.entry_px);
+                continue;
+            }
             if p.signed_qty == Decimal::ZERO {
                 continue;
             }
@@ -461,7 +499,12 @@ impl Reconciler {
         Ok(())
     }
 
-    pub fn hedge_readiness(&self) -> super::exec::lighter::HedgeReadiness { self.hl.readiness() }
+    pub fn hedge_readiness(&self) -> HedgeReadiness {
+        match &self.hl {
+            HedgeAccount::Lighter(l) => l.readiness(),
+            HedgeAccount::Hyperliquid(_) => HedgeReadiness::default(),
+        }
+    }
 
     async fn resolve_aster_attempts(&self, account: &AccountState, events: &tokio::sync::mpsc::Sender<super::exec::command::ExecEvent>) {
         for intent in account.pending_exec().iter() {

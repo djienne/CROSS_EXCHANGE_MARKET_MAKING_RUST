@@ -141,13 +141,15 @@ pub(crate) async fn run_with(
     // Live and dry-run never share a file.
     let runs_dir = if live { runs_root.to_path_buf() } else { runs_root.join("dry-run") };
     let _lock = lock_market(&runs_dir, &market)?;
+    // Markets on one Aster symbol share its one-way position there: one live writer per symbol.
+    let _aster_lock = if live { Some(lock_market(&runs_dir, &format!("ASTER-{}", maker_markets[0].aster_symbol))?) } else { None };
     let sim = if live {
         refuse_insecure_env_files()?;
         refuse_legacy_stack(&market, &[runs_root, Path::new("../runs")])?;
         None
     } else {
         let dry_run = cfg.dry_run.clone().context("--mode dry-run needs a [dry_run] table in the config")?;
-        Some(crate::dryrun::start(&dry_run, &mut cfg, &taker_markets[0], &runs_dir).await?)
+        Some(crate::dryrun::start(&dry_run, &mut cfg, &maker_markets[0], &runs_dir).await?)
     };
     let parked = stop.clone();
     let result = async move {

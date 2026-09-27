@@ -7,7 +7,7 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 
 use crate::book::OrderBook;
-use crate::config::Config;
+use crate::config::{Config, HedgeVenue};
 use crate::connectors::{rest_book, rest_specs};
 use crate::markets::MarketSpec;
 use crate::quote_engine::{compute_desired_quote, DesiredQuote, PositionContext};
@@ -15,10 +15,11 @@ use crate::types::{MarketId, RejectReason, Side};
 
 use super::account::{AccountSnapshot, Venue};
 use super::exec::aster::AsterRest;
-use super::exec::creds::{venue_creds, AsterCreds};
+use super::exec::creds::{venue_creds, AsterCreds, HyperliquidCreds};
+use super::exec::hyperliquid::HyperliquidHedge;
 use super::exec::lighter::LighterExchange;
 use super::exec::sign::EvmAsterSigner;
-use super::reconcile::Reconciler;
+use super::reconcile::{HedgeAccount, Reconciler};
 use super::scale::MarketScale;
 
 #[derive(Debug, Serialize)]
@@ -148,17 +149,27 @@ impl StatusPoller {
         }
         let specs = rest_specs::build_market_specs(&selected, &cfg.live).await?;
         let spec = specs.first().context("no resolved market spec")?.clone();
-        let (acreds, lcreds) = venue_creds(cfg.live.dry_run)?;
-        let aster = build_aster(cfg, &specs, acreds)?;
-        let lighter = LighterExchange::new_read_only(
-            cfg.live.lighter.base_url.clone(),
-            Path::new(&cfg.live.lighter.signers_dir),
-            &lcreds,
-            &specs,
-            cfg.live.lighter.fill_timeout_ms,
-            cfg.live.lighter.ws_account_max_age_ms,
-        )?;
-        let reconciler = Reconciler::new(aster, lighter, &specs, cfg.live.max_book_staleness_ms);
+        let (aster, hedge) = match spec.hedge {
+            HedgeVenue::Lighter => {
+                let (acreds, lcreds) = venue_creds(cfg.live.dry_run)?;
+                let lighter = LighterExchange::new_read_only(
+                    cfg.live.lighter.base_url.clone(),
+                    Path::new(&cfg.live.lighter.signers_dir),
+                    &lcreds,
+                    &specs,
+                    cfg.live.lighter.fill_timeout_ms,
+                    cfg.live.lighter.ws_account_max_age_ms,
+                )?;
+                (acreds, HedgeAccount::Lighter(lighter))
+            }
+            HedgeVenue::Hyperliquid => {
+                let dry = cfg.live.dry_run;
+                let acreds = if dry { AsterCreds::dry_run() } else { AsterCreds::from_env()? };
+                let hcreds = if dry { HyperliquidCreds::dry_run() } else { HyperliquidCreds::from_env()? };
+                (acreds, HedgeAccount::Hyperliquid(HyperliquidHedge::new(&cfg.live.hyperliquid.base_url, hcreds, &specs).await?))
+            }
+        };
+        let reconciler = Reconciler::new(build_aster(cfg, &specs, aster)?, hedge, &specs, cfg.live.max_book_staleness_ms);
         Ok(Self { cfg: cfg.clone(), spec, reconciler, http: rest_book::client()? })
     }
 
@@ -166,12 +177,7 @@ impl StatusPoller {
         let snapshot = self.reconciler.snapshot().await?;
         let (aster_book, lighter_book) = tokio::join!(
             rest_book::fetch_aster_book_from_base(&self.http, &self.cfg.live.aster.base_url, &self.spec.aster_symbol, 20),
-            rest_book::fetch_lighter_book_from_base(
-                &self.http,
-                &self.cfg.live.lighter.base_url,
-                self.spec.lighter_market_id,
-                20
-            ),
+            rest_book::fetch_hedge_book(&self.http, &self.cfg.live, &self.spec, 20),
         );
         Ok(build_report(&self.cfg, &self.spec, snapshot, &aster_book?, &lighter_book?))
     }

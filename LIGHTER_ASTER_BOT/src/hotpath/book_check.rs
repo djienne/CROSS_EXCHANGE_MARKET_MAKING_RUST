@@ -31,13 +31,12 @@ use super::book_cell::{VenueBook, VenueTag};
 use super::registry::VenueRegistry;
 use super::watchdog::ReconnectHandle;
 
-/// One thing to cross-check: a cell key plus the venue symbol to query over REST
-/// (the Aster symbol, or the Lighter market id string).
+/// One thing to cross-check: a cell key plus the market it reads over REST.
 #[derive(Debug, Clone)]
 pub struct BookCheckTarget {
     pub market: MarketId,
     pub venue: VenueTag,
-    pub symbol: String,
+    pub spec: crate::markets::MarketSpec,
 }
 
 /// Tunables for the cross-check, resolved from `[book_check]` config.
@@ -56,8 +55,7 @@ pub struct BookCheckParams {
     /// Skip a REST snapshot whose exchange timestamp is already stale. A stale REST
     /// snapshot is a bad comparator and can otherwise create false divergence in volatility.
     pub max_rest_snapshot_age_ms: i64,
-    pub aster_base_url: String,
-    pub hl_base_url: String,
+    pub live: crate::config::LiveCfg,
 }
 
 /// The cross-check thread body. Runs on its own OS thread (a current-thread tokio
@@ -125,20 +123,10 @@ async fn fetch_one(
     let key = (target.market.clone(), target.venue);
     let rest = match target.venue {
         VenueTag::Aster => {
-            rest_book::fetch_aster_book_from_base(
-                client,
-                &params.aster_base_url,
-                &target.symbol,
-                params.depth_limit,
-            )
-            .await
+            let symbol = target.spec.aster_symbol.to_uppercase();
+            rest_book::fetch_aster_book_from_base(client, &params.live.aster.base_url, &symbol, params.depth_limit).await
         }
-        VenueTag::Hedge => match target.symbol.parse::<u32>() {
-            Ok(market_id) => {
-                rest_book::fetch_lighter_book_from_base(client, &params.hl_base_url, market_id, params.depth_limit).await
-            }
-            Err(e) => Err(anyhow::anyhow!("invalid Lighter market id {:?}: {e}", target.symbol)),
-        },
+        VenueTag::Hedge => rest_book::fetch_hedge_book(client, &params.live, &target.spec, params.depth_limit).await,
     };
     let rest_book = match rest {
         Ok(b) => b,

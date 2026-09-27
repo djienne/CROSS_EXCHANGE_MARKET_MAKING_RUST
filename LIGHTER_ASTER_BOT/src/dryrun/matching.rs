@@ -621,6 +621,10 @@ impl Exchange {
         self.now
     }
 
+    pub fn hedge(&self) -> Venue {
+        self.p.hedge
+    }
+
     /// For scripted feeds, which publish only when told: nothing waits for them.
     #[cfg(test)]
     pub fn trust_feed(&mut self) {

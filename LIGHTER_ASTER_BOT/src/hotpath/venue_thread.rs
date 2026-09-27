@@ -9,7 +9,8 @@ use std::thread::{self, JoinHandle};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::connectors::{aster, lighter, BookTap, Tap};
+use crate::config::HedgeVenue;
+use crate::connectors::{aster, hyperliquid, lighter, BookTap, Tap};
 use crate::livebot::scale::HotQtyScale;
 use crate::types::MarketId;
 
@@ -18,12 +19,13 @@ use super::book_cell::{VenueBook, VenueTag};
 /// Spawn one dedicated OS thread running the venue's reconnecting WS reader. The
 /// thread exits (so `join()` returns) when `shutdown` is cancelled.
 ///
-/// `ws_url` is the venue's websocket root (Aster) or `/stream` endpoint (Lighter), derived
-/// from the configured REST origin. `core_hint` optionally pins the thread to a CPU core
+/// `ws_url` is the venue's websocket root (Aster) or endpoint (Lighter `/stream`, Hyperliquid
+/// `/ws`), derived from the configured REST origin; `hedge` names the hedge cell's venue. `core_hint` optionally pins the thread to a CPU core
 /// (index taken modulo the available cores), see [`maybe_pin_core`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_venue_thread(
     venue: VenueTag,
+    hedge: HedgeVenue,
     ws_url: String,
     symbol: String,
     market: MarketId,
@@ -52,7 +54,7 @@ pub fn spawn_venue_thread(
                 tokio::select! {
                     // The reader loops forever (reconnecting); it only returns if the
                     // task is dropped. The shutdown arm is what ends the thread cleanly.
-                    _ = run_reader(venue, ws_url, symbol, market, tap) => {}
+                    _ = run_reader(venue, hedge, ws_url, symbol, market, tap) => {}
                     _ = shutdown.cancelled() => {}
                 }
             });
@@ -62,14 +64,16 @@ pub fn spawn_venue_thread(
 
 async fn run_reader(
     venue: VenueTag,
+    hedge: HedgeVenue,
     ws_url: String,
     symbol: String,
     market: MarketId,
     tap: Tap,
 ) {
-    match venue {
-        VenueTag::Aster => aster::run_with_tap(ws_url, symbol, tap).await,
-        VenueTag::Hedge => {
+    match (venue, hedge) {
+        (VenueTag::Aster, _) => aster::run_with_tap(ws_url, symbol, tap).await,
+        (VenueTag::Hedge, HedgeVenue::Hyperliquid) => hyperliquid::run_with_tap(ws_url, symbol, tap).await,
+        (VenueTag::Hedge, HedgeVenue::Lighter) => {
             // Fail LOUDLY on a malformed "market_id:label" symbol: the old fallback of
             // market_id 0 silently subscribed a real (wrong) Lighter market's book, only
             // caught ~90s later by book-check divergence.

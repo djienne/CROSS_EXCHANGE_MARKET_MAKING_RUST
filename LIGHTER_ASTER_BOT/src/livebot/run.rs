@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::sync::Notify;
@@ -23,7 +23,7 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::config::{Config, MarketCfg};
+use crate::config::{Config, HedgeVenue, MarketCfg};
 use crate::connectors::{rest_book, rest_specs};
 use crate::hotpath::clock::mono_now_ns;
 use crate::hotpath::{
@@ -104,9 +104,16 @@ pub async fn run(
             markets.len()
         );
     }
+    // The hedge pays its own venue's taker fee.
+    let mut cfg = cfg.clone();
+    let hedge_venue = markets[0].hedge_venue;
+    if hedge_venue == HedgeVenue::Hyperliquid {
+        cfg.edge.taker_fee_bps = cfg.edge.hyperliquid_taker_fee_bps.context("hedging on Hyperliquid needs [maker.edge] hyperliquid_taker_fee_bps")?;
+    }
+    let cfg = &cfg;
     let mode = if cfg.live.dry_run { "dry-run" } else { "live" };
     if !cfg.live.dry_run {
-        warn!("livebot mode=LIVE: placing REAL orders on Aster + Lighter with REAL funds.");
+        warn!("livebot mode=LIVE: placing REAL orders on Aster + {hedge_venue:?} with REAL funds.");
     }
     info!("livebot starting: mode={mode}, {} market(s)", markets.len());
 
@@ -134,6 +141,7 @@ pub async fn run(
     let spec_by_id: HashMap<MarketId, &MarketSpec> = specs.iter().map(|s| (s.market_id.clone(), s)).collect();
     let aster_ws = crate::connectors::aster::ws_root(&cfg.live.aster.base_url);
     let lighter_ws = crate::lighter::ws::stream_url(&cfg.live.lighter.base_url);
+    let hyperliquid_ws = crate::connectors::hyperliquid::ws_url(&cfg.live.hyperliquid.base_url);
     let mut core_hint = 0usize;
     for m in &markets {
         let id = m.id();
@@ -142,23 +150,21 @@ pub async fn run(
         } else {
             None
         };
+        let spec = spec_by_id.get(&id).expect("build_market_specs resolves every market or fails");
+        let (hedge_ws, hedge_symbol) = match spec.hedge {
+            HedgeVenue::Lighter => (&lighter_ws, format!("{}:{}", spec.lighter_market_id, spec.hl_coin)),
+            HedgeVenue::Hyperliquid => (&hyperliquid_ws, spec.hl_coin.clone()),
+        };
         for (venue, ws_url, symbol) in [
             (VenueTag::Aster, &aster_ws, m.aster_symbol.to_lowercase()),
-            (
-                VenueTag::Hedge,
-                &lighter_ws,
-                spec_by_id
-                    .get(&id)
-                    .map(|s| format!("{}:{}", s.lighter_market_id, s.hl_coin))
-                    .expect("build_market_specs resolves every market or fails"),
-            ),
+            (VenueTag::Hedge, hedge_ws, hedge_symbol),
         ] {
             let cell = registry.cell(&id, venue).expect("registry has every cell");
             let handle = ReconnectHandle::new();
             let notify = handle.notify();
             reconnect_map.insert((id.clone(), venue), handle);
             venue_handles.push(spawn_venue_thread(
-                venue, ws_url.clone(), symbol, id.clone(), cell, notify, feeds_shutdown.clone(), Some(core_hint),
+                venue, spec.hedge, ws_url.clone(), symbol, id.clone(), cell, notify, feeds_shutdown.clone(), Some(core_hint),
                 scale.clone(),
             ));
             core_hint += 1;
@@ -178,22 +184,9 @@ pub async fn run(
 
     let book_check_handle = if cfg.book_check.enabled {
         let reg = registry.clone();
-        let targets: Vec<BookCheckTarget> = markets
+        let targets: Vec<BookCheckTarget> = specs
             .iter()
-            .flat_map(|m| {
-                let id = m.id();
-                [
-                    BookCheckTarget { market: id.clone(), venue: VenueTag::Aster, symbol: m.aster_symbol.to_uppercase() },
-                    BookCheckTarget {
-                        market: id.clone(),
-                        venue: VenueTag::Hedge,
-                        symbol: spec_by_id
-                            .get(&id)
-                            .map(|s| s.lighter_market_id.to_string())
-                            .unwrap_or_else(|| "0".into()),
-                    },
-                ]
-            })
+            .flat_map(|s| [VenueTag::Aster, VenueTag::Hedge].map(|venue| BookCheckTarget { market: s.market_id.clone(), venue, spec: s.clone() }))
             .collect();
         let params = BookCheckParams {
             tolerance_bps: cfg.book_check.tolerance_bps,
@@ -203,8 +196,7 @@ pub async fn run(
             max_quote_staleness_ms: cfg.live.max_book_staleness_ms,
             max_concurrent_requests: cfg.book_check.max_concurrent_requests,
             max_rest_snapshot_age_ms: cfg.book_check.max_rest_snapshot_age_ms,
-            aster_base_url: cfg.live.aster.base_url.clone(),
-            hl_base_url: cfg.live.lighter.base_url.clone(),
+            live: cfg.live.clone(),
         };
         let sd = feeds_shutdown.clone();
         Some(
@@ -487,12 +479,7 @@ async fn classify_markets(specs: &[MarketSpec], cfg: &Config) -> HashMap<MarketI
     let mut out = HashMap::new();
     for s in specs {
         let ref_px = match &client {
-            Some(c) => rest_book::fetch_lighter_book_from_base(
-                c,
-                &cfg.live.lighter.base_url,
-                s.lighter_market_id,
-                cfg.book_check.depth_limit,
-            )
+            Some(c) => rest_book::fetch_hedge_book(c, &cfg.live, s, cfg.book_check.depth_limit)
                 .await
                 .ok()
                 .and_then(|b| b.mid()),
@@ -543,30 +530,23 @@ async fn setup_live_planes(
     use std::path::Path;
 
     use super::exec::aster::{run_aster_worker, AsterRest};
-    use super::exec::creds::venue_creds;
+    use super::exec::creds::{AsterCreds, HyperliquidCreds, LighterCreds};
+    use super::exec::hyperliquid::{run_hyperliquid_worker, HyperliquidHedge};
     use super::exec::lighter::{run_lighter_worker, LighterExchange};
     use super::exec::sign::{AsterSigner, EvmAsterSigner};
-    use super::reconcile::Reconciler;
+    use super::reconcile::{HedgeAccount, Reconciler};
     use super::scale::MarketScale;
     use super::userstream::{run_aster_user_stream, StreamLiveness};
 
     // Load + role-resolve credentials; build the signers once (shared across clients).
-    let (acreds, hcreds) = venue_creds(cfg.live.dry_run)?;
+    let dry = cfg.live.dry_run;
+    let acreds = if dry { AsterCreds::dry_run() } else { AsterCreds::from_env()? };
     let aster_signer: Arc<dyn AsterSigner> = Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);
 
     // Per-market wire data shared by all Aster client instances.
     let mut scales: HashMap<MarketId, (MarketScale, String)> = HashMap::new();
     for s in specs {
         scales.insert(s.market_id.clone(), (MarketScale::from_spec(s), s.aster_symbol.clone()));
-    }
-    for s in specs {
-        if s.lighter_market_id == 0 {
-            anyhow::bail!(
-                "Lighter market id not resolved for market {} (symbol {}); refusing to start live",
-                s.market_id.0,
-                s.hl_coin
-            );
-        }
     }
     let new_aster = || {
         AsterRest::new(
@@ -578,21 +558,48 @@ async fn setup_live_planes(
             cfg.live.aster.effective_max_rest_requests_per_minute(),
         )
     };
-    let signers_dir = Path::new(&cfg.live.lighter.signers_dir);
-    let hedge = LighterExchange::new_lighter(
-        cfg.live.lighter.base_url.clone(),
-        signers_dir,
-        hcreds,
-        specs,
-        cfg.live.lighter.fill_timeout_ms,
-        cfg.live.lighter.ws_account_max_age_ms,
-    )
-    .await?;
+    let hedge = match specs[0].hedge {
+        HedgeVenue::Lighter => {
+            for s in specs {
+                if s.lighter_market_id == 0 {
+                    anyhow::bail!(
+                        "Lighter market id not resolved for market {} (symbol {}); refusing to start live",
+                        s.market_id.0,
+                        s.hl_coin
+                    );
+                }
+            }
+            let lcreds = if dry { LighterCreds::dry_run() } else { LighterCreds::from_env()? };
+            let lighter = LighterExchange::new_lighter(
+                cfg.live.lighter.base_url.clone(),
+                Path::new(&cfg.live.lighter.signers_dir),
+                lcreds,
+                specs,
+                cfg.live.lighter.fill_timeout_ms,
+                cfg.live.lighter.ws_account_max_age_ms,
+            )
+            .await?;
+            // Pre-warm the worker connections (establish TLS now, off the hot path) so the FIRST
+            // real hedge doesn't pay a handshake — latency matters most on the very first fill.
+            aux.extend(lighter.start_private_streams(shutdown.clone()));
+            for s in specs {
+                lighter
+                    .wait_ready(&s.market_id, Duration::from_secs(15))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Lighter websocket warmup failed for {}: {e:#}", s.market_id.0))?;
+            }
+            let _ = lighter.clearinghouse_state().await;
+            HedgeAccount::Lighter(lighter)
+        }
+        HedgeVenue::Hyperliquid => {
+            let creds = if dry { HyperliquidCreds::dry_run() } else { HyperliquidCreds::from_env()? };
+            HedgeAccount::Hyperliquid(HyperliquidHedge::new(&cfg.live.hyperliquid.base_url, creds, specs).await?)
+        }
+    };
 
     // Separate client instances per plane (each is a cheap reqwest client + shared signer Arc):
     // writes (worker), reads (reconciler), listenKey+WS (user stream).
     let worker_aster = new_aster()?;
-    let worker_hl = hedge.clone();
     let recon = Reconciler::new(new_aster()?, hedge.clone(), specs, cfg.live.max_book_staleness_ms).without_hedge_orders();
     // A second reconciler instance reserved for SHUTDOWN verification (cheap: a reqwest client +
     // the shared signer Arc). The main one is consumed by its cold loop task and dies with the
@@ -604,24 +611,14 @@ async fn setup_live_planes(
         sym_to_market.insert(s.aster_symbol.to_uppercase(), s.market_id.clone());
     }
 
-    // Pre-warm the worker connections (establish TLS now, off the hot path) so the FIRST real
-    // order / hedge doesn't pay a handshake — latency matters most on the very first fill.
-    aux.extend(worker_hl.start_private_streams(shutdown.clone()));
     let _ = worker_aster.balance().await;
-    for s in specs {
-        worker_hl
-            .wait_ready(&s.market_id, Duration::from_secs(15))
-            .await
-            .map_err(|e| anyhow::anyhow!("Lighter websocket warmup failed for {}: {e:#}", s.market_id.0))?;
-    }
-    let _ = worker_hl.clearinghouse_state().await;
 
     // LEVERAGE GATE: ensure REAL venue leverage == 1 on BOTH venues for every traded market, else
     // BAIL. This is the actual exchange leverage (NOT the config [capital] soft cap, which only sizes
     // orders) — a leftover 5x/20x amplifies exposure beyond the deposited capital. Aster has no
     // EVM-signed set-leverage endpoint, so we VERIFY it (operator sets it once on the Aster UI).
-    // Lighter is also verified read-only from the account payload's per-market
-    // initial_margin_fraction. Done before any trading.
+    // The hedge venue is also verified read-only: Lighter from the account payload's per-market
+    // initial_margin_fraction, Hyperliquid from `activeAssetData`. Done before any trading.
     for s in specs {
         let aster_lev = worker_aster
             .get_leverage(&s.market_id)
@@ -633,17 +630,18 @@ async fn setup_live_planes(
                 s.market_id.0, s.aster_symbol
             );
         }
-        let lighter_lev = worker_hl
-            .get_leverage(&s.market_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Lighter leverage read failed for {}: {e:#}", s.market_id.0))?;
-        if lighter_lev != rust_decimal::Decimal::ONE {
+        let hedge_lev = match &hedge {
+            HedgeAccount::Lighter(l) => l.get_leverage(&s.market_id).await,
+            HedgeAccount::Hyperliquid(h) => h.leverage(&s.market_id).await,
+        }
+        .map_err(|e| anyhow::anyhow!("{:?} leverage read failed for {}: {e:#}", s.hedge, s.market_id.0))?;
+        if hedge_lev != rust_decimal::Decimal::ONE {
             anyhow::bail!(
-                "Lighter leverage for {} is {lighter_lev}x (expected 1x) — set {} to 1x cross on the Lighter UI and restart",
-                s.market_id.0, s.hl_coin
+                "{:?} leverage for {} is {hedge_lev}x (expected 1x) — set {} to 1x cross on its UI and restart",
+                s.hedge, s.market_id.0, s.hl_coin
             );
         }
-        info!("leverage gate: {} = 1x (Aster verified, Lighter verified)", s.market_id.0);
+        info!("leverage gate: {} = 1x (Aster verified, {:?} verified)", s.market_id.0, s.hedge);
     }
 
     // Spawn the venue workers (writes) as SEPARATE tasks: a join! in one task would
@@ -652,7 +650,10 @@ async fn setup_live_planes(
     // supervisor that only awaits the two real tasks at shutdown.
     let etx = events_tx.clone();
     let aster_worker_task = tokio::spawn(run_aster_worker(exec_rx, exec_prio_rx, etx, worker_aster));
-    let hl_worker_task = tokio::spawn(run_lighter_worker(hedge_rx, events_tx.clone(), worker_hl, journal.clone()));
+    let hl_worker_task = match hedge {
+        HedgeAccount::Lighter(l) => tokio::spawn(run_lighter_worker(hedge_rx, events_tx.clone(), l, journal.clone())),
+        HedgeAccount::Hyperliquid(h) => tokio::spawn(run_hyperliquid_worker(hedge_rx, events_tx.clone(), h, journal.clone())),
+    };
     let worker_task = tokio::spawn(async move {
         let (aster, hedge) = tokio::join!(aster_worker_task, hl_worker_task);
         aster.map_err(|e| anyhow::anyhow!("Aster worker failed: {e}"))?;

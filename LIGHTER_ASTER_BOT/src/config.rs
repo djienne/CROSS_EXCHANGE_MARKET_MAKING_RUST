@@ -681,7 +681,7 @@ fn default_aster_rate_limit_backoff_ms() -> i64 {
 }
 
 /// The venue a market hedges on.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HedgeVenue {
     #[default]
@@ -767,13 +767,14 @@ impl Config {
             if !ids.insert(id.clone()) {
                 bail!("duplicate market_id {id:?} in [[markets]]");
             }
+            // One symbol may be hedged on each venue; live, the Aster symbol's lock keeps them apart.
             let aster = m.aster_symbol.to_ascii_uppercase();
-            if !aster_symbols.insert(aster.clone()) {
-                bail!("duplicate aster_symbol {aster:?} in [[markets]]");
+            if !aster_symbols.insert((aster.clone(), m.hedge_venue)) {
+                bail!("duplicate aster_symbol {aster:?} for one hedge venue in [[markets]]");
             }
             let hl = m.hl_coin.to_ascii_uppercase();
-            if !hl_coins.insert(hl.clone()) {
-                bail!("duplicate lighter_symbol {hl:?} in [[markets]]");
+            if !hl_coins.insert((hl.clone(), m.hedge_venue)) {
+                bail!("duplicate lighter_symbol {hl:?} for one hedge venue in [[markets]]");
             }
         }
         if self.book_check.enabled {
