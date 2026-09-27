@@ -519,7 +519,6 @@ impl Lighter {
                     "account_type": 0,
                     "index": account,
                     "account_index": account,
-                    "l1_address": self.identity.wallet_address,
                     "status": 1,
                     "collateral": view.balance.to_string(),
                     "available_balance": view.available.to_string(),

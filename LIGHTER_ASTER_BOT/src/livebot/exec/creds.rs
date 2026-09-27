@@ -149,7 +149,6 @@ pub struct LighterCreds {
     pub api_public_key: String,
     pub api_key_index: i32,
     pub account_index: i64,
-    pub wallet_address: String,
 }
 
 impl std::fmt::Debug for LighterCreds {
@@ -159,7 +158,6 @@ impl std::fmt::Debug for LighterCreds {
             .field("api_public_key", &self.api_public_key)
             .field("api_key_index", &self.api_key_index)
             .field("account_index", &self.account_index)
-            .field("wallet_address", &self.wallet_address)
             .finish()
     }
 }
@@ -171,14 +169,13 @@ impl LighterCreds {
         Self::load(&lighter)
     }
 
-    /// The dry-run identity: the pinned API key in slot 2 of a made-up account of the owner.
+    /// The dry-run identity: the pinned API key in slot 2 of a made-up account.
     pub fn dry_run() -> Self {
         LighterCreds {
             api_private_key: DRY_RUN_LIGHTER_PRIVATE_KEY.to_string(),
             api_public_key: DRY_RUN_LIGHTER_PUBLIC_KEY.to_string(),
             api_key_index: 2,
             account_index: 1_000_000_000,
-            wallet_address: dry_run_owner(),
         }
     }
 
@@ -192,12 +189,10 @@ impl LighterCreds {
         let account_index = required(&m, "ACCOUNT_INDEX")?
             .parse::<i64>()
             .context("ACCOUNT_INDEX must be an integer")?;
-        let wallet_address = required(&m, "WALLET_ADDRESS")?;
         info!(
-            "lighter credentials: account_index={} api_key_index={} wallet={} public_key_len={}",
+            "lighter credentials: account_index={} api_key_index={} public_key_len={}",
             account_index,
             api_key_index,
-            wallet_address,
             api_public_key.len()
         );
         Ok(LighterCreds {
@@ -205,15 +200,14 @@ impl LighterCreds {
             api_public_key,
             api_key_index,
             account_index,
-            wallet_address,
         })
     }
 }
 
 /// Hyperliquid credentials from `HYPERLIQUID_ENV_PATH` (default `hyperliquid.env`), keys
-/// `exchange=hyperliquid`, `wallet_address` (the traded subaccount or vault: the `/info` user),
-/// `private_key` (the agent key that signs; its address owns the nonces) and `is_vault` (sign
-/// for `wallet_address` as `vaultAddress`).
+/// `wallet_address` (the traded subaccount or vault: the `/info` user), `private_key` (the agent
+/// key that signs; its address owns the nonces) and `is_vault` (sign for `wallet_address` as
+/// `vaultAddress`). rust_live's copies also carry `exchange=hyperliquid`, which is ignored.
 pub struct HyperliquidCreds {
     pub account: String,
     pub signer: String,
@@ -244,7 +238,6 @@ impl HyperliquidCreds {
         if let Some(extra) = m.keys().find(|k| !["exchange", "wallet_address", "private_key", "is_vault"].contains(&k.as_str())) {
             bail!("hyperliquid env: unknown key {extra}");
         }
-        ensure!(required(&m, "exchange")? == "hyperliquid", "hyperliquid env: exchange must be hyperliquid");
         let key = parse_priv_key(&required(&m, "private_key")?)?;
         let account = parse_address(&required(&m, "wallet_address")?).context("hyperliquid env wallet_address")?;
         let vault = match required(&m, "is_vault")?.as_str() {
@@ -286,13 +279,12 @@ mod tests {
         assert_ne!(aster.user, aster.signer);
         // The live signer accepts it: the signer address is the key's.
         super::super::sign::EvmAsterSigner::new(aster.user.clone(), aster.signer, aster.key).unwrap();
-        assert_eq!(lighter.wallet_address, aster.user);
         assert_eq!((lighter.account_index, lighter.api_key_index), (1_000_000_000, 2));
     }
 
     #[test]
     fn hyperliquid_signs_as_the_agent_for_the_vault_and_hides_its_key() {
-        let p = write_tmp("hl", &format!("exchange=hyperliquid\nwallet_address={USER1}\nprivate_key={KEY1}\nis_vault=true\n"));
+        let p = write_tmp("hl", &format!("wallet_address={USER1}\nprivate_key={KEY1}\nis_vault=true\n"));
         let c = HyperliquidCreds::load(&p).unwrap();
         assert_eq!((c.account.as_str(), c.signer.as_str(), c.vault), (USER1, ADDR1, Some([0x11; 20])));
         assert!(!format!("{c:?}").contains(&KEY1[40..]), "{c:?}");
@@ -344,7 +336,6 @@ mod tests {
             api_public_key: "pub".to_string(),
             api_key_index: 1,
             account_index: 2,
-            wallet_address: "0xabc".to_string(),
         };
         let text = format!("{creds:?}");
         assert!(text.contains("<redacted>"));
@@ -358,7 +349,6 @@ API_KEY_PRIVATE_KEY=priv
 API_KEY_PUBLIC_KEY=pub
 API_KEY_INDEX=2
 ACCOUNT_INDEX=42
-WALLET_ADDRESS=0xabc
 ";
         let p = write_tmp("lighter", body);
         let c = LighterCreds::load(&p).unwrap();
@@ -366,7 +356,6 @@ WALLET_ADDRESS=0xabc
         assert_eq!(c.api_public_key, "pub");
         assert_eq!(c.api_key_index, 2);
         assert_eq!(c.account_index, 42);
-        assert_eq!(c.wallet_address, "0xabc");
         std::fs::remove_file(p).ok();
     }
 }

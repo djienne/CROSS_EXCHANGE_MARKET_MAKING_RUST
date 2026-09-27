@@ -40,9 +40,9 @@ cargo build --release --locked        # Rust 1.92; the Lighter signers exist for
 ```
 
 - `aster.env` and `lighter.env` sit in the working directory (or at `ASTER_ENV_PATH` /
-  `LIGHTER_ENV_PATH`), mode `600`; `run --mode live` refuses them if group/other can read
-  them. `aster.env` must list the signer address in `wallet_address`/`subaccount_address`,
-  and that address must match the private key.
+  `LIGHTER_ENV_PATH`), mode `600`, with the keys of `aster.env.example` / `lighter.env.example`;
+  `run --mode live` refuses them if group/other can read them. `aster.env` must list the signer
+  address in `wallet_address`/`subaccount_address`, and that address must match the private key.
 - Every process that signs for the same Aster API wallet must see the same `ASTER_NONCE_DIR`
   (default: the OS temp dir's `lighter-aster-nonces`), writable by the bot user. The nonces
   are clock-based and strictly increasing, so losing the directory at a reboot is safe; never
@@ -377,15 +377,14 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
   --max-usd <N>`. The roundtrips need a flat start and no open orders. They clean up
   reduce-only (at most three closes in 30 s) and stay blocked without terminal-order and
   flat-position evidence.
-- Hyperliquid reads `HYPERLIQUID_ENV_PATH` (default `hyperliquid.env`: `exchange=hyperliquid`,
-  `wallet_address` = the traded subaccount, `private_key` = its agent key, `is_vault`). Mount it
-  read-only: `docker compose --profile live run --rm -v <dir>/hyperliquid.env:/secrets/hyperliquid.env:ro
-  -e HYPERLIQUID_ENV_PATH=/secrets/hyperliquid.env bot probe hl-balance --market HYPE` reads the
-  account, fees and action budget. `probe hl-place-cancel` (one post-only buy 10 % under the bid,
-  cancelled) and `probe hl-market` (a ~$10.5 IOC buy sold back reduce-only) trade real funds:
-  both need `--i-understand-live --max-usd <10.5..20>`, a flat start and no open order. Every
-  action spends the account's lifetime budget (10k + ~1 per USDC traded), and there is no
-  dead-man below $1M of volume.
+- Hyperliquid reads `HYPERLIQUID_ENV_PATH` (default `hyperliquid.env`, keys as in
+  `hyperliquid.env.example`: `wallet_address` = the traded subaccount, `private_key` = its agent
+  key, `is_vault`). `docker compose --profile live run --rm bot probe hl-balance --market HYPE`
+  reads the account, fees and action budget. `probe hl-place-cancel` (one post-only buy 10 %
+  under the bid, cancelled) and `probe hl-market` (a ~$10.5 IOC buy sold back reduce-only) trade
+  real funds: both need `--i-understand-live --max-usd <10.5..20>`, a flat start and no open
+  order. Every action spends the account's lifetime budget (10k + ~1 per USDC traded), and
+  there is no dead-man below $1M of volume.
 
 ## Orchestrator leftovers
 
