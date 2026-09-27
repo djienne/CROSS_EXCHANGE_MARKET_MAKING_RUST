@@ -2441,6 +2441,7 @@ impl Strategy {
         let order_evidence = match &ev {
             ExecEvent::PlaceAck { client_id, venue_order_id } => Some(JournalDetail::Order { client_id: client_id.clone(), venue_order_id: Some(venue_order_id.clone()), state: "accepted" }),
             ExecEvent::CancelAck { client_id } => Some(JournalDetail::Order { client_id: client_id.clone(), venue_order_id: None, state: "cancelled" }),
+            ExecEvent::CancelFilledOrExpired { client_id } => Some(JournalDetail::Order { client_id: client_id.clone(), venue_order_id: None, state: "filled_or_expired" }),
             _ => None,
         };
         match ev {
@@ -2505,6 +2506,12 @@ impl Strategy {
                 self.request_safety_sweep(now_ns, "place_unknown");
             }
             ExecEvent::CancelAck { client_id } => {
+                self.cancel_ack_by_client_id(&client_id);
+            }
+            ExecEvent::CancelFilledOrExpired { client_id } => {
+                // Not resting any more, so no sweep. The gate stays closed until the fill (user
+                // stream) or a terminal backfill (`recover_orphans`) accounts for the order.
+                self.uncertain_makers.insert(client_id.clone());
                 self.cancel_ack_by_client_id(&client_id);
             }
             ExecEvent::CancelReject { client_id, reason } => {
@@ -4664,6 +4671,23 @@ lighter_symbol = "BTC"
         let HedgeCommand::Hedge { intent,.. }=hrx.try_recv().unwrap() else {panic!("hedge expected")}; assert_eq!(intent.qty,dec!(0.5));
         let late=AsterFill { market:m.clone(),aster_side:Side::Buy,order_id:"17".into(),trade_id:"99".into(),client_id:client,last_fill_qty:dec!(0.5),last_fill_px:dec!(100),cum_filled_qty:dec!(0.5),event_time_ms:1700000000000,reduce_only:false,commission:Some(dec!(0)),commission_asset:Some("USDT".into()) };
         strat.handle_maker_fill(late,now+4).await; assert!(hrx.try_recv().is_err()); assert_eq!(strat.aster_pos[&m].qty,dec!(0.5)); assert_eq!(strat.logical_ids[&m],intent.logical_id);
+    }
+
+    #[tokio::test]
+    async fn cancel_filled_or_expired_closes_the_slot_hedges_the_backfill_without_freezing() {
+        let account=AccountState::default(); let (etx,mut erx)=tokio::sync::mpsc::channel(16); let (htx,mut hrx)=tokio::sync::mpsc::channel(16);
+        let mut strat=live_strat(etx,htx,account.clone()); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
+        let client=strat.orders.next_client_id(&m,Side::Buy).unwrap(); strat.orders.on_place_sent(&m,Side::Buy,client.clone(),10000,500,now);
+        strat.handle_exec_event(ExecEvent::PlaceAck { client_id: client.clone(), venue_order_id: "17".into() }, now+1);
+        strat.handle_exec_event(ExecEvent::CancelFilledOrExpired { client_id: client.clone() }, now+2);
+        assert!(!strat.frozen && strat.sweep_pending.is_none() && erx.try_recv().is_err(), "a finished order needs no freeze or sweep");
+        assert!(strat.orders.live_slots().is_empty(), "the order no longer rests");
+        assert_eq!(strat.maker_gate_reason(&m, now+2), Some("MAKER_EXECUTION_UNCERTAIN"));
+        account.publish(funded_snapshot(now+3,dec!(0),dec!(0))); strat.recover_orphans(now+4);
+        assert!(!account.maker_queries().is_empty(), "the uncertain order is backfilled");
+        strat.handle_maker_order_progress(m.clone(),Side::Buy,client,"17".into(),dec!(0.5),Some(dec!(50)),true,1700000000000,now+5).await;
+        let HedgeCommand::Hedge { intent,.. }=hrx.try_recv().unwrap() else {panic!("hedge expected")}; assert_eq!(intent.qty,dec!(0.5));
+        assert!(strat.uncertain_makers.is_empty() && !strat.frozen);
     }
 
     // --- circuit breaker ---

@@ -807,15 +807,7 @@ async fn process_cmd(
                 limiter.record();
                 let ev = match rest.cancel_order(&market, &client_id).await {
                     Ok(CancelOutcome::Canceled | CancelOutcome::AlreadyGone) => ExecEvent::CancelAck { client_id },
-                    Ok(CancelOutcome::FilledOrExpired) => {
-                        // A cancel returning FILLED/EXPIRED proves the order is not resting, but it
-                        // may also mean a fill happened before the cancel. Do not silently resume
-                        // quoting; freeze/sweep until the user stream or reconciler accounts for it.
-                        ExecEvent::CancelReject {
-                            client_id,
-                            reason: "cancel returned FILLED/EXPIRED; waiting for fill/reconcile".into(),
-                        }
-                    }
+                    Ok(CancelOutcome::FilledOrExpired) => ExecEvent::CancelFilledOrExpired { client_id },
                     Err(e) => {
                         warn!("aster cancel {client_id} failed: {e:#}");
                         ExecEvent::CancelReject { client_id, reason: e.to_string() }
@@ -847,12 +839,7 @@ async fn process_cmd(
                                 let _ = tx.send(ExecEvent::CancelAck { client_id: old_client_id }).await;
                             }
                             CancelOutcome::FilledOrExpired => {
-                                let _ = tx
-                                    .send(ExecEvent::CancelReject {
-                                        client_id: old_client_id,
-                                        reason: "replace cancel returned FILLED/EXPIRED; waiting for fill/reconcile".into(),
-                                    })
-                                    .await;
+                                let _ = tx.send(ExecEvent::CancelFilledOrExpired { client_id: old_client_id }).await;
                             }
                             CancelOutcome::Canceled => unreachable!("handled above"),
                         }
