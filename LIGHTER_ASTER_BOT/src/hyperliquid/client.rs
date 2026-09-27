@@ -159,6 +159,23 @@ pub fn position_of(state: &Value, coin: &str) -> Result<Decimal> {
     positions.iter().find(|p| p["position"]["coin"] == coin).map_or(Ok(Decimal::ZERO), |p| dec(&p["position"]["szi"]))
 }
 
+/// POST `/info` at `base`.
+pub async fn info(http: &reqwest::Client, base: &str, body: Value) -> Result<Value> {
+    let reply = http.post(format!("{}/info", base.trim_end_matches('/'))).json(&body).send().await
+        .and_then(reqwest::Response::error_for_status)
+        .with_context(|| format!("Hyperliquid info {}", body["type"]))?;
+    Ok(reply.json().await?)
+}
+
+/// `coin`'s asset id (its place in the universe) and size decimals, from a `meta` reply.
+pub fn asset_in(meta: &Value, coin: &str) -> Result<Asset> {
+    let universe = meta["universe"].as_array().context("meta without a universe")?;
+    let (index, entry) = universe.iter().enumerate().find(|(_, a)| a["name"] == coin)
+        .with_context(|| format!("{coin} is not a Hyperliquid perp"))?;
+    let sz_decimals = entry["szDecimals"].as_u64().context("meta without szDecimals")? as u32;
+    Ok(Asset { index: index as u32, coin: coin.to_string(), sz_decimals })
+}
+
 pub struct Client {
     http: reqwest::Client,
     base: String,
@@ -187,10 +204,7 @@ impl Client {
     }
 
     pub async fn info(&self, body: Value) -> Result<Value> {
-        let reply = self.http.post(format!("{}/info", self.base)).json(&body).send().await
-            .and_then(reqwest::Response::error_for_status)
-            .with_context(|| format!("Hyperliquid info {}", body["type"]))?;
-        Ok(reply.json().await?)
+        info(&self.http, &self.base, body).await
     }
 
     /// `/info` for the traded account.
@@ -199,12 +213,7 @@ impl Client {
     }
 
     pub async fn asset(&self, coin: &str) -> Result<Asset> {
-        let meta = self.info(json!({"type": "meta"})).await?;
-        let universe = meta["universe"].as_array().context("meta without a universe")?;
-        let (index, entry) = universe.iter().enumerate().find(|(_, a)| a["name"] == coin)
-            .with_context(|| format!("{coin} is not a Hyperliquid perp"))?;
-        let sz_decimals = entry["szDecimals"].as_u64().context("meta without szDecimals")? as u32;
-        Ok(Asset { index: index as u32, coin: coin.to_string(), sz_decimals })
+        asset_in(&self.info(json!({"type": "meta"})).await?, coin)
     }
 
     /// The best bid and ask.

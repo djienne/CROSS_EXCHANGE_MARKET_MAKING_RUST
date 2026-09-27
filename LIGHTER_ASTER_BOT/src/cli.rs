@@ -149,13 +149,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Commands::FetchSpecs { markets } => {
             let cfg = crate::config::Config::load(&cli.config)?;
             let selected = cfg.select_markets(markets.as_deref());
-            let specs = crate::connectors::rest_specs::build_market_specs_with_bases(
-                &selected,
-                cfg.live.partials.lighter_min_notional,
-                &cfg.live.aster.base_url,
-                &cfg.live.lighter.base_url,
-            )
-            .await?;
+            let specs = crate::connectors::rest_specs::build_market_specs(&selected, &cfg.live).await?;
             println!(
                 "{:<6} {:<10} {:<10} {:>8} {:>12} {:>12} {:>12} {:>12} {:>7} {:>14}",
                 "id", "aster", "lighter", "mkt_id", "tick", "step", "minQty", "minNotl", "szDec", "qtyStep"

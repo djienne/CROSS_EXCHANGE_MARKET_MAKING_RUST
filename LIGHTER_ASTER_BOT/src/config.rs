@@ -237,6 +237,8 @@ pub struct LiveCfg {
     #[serde(default)]
     pub lighter: LiveLighterCfg,
     #[serde(default)]
+    pub hyperliquid: LiveHyperliquidCfg,
+    #[serde(default)]
     pub circuit_breaker: LiveCircuitBreakerCfg,
     /// Proactive per-venue margin guard: cap each venue's position notional at its real free
     /// collateral (minus that venue's safety buffer) so the position-increasing side stops quoting
@@ -412,6 +414,23 @@ pub struct LiveLighterCfg {
     pub ws_account_max_age_ms: i64,
 }
 
+/// The hedge on Hyperliquid reuses `[live.lighter]`'s slippage caps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveHyperliquidCfg {
+    #[serde(default = "default_hyperliquid_base_url")]
+    pub base_url: String,
+}
+
+impl Default for LiveHyperliquidCfg {
+    fn default() -> Self {
+        LiveHyperliquidCfg { base_url: default_hyperliquid_base_url() }
+    }
+}
+
+fn default_hyperliquid_base_url() -> String {
+    crate::hyperliquid::client::MAINNET.to_string()
+}
+
 impl Default for LiveLighterCfg {
     fn default() -> Self {
         LiveLighterCfg {
@@ -470,6 +489,7 @@ impl Default for LiveCfg {
             partials: LivePartialsCfg::default(),
             aster: LiveAsterCfg::default(),
             lighter: LiveLighterCfg::default(),
+            hyperliquid: LiveHyperliquidCfg::default(),
             circuit_breaker: LiveCircuitBreakerCfg::default(),
             margin_guard: LiveMarginGuardCfg::default(),
             dry_run: false,
@@ -660,11 +680,23 @@ fn default_aster_rate_limit_backoff_ms() -> i64 {
     5_000
 }
 
+/// The venue a market hedges on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HedgeVenue {
+    #[default]
+    Lighter,
+    Hyperliquid,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketCfg {
     pub aster_symbol: String,
+    /// The hedge venue's coin, on Hyperliquid as on Lighter.
     #[serde(rename = "lighter_symbol")]
     pub hl_coin: String,
+    #[serde(default)]
+    pub hedge_venue: HedgeVenue,
     /// Optional logical id; defaults to `lighter_symbol`.
     #[serde(default)]
     pub market_id: Option<String>,
@@ -717,6 +749,9 @@ impl Config {
         let cfg: Config = strict_from_toml(value)?;
         cfg.validate()?;
         require_mainnet_origins(&cfg.live.aster.base_url, &cfg.live.lighter.base_url)?;
+        if cfg.live.hyperliquid.base_url.trim_end_matches('/') != default_hyperliquid_base_url() {
+            bail!("operational venue URLs must use the supported Hyperliquid mainnet origin");
+        }
         Ok(cfg)
     }
 

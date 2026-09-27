@@ -3236,6 +3236,7 @@ mod tests {
             market_id: "BTC".into(),
             aster_symbol: "BTCUSDT".into(),
             hl_coin: "BTC".into(),
+            hedge: Default::default(),
             lighter_market_id: 1,
             lighter_price_decimals: 2,
             lighter_size_decimals: 3,

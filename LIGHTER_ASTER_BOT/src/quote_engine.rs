@@ -547,6 +547,7 @@ pub(crate) mod tests {
             funding_buffer_bps: dec!(0.0),
             aster_maker_fee_bps: dec!(0.0),
             taker_fee_bps: dec!(4.5),
+            hyperliquid_taker_fee_bps: None,
         }
     }
 

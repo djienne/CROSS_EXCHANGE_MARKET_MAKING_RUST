@@ -146,13 +146,7 @@ impl StatusPoller {
         if selected.len() != 1 {
             bail!("status is single-market only; selected {} markets", selected.len());
         }
-        let specs = rest_specs::build_market_specs_with_bases(
-            &selected,
-            cfg.live.partials.lighter_min_notional,
-            &cfg.live.aster.base_url,
-            &cfg.live.lighter.base_url,
-        )
-        .await?;
+        let specs = rest_specs::build_market_specs(&selected, &cfg.live).await?;
         let spec = specs.first().context("no resolved market spec")?.clone();
         let (acreds, lcreds) = venue_creds(cfg.live.dry_run)?;
         let aster = build_aster(cfg, &specs, acreds)?;

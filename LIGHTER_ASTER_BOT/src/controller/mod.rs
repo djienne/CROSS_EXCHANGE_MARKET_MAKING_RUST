@@ -107,6 +107,8 @@ impl BotConfig {
         ensure!(t.id().0 == market && m.id().0 == market, "market ids must be spelled {market} in both engine configs");
         ensure!(t.aster_symbol.eq_ignore_ascii_case(&m.aster_symbol) && t.lighter_symbol.eq_ignore_ascii_case(&m.hl_coin),
             "taker and maker configs name different instruments for {market}");
+        ensure!(m.hedge_venue == crate::config::HedgeVenue::Lighter,
+            "{market} hedges on Hyperliquid, and the taker `run` pairs XEMM with has no Hyperliquid leg yet");
         ensure!(self.maker.live.enabled, "[maker.live] enabled must be true under `run`");
         ensure!(self.taker.pnl.enabled && self.maker.live.circuit_breaker.enabled,
             "`run` keeps both engines' own loss stops: [taker.pnl] and [maker.live.circuit_breaker] need enabled = true");

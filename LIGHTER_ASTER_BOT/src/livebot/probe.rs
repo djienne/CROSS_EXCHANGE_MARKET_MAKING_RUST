@@ -59,13 +59,7 @@ async fn resolve(cfg: &Config, target: &str) -> Result<(Vec<MarketCfg>, Vec<Mark
     if markets.is_empty() {
         bail!("no market '{target}' in config [[markets]] (try the market id, e.g. HYPE)");
     }
-    let specs = rest_specs::build_market_specs_with_bases(
-        &markets,
-        cfg.live.partials.lighter_min_notional,
-        &cfg.live.aster.base_url,
-        &cfg.live.lighter.base_url,
-    )
-    .await?;
+    let specs = rest_specs::build_market_specs(&markets, &cfg.live).await?;
     Ok((markets, specs))
 }
 
@@ -93,13 +87,7 @@ pub async fn run(cfg: &Config, check: &str, target: Option<String>, i_understand
 /// An Aster client for an account-wide read: any one configured market gives it wire context.
 async fn account_wide_aster(cfg: &Config) -> Result<AsterRest> {
     let markets = cfg.select_markets(None);
-    let specs = rest_specs::build_market_specs_with_bases(
-        &markets[..1.min(markets.len())],
-        cfg.live.partials.lighter_min_notional,
-        &cfg.live.aster.base_url,
-        &cfg.live.lighter.base_url,
-    )
-    .await?;
+    let specs = rest_specs::build_market_specs(&markets[..1.min(markets.len())], &cfg.live).await?;
     build_aster(cfg, &specs)
 }
 

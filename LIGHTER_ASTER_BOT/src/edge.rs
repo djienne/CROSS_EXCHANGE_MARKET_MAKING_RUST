@@ -21,7 +21,12 @@ pub struct EdgeConfig {
     pub basis_buffer_bps: Decimal,
     pub funding_buffer_bps: Decimal,
     pub aster_maker_fee_bps: Decimal,
+    /// The hedge's taker fee on Lighter.
     pub taker_fee_bps: Decimal,
+    /// The hedge's taker fee on Hyperliquid (the account's `userCrossRate`); a market hedged
+    /// there needs it.
+    #[serde(default)]
+    pub hyperliquid_taker_fee_bps: Option<Decimal>,
 }
 
 impl EdgeConfig {
@@ -124,6 +129,7 @@ mod tests {
             funding_buffer_bps: dec!(0.0),
             aster_maker_fee_bps: dec!(1.0),
             taker_fee_bps: dec!(4.5),
+            hyperliquid_taker_fee_bps: None,
         }
     }
 

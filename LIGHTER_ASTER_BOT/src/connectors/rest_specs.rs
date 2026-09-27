@@ -1,6 +1,6 @@
 //! One-shot REST fetch of market specifications: Aster `exchangeInfo` (tick /
-//! step / min-qty / min-notional) and Lighter `orderBooks` metadata, combined
-//! into `MarketSpec`s.
+//! step / min-qty / min-notional) and the hedge venue's metadata (Lighter `orderBooks`,
+//! Hyperliquid `meta`), combined into `MarketSpec`s.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -9,7 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
-use crate::config::MarketCfg;
+use crate::config::{HedgeVenue, LiveCfg, MarketCfg};
 use crate::decimal::parse_dec;
 use crate::markets::MarketSpec;
 
@@ -137,16 +137,22 @@ pub async fn fetch_lighter_meta_from_base(client: &reqwest::Client, base_url: &s
     Ok(out)
 }
 
-/// Resolve `MarketSpec`s for the configured markets from both venues' REST base URLs.
-pub async fn build_market_specs_with_bases(
-    markets: &[MarketCfg],
-    hl_min_notional: Decimal,
-    aster_base_url: &str,
-    hl_base_url: &str,
-) -> Result<Vec<MarketSpec>> {
+/// Hyperliquid refuses an order worth under $10 at its limit price; the margin covers a sell
+/// IOC priced under the mark.
+const HYPERLIQUID_MIN_NOTIONAL: Decimal = rust_decimal_macros::dec!(10.5);
+
+/// Resolve `MarketSpec`s for the configured markets from the venues' REST base URLs; a hedge
+/// venue is read only if a market hedges there.
+pub async fn build_market_specs(markets: &[MarketCfg], live: &LiveCfg) -> Result<Vec<MarketSpec>> {
     let client = client()?;
-    let aster = fetch_aster_exchange_info_from_base(&client, aster_base_url).await?;
-    let lighter = fetch_lighter_meta_from_base(&client, hl_base_url).await?;
+    let aster = fetch_aster_exchange_info_from_base(&client, &live.aster.base_url).await?;
+    let uses = |venue| markets.iter().any(|m| m.hedge_venue == venue);
+    let lighter = if uses(HedgeVenue::Lighter) { fetch_lighter_meta_from_base(&client, &live.lighter.base_url).await? } else { HashMap::new() };
+    let hyperliquid = if uses(HedgeVenue::Hyperliquid) {
+        crate::hyperliquid::client::info(&client, &live.hyperliquid.base_url, serde_json::json!({"type": "meta"})).await?
+    } else {
+        serde_json::Value::Null
+    };
 
     let mut specs = Vec::new();
     for m in markets {
@@ -154,30 +160,34 @@ pub async fn build_market_specs_with_bases(
             .get(&m.aster_symbol)
             .copied()
             .ok_or_else(|| anyhow!("Aster symbol {} not found in exchangeInfo", m.aster_symbol))?;
-        let lm = lighter
-            .get(&m.hl_coin.to_ascii_uppercase())
-            .ok_or_else(|| anyhow!("Lighter symbol {} not found in orderBooks", m.hl_coin))?;
-        let hl_qty_step = Decimal::new(1, lm.size_decimals);
-        let lighter_price_tick = Decimal::new(1, lm.price_decimals);
-        let hedge_min_notional = if lm.min_quote_amount > Decimal::ZERO {
-            lm.min_quote_amount
-        } else {
-            hl_min_notional
+        let (hl_coin, lm, size_decimals, hedge_min_notional) = match m.hedge_venue {
+            HedgeVenue::Lighter => {
+                let lm = lighter
+                    .get(&m.hl_coin.to_ascii_uppercase())
+                    .ok_or_else(|| anyhow!("Lighter symbol {} not found in orderBooks", m.hl_coin))?;
+                let min = if lm.min_quote_amount > Decimal::ZERO { lm.min_quote_amount } else { live.partials.lighter_min_notional };
+                (lm.symbol.clone(), Some(lm), lm.size_decimals, min)
+            }
+            HedgeVenue::Hyperliquid => {
+                let asset = crate::hyperliquid::client::asset_in(&hyperliquid, &m.hl_coin)?;
+                (asset.coin, None, asset.sz_decimals, HYPERLIQUID_MIN_NOTIONAL)
+            }
         };
         specs.push(MarketSpec {
             market_id: m.id(),
             aster_symbol: m.aster_symbol.clone(),
-            hl_coin: lm.symbol.clone(),
-            lighter_market_id: lm.market_id,
-            lighter_price_decimals: lm.price_decimals,
-            lighter_size_decimals: lm.size_decimals,
-            lighter_price_tick,
+            hl_coin,
+            hedge: m.hedge_venue,
+            lighter_market_id: lm.map_or(0, |l| l.market_id),
+            lighter_price_decimals: lm.map_or(0, |l| l.price_decimals),
+            lighter_size_decimals: lm.map_or(0, |l| l.size_decimals),
+            lighter_price_tick: lm.map_or(Decimal::ZERO, |l| Decimal::new(1, l.price_decimals)),
             tick,
             step,
             aster_min_qty: min_qty,
             aster_min_notional: min_notional,
-            hl_sz_decimals: lm.size_decimals as i32,
-            hl_qty_step,
+            hl_sz_decimals: size_decimals as i32,
+            hl_qty_step: Decimal::new(1, size_decimals),
             hl_min_notional: hedge_min_notional,
         });
     }

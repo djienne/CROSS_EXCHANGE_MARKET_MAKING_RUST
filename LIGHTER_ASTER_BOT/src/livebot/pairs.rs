@@ -104,6 +104,7 @@ mod tests {
             market_id: "X".into(),
             aster_symbol: "XUSDT".into(),
             hl_coin: "X".into(),
+            hedge: Default::default(),
             lighter_market_id: 1,
             lighter_price_decimals: 2,
             lighter_size_decimals: 3,

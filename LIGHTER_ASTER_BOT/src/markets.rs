@@ -11,6 +11,8 @@ pub struct MarketSpec {
     pub aster_symbol: String,
     pub hl_coin: String,
     #[serde(default)]
+    pub hedge: crate::config::HedgeVenue,
+    #[serde(default)]
     pub lighter_market_id: u32,
     #[serde(default)]
     pub lighter_price_decimals: u32,

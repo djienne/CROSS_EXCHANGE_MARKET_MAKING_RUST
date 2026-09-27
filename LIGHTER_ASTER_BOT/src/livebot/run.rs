@@ -111,13 +111,7 @@ pub async fn run(
     info!("livebot starting: mode={mode}, {} market(s)", markets.len());
 
     // --- resolve specs + classify pair eligibility ---
-    let specs = rest_specs::build_market_specs_with_bases(
-        &markets,
-        cfg.live.partials.lighter_min_notional,
-        &cfg.live.aster.base_url,
-        &cfg.live.lighter.base_url,
-    )
-    .await?;
+    let specs = rest_specs::build_market_specs(&markets, &cfg.live).await?;
     let eligibility = classify_markets(&specs, cfg).await;
     let market_ids: Vec<MarketId> = specs.iter().map(|s| s.market_id.clone()).collect();
     let eligible_count = eligibility.values().filter(|&&e| e).count();
