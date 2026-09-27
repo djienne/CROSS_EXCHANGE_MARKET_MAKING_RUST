@@ -164,8 +164,14 @@ impl Signer {
     }
 
     /// Verify the API key matches the one registered on Lighter (network call inside lib).
+    /// On a multi-thread runtime it runs off the async workers: under `run` both engines check
+    /// at once, and the dry run's simulated Lighter answers from the same runtime.
     pub fn check_client(&self, api_key_index: i32) -> Result<()> {
-        let err = unsafe { take_cstring((self.check_client)(api_key_index, self.account_index)) };
+        let call = || unsafe { take_cstring((self.check_client)(api_key_index, self.account_index)) };
+        let err = match tokio::runtime::Handle::try_current() {
+            Ok(rt) if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(call),
+            _ => call(),
+        };
         match nonempty(err) {
             Some(e) => bail!("CheckClient failed: {e}"),
             None => Ok(()),

@@ -854,7 +854,8 @@ pub(crate) mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // One worker: the library's blocking key check must leave the runtime free to answer it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn lighter_answers_the_bots_own_clients() {
         let dir = Path::new("signers");
         if !dir.join(native::signer_filename()).exists() {
@@ -866,8 +867,9 @@ pub(crate) mod tests {
         let creds = LighterCreds::dry_run();
         let (account, key) = (creds.account_index, creds.api_key_index);
         let signer = Signer::load(dir, &world.lighter, &creds.api_private_key, key, account).unwrap();
-        // The library's own key check, as at live startup.
-        tokio::task::block_in_place(|| signer.check_client(key)).unwrap();
+        // The library's own key check, as at live startup: on the only worker, as an engine
+        // task, so the simulated venue can answer only if the check leaves the worker free.
+        let signer = tokio::spawn(async move { signer.check_client(key).map(|()| signer) }).await.unwrap().unwrap();
 
         let rest = RestClient::new(&world.lighter, 0).unwrap();
         let http = reqwest::Client::new();
