@@ -1,8 +1,9 @@
-//! Hyperliquid market-data connector, for a market hedged there. `l2Book` is a full snapshot
-//! (20 levels a side) pushed about every 5.3 s whether or not the book moved; `bbo` is pushed on
-//! each change of the top (~3.7/s on HYPE; both measured 2026-09-27). Each fills its own slot of
-//! the hedge cell: quoting and hedging already take a fresh BBO deep enough for the order, and
-//! refuse a thin one over a stale L2 (`HlBboThinAndL2Stale`).
+//! Hyperliquid market-data connector, for a market hedged there. `l2Book` with `fast` is a full
+//! snapshot of 5 levels a side pushed every ~0.54 s whether or not the book moved (without it, 20
+//! levels every ~5.4 s; the thinner side's 5 levels held >= 10.9 HYPE, median 147, over 100 s on
+//! 2026-09-28); `bbo` is pushed on each change of the top (~3.7/s on HYPE, 2026-09-27). Each fills
+//! its own slot of the hedge cell: quoting and hedging already take a fresh BBO deep enough for the
+//! order, and refuse a thin one over a stale L2 (`HlBboThinAndL2Stale`).
 
 use std::time::{Duration, Instant};
 
@@ -45,6 +46,11 @@ enum Frame {
     Bbo { time: i64, bbo: [Option<Level>; 2] },
 }
 
+/// The market-data subscriptions for `coin`, `l2Book` in its fast mode.
+pub fn subscriptions(coin: &str) -> [serde_json::Value; 2] {
+    [serde_json::json!({"type": "l2Book", "coin": coin, "fast": true}), serde_json::json!({"type": "bbo", "coin": coin})]
+}
+
 /// Runs until aborted, reconnecting; honors the watchdog's reconnect signal.
 pub async fn run_with_tap(ws_url: String, coin: String, tap: Tap) {
     let mut backoff = 1u64;
@@ -66,8 +72,8 @@ pub async fn run_with_tap(ws_url: String, coin: String, tap: Tap) {
 async fn stream_once(url: &str, coin: &str, tap: &Tap) -> Result<()> {
     let ws = super::connect_guarded(url).await.context("connect Hyperliquid ws")?;
     let (mut write, mut read) = ws.split();
-    for kind in ["l2Book", "bbo"] {
-        let subscribe = serde_json::json!({"method": "subscribe", "subscription": {"type": kind, "coin": coin}});
+    for subscription in subscriptions(coin) {
+        let subscribe = serde_json::json!({"method": "subscribe", "subscription": subscription});
         super::send_guarded(&mut write, Message::Text(subscribe.to_string())).await?;
     }
     let mut ping = interval(PING_EVERY);

@@ -110,7 +110,7 @@ impl DryRunCfg {
     }
 }
 
-/// Aster's stream and Hyperliquid's l2Book carry 20 levels a side; Lighter's book is whole.
+/// Aster's stream carries 20 levels a side, Hyperliquid's fast l2Book 5; Lighter's book is whole.
 const DEPTH: usize = 20;
 /// How long the live market data may take to give both replicas a book.
 const WARM_TIMEOUT: Duration = Duration::from_secs(60);

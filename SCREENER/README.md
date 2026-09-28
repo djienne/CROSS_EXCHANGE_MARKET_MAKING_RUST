@@ -42,7 +42,8 @@ last prices (a 60 s cut, 2026-09-26: 33 s down, every pair back within seconds).
 or a crash, Docker restarts the container (`unless-stopped`); a kill loses at most the last 30 s.
 
 Hyperliquid uses public `bbo`, `l2Book` and `trades`. BBO gives the faster touch; L2 confirms an
-unchanged book. Historical trades received on subscription are excluded using the first book's
+unchanged book. `l2Book` is subscribed `fast` (5 levels, every ~0.54 s instead of 20 every ~5.4 s;
+from 2026-09-28 on, earlier days carry the slow one). Historical trades received on subscription are excluded using the first book's
 exchange timestamp; subsequent duplicates use `(coin, time, tid)`. A disconnected or 30-second
 stale Hyperliquid book invalidates only its own pairs. No credentials or order calls are involved.
 

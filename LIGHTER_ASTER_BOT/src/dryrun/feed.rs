@@ -708,8 +708,8 @@ async fn hyperliquid_session(
     let (ws, _) = tokio_tungstenite::connect_async(url).await.context("connect")?;
     let (mut write, mut read) = ws.split();
     for coin in coins {
-        for kind in ["l2Book", "bbo"] {
-            let subscribe = json!({"method": "subscribe", "subscription": {"type": kind, "coin": coin}});
+        for subscription in crate::connectors::hyperliquid::subscriptions(coin) {
+            let subscribe = json!({"method": "subscribe", "subscription": subscription});
             crate::connectors::send_guarded(&mut write, Message::Text(subscribe.to_string())).await?;
         }
     }
