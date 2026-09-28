@@ -151,7 +151,7 @@ def simulator(runs: Path, market: str, since: datetime, now: datetime) -> dict[s
     frozen = {r["ts_ms"] for r in diag if (r["lateness_ms"].get("max") or 0) > 500}
     out: dict[str, Any] = {"minutes": round(minutes, 1), "host_frozen_windows": len(frozen),
                            "scheduler_lateness_p99_ms": pct([r["lateness_ms"]["p99"] for r in diag if r["lateness_ms"].get("n")], 0.5)}
-    for venue in ("aster", "lighter"):
+    for venue in (k for k in ("aster", "lighter", "hyperliquid") if k in diag[-1]):
         v = [r[venue] for r in diag]
         frames, late = sum(x["frames"] for x in v), sum(x["late_frames"] for x in v)
         clean = [r[venue] for r in diag if r["ts_ms"] not in frozen]

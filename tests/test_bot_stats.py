@@ -31,17 +31,19 @@ class BotStatsTests(unittest.TestCase):
                 "actual_economics": {"gross_usd": "0.03", "fees_usd": "0.04", "net_usd": "-0.01", "net_bps": "-1"},
                 "aster_submit": 'Accepted { raw: "{\\"updateTime\\":%d}" }' % (start_ms + 90),
                 "lighter_fee_evidence": [{"event_time_ms": start_ms + 300}]}
-        window = lambda ts, lateness, late: {"ts_ms": ts, "window_s": 60, "lateness_ms": {"n": 1, "p99": lateness, "max": lateness},
+        window = lambda ts, lateness, late, venues=("aster", "lighter"): {"ts_ms": ts, "window_s": 60, "lateness_ms": {"n": 1, "p99": lateness, "max": lateness},
             **{v: {"frames": 100, "late_frames": late, "gaps": 0, "lag_ms": {}, "requests": 6, "orders": 0, "rejects": {},
                    "maker_fills": 0, "taker_fills": 0, "prints": 0, "prints_inside_spread": 0, "prints_over_visible": 0,
-                   "account": {"equity": "200", "fees": "0", "funding": "0"}} for v in ("aster", "lighter")}}
+                   "account": {"equity": "200", "fees": "0", "funding": "0"}} for v in venues}}
         with tempfile.TemporaryDirectory() as tmp:
             runs = Path(tmp)
             write_jsonl(runs / "opportunities_HYPE.jsonl", [opp])
             write_jsonl(runs / "executions_HYPE.jsonl", [{**done, "outcome": "submitting", "actual_economics": None}, done])
             write_jsonl(runs / "sim-HYPE.diag.jsonl", [window(start_ms, 2000, 50), window(start_ms + 60_000, 2, 1)])
-            since = datetime.fromtimestamp(start_ms / 1000 - 3600, timezone.utc)
-            result = bot_stats.report(runs, "HYPE", since, datetime.fromtimestamp(start_ms / 1000 + 3600, timezone.utc))
+            write_jsonl(runs / "sim-HYPE-HL.diag.jsonl", [window(start_ms, 2, 1, ("aster", "hyperliquid"))])
+            since, until = (datetime.fromtimestamp(start_ms / 1000 + h * 3600, timezone.utc) for h in (-1, 1))
+            result = bot_stats.report(runs, "HYPE", since, until)
+            hl = bot_stats.simulator(runs, "HYPE-HL", since, until)
         taker, sim = result["taker"], result["simulator"]
         self.assertEqual((taker["trades"], taker["outcomes"]), (1, {"success": 1}))
         self.assertAlmostEqual(taker["aster_slippage_bps"]["mean"], 5.0, places=2)
@@ -52,6 +54,8 @@ class BotStatsTests(unittest.TestCase):
         self.assertEqual((taker["aster_fill_ms"]["p50"], taker["lighter_fill_ms"]["p50"]), (90, 300))
         self.assertEqual((sim["host_frozen_windows"], sim["aster"]["late_frames_pct"], sim["aster"]["late_frames_pct_unfrozen"]),
                          (1, 25.5, 1.0))
+        # A Hyperliquid-hedged market's simulator reports its own venues.
+        self.assertEqual([v for v in ("aster", "lighter", "hyperliquid") if v in hl], ["aster", "hyperliquid"])
 
 
 if __name__ == "__main__":

@@ -21,6 +21,8 @@ and probes.
 
 ```text
 .
+├── dryrun_summary.py       one screen per dry-run market, condensed from the two reports below
+├── screener_summary.py     the screener's best routes so far (runs SCREENER's report in Docker)
 ├── combined_pnl.py         execution economics across both engines' records
 ├── trade_history.py        the same records as a SQLite trade history, with repair
 ├── bot_stats.py            why: edge kept per leg, entry gate, controller, simulator health
@@ -71,6 +73,8 @@ Run from the repository root. The reports read the bot's records in `LIGHTER_AST
 and, without `--since`, count from the dry run's first start.
 
 ```bash
+python3 dryrun_summary.py                       # every dry-run market on one screen
+python3 screener_summary.py --top 10            # the screener's ranking; --since/--until/--lighter/--latency pass through
 python3 combined_pnl.py --market HYPE --since 2026-06-23T16:00:00Z   # add --json for JSON
 python3 trade_history.py --market HYPE          # database: runs/trade_history.sqlite
 python3 combined_pnl.py --market HYPE --dry-run
