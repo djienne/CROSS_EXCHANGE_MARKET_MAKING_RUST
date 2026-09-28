@@ -64,7 +64,8 @@ class EconomicContractTests(unittest.TestCase):
                "actual_gross_usd": "0.1", "actual_fees_usd": "0.008375", "actual_net_usd": "0.091625"}
         new = {("hedge" + k[len("lighter"):] if k.startswith("lighter") else k): v for k, v in old.items()}
         new.update(direction="SELL_HYPERLIQUID_BUY_ASTER", hedge_venue="hyperliquid")
-        for row in (old, new):
+        lh = dict(new, direction="SELL_HYPERLIQUID_BUY_LIGHTER", first_venue="lighter")
+        for row in (old, new, lh):
             result = economics.taker_economics(row)
             self.assertEqual((result["economic_status"], result["net_pnl_usdc"], result["lighter_client_order_index"]), ("confirmed", Decimal("0.091625"), "2"))
 

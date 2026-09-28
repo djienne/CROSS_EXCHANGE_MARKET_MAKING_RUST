@@ -23,7 +23,7 @@ use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::config::LiveMode;
+use crate::config::{FirstVenue, LiveMode};
 
 /// Runtime state (journals, latches, controller files) lives here, relative to the working
 /// directory: the crate dir, bind-mounted as /app/runs in Docker.
@@ -97,19 +97,24 @@ impl BotConfig {
     }
 
     /// Both engines' entry for `market`, which must name the same instruments on the same
-    /// venues.
+    /// venues; or the taker's alone, for a market without an Aster leg for XEMM to quote on.
     pub fn select(&self, market: &str) -> Result<(Vec<crate::taker::config::MarketCfg>, Vec<crate::config::MarketCfg>)> {
         let taker = self.taker.select_markets(Some(market));
         let maker = self.maker.select_markets(Some(market));
-        let (Some(t), Some(m), 1, 1) = (taker.first(), maker.first(), taker.len(), maker.len()) else {
-            bail!("market {market} must appear exactly once in both [[taker.markets]] and [[maker.markets]]");
+        let taker_only = taker.first().is_some_and(|t| t.first_venue != FirstVenue::Aster);
+        let (Some(t), 1, true) = (taker.first(), taker.len(), maker.len() == usize::from(!taker_only)) else {
+            bail!("market {market} must appear exactly once in [[taker.markets]] and, if its first leg is Aster, in [[maker.markets]]");
         };
-        ensure!(t.id().0 == market && m.id().0 == market, "market ids must be spelled {market} in both engine configs");
-        ensure!(t.aster_symbol.eq_ignore_ascii_case(&m.aster_symbol) && t.lighter_symbol.eq_ignore_ascii_case(&m.hl_coin)
-            && t.hedge_venue == m.hedge_venue, "taker and maker configs name different instruments for {market}");
-        ensure!(self.maker.live.enabled, "[maker.live] enabled must be true under `run`");
-        ensure!(self.taker.pnl.enabled && self.maker.live.circuit_breaker.enabled,
-            "`run` keeps both engines' own loss stops: [taker.pnl] and [maker.live.circuit_breaker] need enabled = true");
+        ensure!(t.id().0 == market, "market ids must be spelled {market} in the engine configs");
+        if let Some(m) = maker.first() {
+            ensure!(m.id().0 == market, "market ids must be spelled {market} in both engine configs");
+            ensure!(t.aster_symbol.eq_ignore_ascii_case(&m.aster_symbol) && t.lighter_symbol.eq_ignore_ascii_case(&m.hl_coin)
+                && t.hedge_venue == m.hedge_venue, "taker and maker configs name different instruments for {market}");
+            ensure!(self.maker.live.enabled, "[maker.live] enabled must be true under `run`");
+            ensure!(self.maker.live.circuit_breaker.enabled,
+                "`run` keeps XEMM's own loss stop: [maker.live.circuit_breaker] needs enabled = true");
+        }
+        ensure!(self.taker.pnl.enabled, "`run` keeps the taker's own loss stop: [taker.pnl] needs enabled = true");
         Ok((taker, maker))
     }
 }
@@ -120,6 +125,14 @@ impl BotConfig {
 pub async fn run(config: &Path, market: &str, mode: LiveMode, ack_breaker: bool, reset_baseline: bool, stop: CancellationToken) -> Result<()> {
     let cfg = BotConfig::load(config)?;
     run_with(cfg, Path::new(RUNS_DIR), market, mode, ack_breaker, reset_baseline, stop).await
+}
+
+/// A market's two legs as `<VENUE>-<symbol>` lock names: markets sharing a leg share its one-way
+/// position there, so each leg has one live writer (HYPE-LH and HYPE both trade Lighter HYPE).
+pub fn legs(market: &crate::taker::config::MarketCfg) -> [String; 2] {
+    let first = if market.first_venue == FirstVenue::Aster { &market.aster_symbol } else { &market.lighter_symbol };
+    [format!("{:?}-{first}", market.first_venue), format!("{:?}-{}", market.hedge_venue, market.lighter_symbol)]
+        .map(|leg| leg.to_ascii_uppercase())
 }
 
 /// [`run`] with the config loaded and the runs directory given.
@@ -139,8 +152,7 @@ pub(crate) async fn run_with(
     // Live and dry-run never share a file.
     let runs_dir = if live { runs_root.to_path_buf() } else { runs_root.join("dry-run") };
     let _lock = lock_market(&runs_dir, &market)?;
-    // Markets on one Aster symbol share its one-way position there: one live writer per symbol.
-    let _aster_lock = if live { Some(lock_market(&runs_dir, &format!("ASTER-{}", maker_markets[0].aster_symbol))?) } else { None };
+    let _leg_locks = if live { legs(&taker_markets[0]).iter().map(|leg| lock_market(&runs_dir, leg)).collect::<Result<Vec<_>>>()? } else { Vec::new() };
     let sim = if live {
         refuse_insecure_env_files()?;
         refuse_legacy_stack(&market, &[runs_root, Path::new("../runs")])?;
@@ -370,6 +382,12 @@ mod tests {
         assert!(cfg.select("BNB").is_err(), "BNB has no taker entry");
         let (taker, maker) = cfg.select("HYPE-HL").unwrap();
         assert!(taker[0].hedge_venue == maker[0].hedge_venue && maker[0].hedge_venue == crate::config::HedgeVenue::Hyperliquid);
+        let (lh, maker) = cfg.select("HYPE-LH").unwrap();
+        assert!(maker.is_empty(), "no Aster leg, so no XEMM");
+        // Each leg has one live writer: HYPE-LH shares Lighter HYPE with HYPE and Hyperliquid HYPE with HYPE-HL.
+        let legs_of = |m: &str| legs(&cfg.select(m).unwrap().0[0]);
+        assert_eq!(legs(&lh[0]), ["LIGHTER-HYPE", "HYPERLIQUID-HYPE"]);
+        assert_eq!((legs_of("HYPE"), legs_of("HYPE-HL")), (["ASTER-HYPEUSDT".into(), "LIGHTER-HYPE".into()], ["ASTER-HYPEUSDT".into(), "HYPERLIQUID-HYPE".into()]));
         for (edited, expected) in [
             // XEMM's old `[live] mode` key: the mode is a command-line choice only.
             (shipped.replace("[maker.live]", "[maker.live]\nmode = \"live\""), "live.mode"),
@@ -545,6 +563,70 @@ mod tests {
         let qty = |venue: usize, market: &str| state[venue]["account"]["positions"][market]["qty"].as_str().and_then(|q| q.parse::<Decimal>().ok());
         let (aster, hyperliquid) = (qty(0, "HYPEUSDT").unwrap(), qty(1, "HYPE").unwrap());
         assert!(aster + hyperliquid == Decimal::ZERO && aster >= dec!(0.13), "{state}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A market without an Aster leg runs the taker alone: it buys the Lighter ask and sells the
+    /// Hyperliquid bid, each leg at its own venue's fee, and the controller reads its status from
+    /// the taker's own snapshots.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dry_run_arbitrage_on_lighter_and_hyperliquid() {
+        use crate::config::{FirstVenue, HedgeVenue};
+        use crate::dryrun::matching::Venue;
+        use rust_decimal_macros::dec;
+        use std::time::Duration;
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let market = std::sync::Arc::new(crate::dryrun::tests::World::pair([Venue::Lighter, Venue::Hyperliquid]).await);
+        let dir = crate::dryrun::tests::temp_dir("dry-run-e2e-lh");
+        let mut cfg = crate::dryrun::tests::shipped_config(&market, &dir);
+        let arb = &mut cfg.taker.arb;
+        (arb.startup_warmup_ms, arb.entry_gate.enabled) = (0, false);
+        let fresh = market.keep_fresh();
+        let stop = CancellationToken::new();
+        let bot = tokio::spawn({
+            let (stop, runs) = (stop.clone(), dir.clone());
+            async move { run_with(cfg, &runs, "HYPE-LH", LiveMode::DryRun, false, false, stop).await }
+        });
+        // Hyperliquid bids 102 while Lighter asks 101.
+        market.set_hyperliquid(dec!(102), dec!(103));
+        let ledger = dir.join("dry-run").join("trades_HYPE-LH.jsonl");
+        let row = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if let Some(line) = std::fs::read_to_string(&ledger).ok().and_then(|text| text.lines().next().map(str::to_string)) {
+                    break serde_json::from_str::<crate::taker::pnl::TradeLedgerRow>(&line).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("no hedged trade within 60 s");
+        let confirmed = crate::taker::pnl::EconomicStatus::Confirmed;
+        assert_eq!((row.economic_status, row.direction.as_str(), row.first_venue, row.hedge_venue),
+            (confirmed, "SELL_HYPERLIQUID_BUY_LIGHTER", FirstVenue::Lighter, HedgeVenue::Hyperliquid), "{row:?}");
+        let (lighter, hyperliquid) = (row.aster_fill, row.hedge_fill);
+        assert_eq!((lighter.vwap, hyperliquid.vwap, lighter.qty), (dec!(101), dec!(102), hyperliquid.qty), "{row:?}");
+        // Lighter charges nothing; Hyperliquid 4.5 bps, as its own fills report.
+        let fee = hyperliquid.notional * dec!(0.00045);
+        assert!(lighter.fee_usd.is_zero() && hyperliquid.fee_provenance == crate::taker::types::FeeProvenance::Venue
+            && (hyperliquid.fee_usd - fee).abs() < dec!(0.000001), "{row:?}");
+        assert!(row.final_net_position.is_zero() && (row.expected_net_usd - row.actual_net_usd).abs() < dec!(0.001), "{row:?}");
+        let state = dir.join("dry-run").join("bot-HYPE-LH.state.json");
+        let from_taker = || std::fs::read_to_string(&state).ok().and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .is_some_and(|state| state["rights"] == "taker" && state["accounts"]["taker"]["total_equity_usd"].is_string());
+        for _ in 0..600 {
+            if from_taker() { break; }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(from_taker(), "the controller reads the taker's status: {:?}", std::fs::read_to_string(&state));
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(60), bot).await.expect("the drain hung").unwrap().expect("a clean stop");
+        fresh.abort();
+        // The simulated accounts keep the hedged pair: long on Lighter, short on Hyperliquid.
+        let state = std::fs::read_to_string(dir.join("dry-run").join("sim-HYPE-LH.state.json")).unwrap();
+        let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+        let qty = |venue: usize, market: &str| state[venue]["account"]["positions"][market]["qty"].as_str().and_then(|q| q.parse::<Decimal>().ok());
+        let (lighter, hyperliquid) = (qty(0, "24").unwrap(), qty(1, "HYPE").unwrap());
+        assert!(lighter + hyperliquid == Decimal::ZERO && lighter > Decimal::ZERO, "{state}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

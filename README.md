@@ -4,7 +4,8 @@ One Rust binary, `lighter_aster_bot` in `LIGHTER_ASTER_BOT/`, trades one market 
 and Lighter (or Hyperliquid) with two engines: a taker–taker arbitrage engine and an XEMM
 engine that quotes on Aster and hedges on the other venue. Its `run` command holds both in one process and enforces a
 cross-engine loss stop: XEMM quotes, and when an arbitrage passes the taker's entry gate it
-pulls its quotes and hands the execution rights to the taker until the trade is done. `run --mode dry-run`
+pulls its quotes and hands the execution rights to the taker until the trade is done. A market
+with no Aster leg (`HYPE-LH`: Lighter against Hyperliquid) runs the taker alone. `run --mode dry-run`
 runs the same bot against simulated venues fed by live market data, with no credentials and no
 real orders.
 
@@ -31,7 +32,7 @@ and probes.
 ├── SCREENER/               which pairs would suit the bot: its own crate and container, public data only (SCREENER/README.md)
 └── LIGHTER_ASTER_BOT/
     ├── bot.toml            config: [controller], [taker], [maker], [dry_run]
-    ├── docker-compose.yml  services: dryrun, recorder (market-data tape), and bot (live, behind the `live` profile)
+    ├── docker-compose.yml  services: dryrun, dryrun-hl, dryrun-lh, recorder (market-data tape), and bot (live, behind the `live` profile)
     ├── scripts/            deploy_vps.sh, reset_breaker.py
     ├── signers/            Lighter signer libraries (binaries, not secrets)
     ├── src/                controller/ (run), taker/, livebot/ (XEMM), dryrun/ (simulated venues)
@@ -55,7 +56,7 @@ The reports need Python 3.
 
 ```bash
 cd LIGHTER_ASTER_BOT
-docker compose up -d --build dryrun
+docker compose up -d --build dryrun dryrun-hl dryrun-lh   # HYPE, HYPE-HL, HYPE-LH
 docker compose logs -f dryrun
 ```
 

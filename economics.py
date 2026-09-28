@@ -163,12 +163,13 @@ def taker_economics(row: dict[str, Any]) -> dict[str, Any] | None:
             net_pnl_usdc=optional_decimal(row.get("actual_net_usd")),
             economic_status="estimated", key=f"taker:recovery:{key_a}:{key_h}:{row.get('timestamp')}")
     else:
-        sides = {"SELL_ASTER_BUY_LIGHTER": ("sell", "buy"), "SELL_LIGHTER_BUY_ASTER": ("buy", "sell")}
-        leg = direction.replace("HYPERLIQUID", "LIGHTER")
-        if leg not in sides:
+        # SELL_<X>_BUY_<Y>. The `aster_*` slot is the first leg, named by `first_venue` (Aster if absent).
+        first = str(row.get("first_venue", "aster")).upper()
+        sold, _, bought = direction.removeprefix("SELL_").partition("_BUY_")
+        if not direction.startswith("SELL_") or sold == bought or first not in (sold, bought):
             return None
         fills = []
-        for venue, side, identity in zip(("aster", "lighter"), sides[leg], (key_a, key_h)):
+        for venue, side, identity in zip(("aster", "lighter"), ("sell", "buy") if sold == first else ("buy", "sell"), (key_a, key_h)):
             d = row.get("aster_fill") if venue == "aster" else row.get("hedge_fill", row.get("lighter_fill"))
             if not isinstance(d, dict):
                 return None

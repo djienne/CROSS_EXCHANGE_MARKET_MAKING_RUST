@@ -690,6 +690,15 @@ pub enum HedgeVenue {
     Hyperliquid,
 }
 
+/// The venue of an arbitrage's first leg: Aster, or Lighter against a Hyperliquid second leg.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FirstVenue {
+    #[default]
+    Aster,
+    Lighter,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketCfg {
     pub aster_symbol: String,

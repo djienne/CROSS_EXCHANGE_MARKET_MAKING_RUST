@@ -57,6 +57,10 @@ cargo build --release --locked        # Rust 1.92; the Lighter signers exist for
   Hyperliquid. The bot sends Hyperliquid IOCs only, since the venue offers this account no
   dead-man to cancel a resting order. Live, it reads `hyperliquid.env` ([Probes](#probes)), and
   the leverage gate wants 1x on both legs: set the Hyperliquid market to 1x cross first.
+- A `[[taker.markets]]` entry with `first_venue = "lighter"` has no `aster_symbol` and no
+  `[[maker.markets]]` entry, and must hedge on Hyperliquid: `HYPE-LH` takes both sides on
+  Lighter HYPE and Hyperliquid HYPE, and `run` starts the taker alone, with the taker's own
+  account snapshot as the controller's status. Each leg pays its own venue's taker fee.
 
 ## Run and stop
 
@@ -89,13 +93,15 @@ once, with no drain, like a kill.
 
 Only one live writer per market runs at a time: `run --mode live` and `taker run` (unless
 `--observe-only`) take the exclusive lock `runs/bot-<MARKET>.lock` and name the holder's pid
-on contention. A dry run locks `runs/dry-run/bot-<MARKET>.lock`, so it can run beside live.
+on contention. Live, they also lock each leg, `runs/bot-<VENUE>-<SYMBOL>.lock`
+(`bot-LIGHTER-HYPE.lock`), so markets sharing a leg (HYPE and HYPE-LH) never both trade it. A
+dry run locks `runs/dry-run/bot-<MARKET>.lock`, so it can run beside live.
 
 ## Dry run
 
-`run --mode dry-run` is the whole bot, both engines, the controller and every client and
-signer unchanged, against an in-process simulated Aster and hedge venue (Lighter, or
-Hyperliquid for `HYPE-HL`) on loopback. The
+`run --mode dry-run` is the whole bot, its engines, the controller and every client and
+signer unchanged, against the market's two venues simulated in process on loopback: Aster and
+Lighter, Aster and Hyperliquid for `HYPE-HL`, Lighter and Hyperliquid for `HYPE-LH`. The
 simulator follows the live public market data and answers in each venue's own protocol. It
 needs no credentials: the bot signs with a fixed dry-run identity whose keys exist on no
 venue, so a request that escaped to mainnet could not trade. Its files live in
@@ -130,7 +136,7 @@ The venues respond as seen from AWS Tokyo, and pessimistically where the data ca
 Docker (from this directory; the fleet's `start_all.bat` also starts it):
 
 ```bash
-docker compose up -d --build dryrun dryrun-hl   # HYPE on Lighter, HYPE-HL on Hyperliquid
+docker compose up -d --build dryrun dryrun-hl dryrun-lh   # HYPE, HYPE-HL, HYPE-LH (taker only)
 docker compose logs -f dryrun
 ```
 
@@ -249,7 +255,7 @@ kinds listed in `src/dryrun/tape.rs`. Read a day with `zstd -dc data/HYPE/<day>T
 | `bot-<M>-journal.jsonl` | XEMM execution journal (its `"lighter"` venue is the hedge leg, Hyperliquid on `HYPE-HL`) |
 | `bot-<M>.trip.json`, `bot-<M>.active.json` | XEMM loss latch and unclean-session marker |
 | `bot-<M>.residual.json` | Legs XEMM left open at its last stop (a report, not a latch) |
-| `trades_<M>.jsonl`, `executions_<M>.jsonl`, `opportunities_<M>.jsonl` | Taker ledger, execution log and entry-gate history |
+| `trades_<M>.jsonl`, `executions_<M>.jsonl`, `opportunities_<M>.jsonl` | Taker ledger, execution log and entry-gate history (their `aster_*` fields are the first leg, named by `first_venue`) |
 | `active_session_<M>.json`, `circuit_breaker_<M>.json` | Taker unclean-session marker and loss breaker |
 
 The taker's observe-only history still feeds `opportunities_<M>.jsonl`, as live history

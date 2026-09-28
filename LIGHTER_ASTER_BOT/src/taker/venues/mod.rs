@@ -1,5 +1,5 @@
-//! The arbitrage's second leg, behind Aster's fixed first one: Lighter or Hyperliquid, both
-//! answering in the Lighter leg's types.
+//! The arbitrage's legs. The second is Lighter or Hyperliquid, both answering in the Lighter
+//! leg's types; the first is Aster, or Lighter standing in for it against Hyperliquid.
 
 pub mod hyperliquid;
 pub mod lighter;
@@ -12,6 +12,8 @@ use anyhow::{bail, Result};
 use rust_decimal::Decimal;
 use tokio::sync::Notify;
 
+use crate::taker::aster::rest::AsterRest;
+use crate::taker::aster::ws::AsterBookFeed;
 use crate::taker::book::OrderBook;
 use crate::taker::types::{MarketId, Side};
 use hyperliquid::HyperliquidVenue;
@@ -33,6 +35,14 @@ macro_rules! either {
 }
 
 impl OtherLeg {
+    /// Its name in order identities and logs.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Lighter(_) => "lighter",
+            Self::Hyperliquid(_) => "hyperliquid",
+        }
+    }
+
     pub fn order_book_arc(&self, market: &MarketId) -> Result<Arc<OrderBook>> {
         either!(self, v => v.order_book_arc(market))
     }
@@ -130,6 +140,91 @@ impl TerminalOrders for OtherLeg {
         match self {
             Self::Lighter(l) => l.resolve_order_terminal(market, client_order_index, side, timeout).await,
             Self::Hyperliquid(h) => h.resolve_order_terminal(market, client_order_index, timeout).await,
+        }
+    }
+}
+
+/// The arbitrage's first leg. Lighter standing in for Aster answers as the second leg does
+/// (in the first leg's own market), and Aster in the same types.
+pub enum FirstLeg {
+    Aster { rest: Arc<AsterRest>, books: AsterBookFeed },
+    Other(OtherLeg),
+}
+
+impl FirstLeg {
+    pub fn order_book_arc(&self, market: &MarketId) -> Result<Arc<OrderBook>> {
+        match self {
+            Self::Aster { books, .. } => books.order_book_arc(),
+            Self::Other(leg) => leg.order_book_arc(market),
+        }
+    }
+
+    pub fn set_scan_notify(&self, wake: Arc<Notify>) {
+        match self {
+            Self::Aster { books, .. } => books.set_scan_notify(wake),
+            Self::Other(leg) => leg.set_scan_notify(wake),
+        }
+    }
+
+    pub async fn wait_ready(&self, market: &MarketId, timeout: Duration) -> Result<()> {
+        match self {
+            Self::Aster { books, .. } => books.wait_ready(timeout).await,
+            Self::Other(leg) => leg.wait_ready(market, timeout).await,
+        }
+    }
+
+    pub async fn position_qty(&self, market: &MarketId) -> Result<Decimal> {
+        match self {
+            Self::Aster { rest, .. } => rest.position_qty(market).await,
+            Self::Other(leg) => leg.rest_position_qty(market).await,
+        }
+    }
+
+    pub async fn open_orders_count(&self, market: &MarketId) -> Result<usize> {
+        match self {
+            Self::Aster { rest, .. } => rest.open_orders(market).await.map(|orders| orders.len()),
+            Self::Other(leg) => leg.rest_open_orders_count(market).await,
+        }
+    }
+
+    pub async fn margin_snapshot(&self) -> Result<LighterMarginSnapshot> {
+        match self {
+            Self::Aster { rest, .. } => rest.balance_snapshot().await
+                .map(|b| LighterMarginSnapshot { available_usdc: b.available_usd, equity_usdc: b.equity_usd() }),
+            Self::Other(leg) => leg.rest_margin_snapshot().await,
+        }
+    }
+
+    pub async fn account_snapshot(&self, market: &MarketId) -> Result<LighterAccountSnapshot> {
+        match self {
+            Self::Aster { rest, .. } => {
+                let (position_qty, b) = tokio::try_join!(rest.position_qty(market), rest.balance_snapshot())?;
+                Ok(LighterAccountSnapshot { position_qty, available_usdc: b.available_usd,
+                    account_value_usdc: b.cross_wallet_balance_usd, unrealized_pnl_usdc: b.cross_unrealized_pnl_usd })
+            }
+            Self::Other(leg) => leg.account_snapshot(market).await,
+        }
+    }
+
+    /// Lighter's websocket position; Aster pushes none to the taker.
+    pub fn ws_position_qty(&self, market: &MarketId) -> Option<Decimal> {
+        match self {
+            Self::Aster { .. } => None,
+            Self::Other(leg) => leg.ws_position_qty(market).ok(),
+        }
+    }
+
+    pub async fn refresh_nonce(&self) -> Result<()> {
+        match self {
+            Self::Aster { .. } => Ok(()),
+            Self::Other(leg) => leg.refresh_nonce().await,
+        }
+    }
+
+    pub fn tx_ready(&self) -> bool {
+        match self {
+            Self::Aster { .. } => true,
+            Self::Other(leg) => leg.tx_ready(),
         }
     }
 }

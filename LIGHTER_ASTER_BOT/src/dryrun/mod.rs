@@ -38,7 +38,7 @@ use self::feed::{Follower, Hub, Input};
 use self::matching::{
     quantiles, Envelope, Event, Exchange, Fees, Filters, Order, Output, Reject, Reply, SimParams, Venue, VenueState, LOOKAHEAD_US,
 };
-use crate::config::HedgeVenue;
+use crate::config::{FirstVenue, HedgeVenue};
 use crate::controller::BotConfig;
 use crate::decimal::parse_dec;
 use crate::lighter::messages::{OrderBookDetail, OrderBooksResponse};
@@ -222,8 +222,12 @@ pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::
         HedgeVenue::Lighter => Venue::Lighter,
         HedgeVenue::Hyperliquid => Venue::Hyperliquid,
     };
+    let (first, symbol) = match market.first_venue {
+        FirstVenue::Aster => (Venue::Aster, &market.aster_symbol),
+        FirstVenue::Lighter => (Venue::Lighter, &market.lighter_symbol),
+    };
     let legs = [
-        Listing::fetch(Venue::Aster, &market.aster_symbol, cfg, &http).await?,
+        Listing::fetch(first, symbol, cfg, &http).await?,
         Listing::fetch(hedge, &market.lighter_symbol, cfg, &http).await?,
     ];
     let (pair, keys) = (legs.each_ref().map(|leg| leg.venue), legs.each_ref().map(|leg| leg.market.clone()));
@@ -613,28 +617,34 @@ pub(crate) mod tests {
     /// Aster's `exchangeInfo` in the documented v3 shape, cut to HYPEUSDT.
     const ASTER_EXCHANGE_INFO: &str = r#"{"timezone":"UTC","serverTime":1790235498000,"rateLimits":[{"rateLimitType":"REQUEST_WEIGHT","interval":"MINUTE","intervalNum":1,"limit":2400},{"rateLimitType":"ORDERS","interval":"MINUTE","intervalNum":1,"limit":1200}],"assets":[],"symbols":[{"symbol":"HYPEUSDT","pair":"HYPEUSDT","contractType":"PERPETUAL","status":"TRADING","baseAsset":"HYPE","quoteAsset":"USDT","marginAsset":"USDT","pricePrecision":3,"quantityPrecision":2,"filters":[{"filterType":"PRICE_FILTER","minPrice":"0.001","maxPrice":"100000","tickSize":"0.001"},{"filterType":"LOT_SIZE","stepSize":"0.01","maxQty":"100000","minQty":"0.01"},{"filterType":"MIN_NOTIONAL","notional":"5"},{"filterType":"PERCENT_PRICE","multiplierUp":"1.0500","multiplierDown":"0.9500","multiplierDecimal":4}],"orderTypes":["LIMIT","MARKET"],"timeInForce":["GTC","IOC","FOK","GTX","HIDDEN"]}]}"#;
 
-    /// Both simulated venues on loopback: HYPE quoted 99 / 101 with 5 on each, 1000 of collateral on
-    /// each, a few milliseconds away.
+    /// Two simulated venues on loopback standing in for mainnet: HYPE quoted 99 / 101 with 5 on
+    /// each, 1000 of collateral on each, a few milliseconds away.
     pub(crate) struct World {
+        /// The first venue's URL: Aster's, or Lighter's against Hyperliquid.
         pub(crate) aster: String,
-        /// The hedge venue's URL: Lighter's, or Hyperliquid's.
+        /// The second venue's URL: Lighter's, or Hyperliquid's.
         pub(crate) hedge: String,
-        hedge_venue: Venue,
+        pair: [Venue; 2],
         venues: Venues,
         inputs: mpsc::UnboundedSender<Input>,
         hubs: [Arc<Mutex<Hub>>; 2],
-        /// The Aster top [`World::keep_fresh`] republishes.
+        /// The Aster and Hyperliquid tops [`World::keep_fresh`] republishes.
         aster_top: Mutex<(Decimal, Decimal)>,
+        hyperliquid_top: Mutex<(Decimal, Decimal)>,
         /// The Lighter book's last nonce.
         lighter_nonce: AtomicI64,
     }
 
     impl World {
         pub(crate) async fn start() -> Self {
-            Self::hedged_on(Venue::Lighter).await
+            Self::pair([Venue::Aster, Venue::Lighter]).await
         }
 
         pub(crate) async fn hedged_on(hedge_venue: Venue) -> Self {
+            Self::pair([Venue::Aster, hedge_venue]).await
+        }
+
+        pub(crate) async fn pair(pair: [Venue; 2]) -> Self {
             let fixed = |ms: f64| Latency::try_from([ms, ms]).unwrap();
             let params = SimParams {
                 shift_us: SHIFT_MS * 1_000,
@@ -647,58 +657,74 @@ pub(crate) mod tests {
                 fees: [Fees { maker: dec!(0), taker: dec!(0.0004) }, Fees { maker: dec!(0), taker: dec!(0) }],
                 leverage: dec!(1),
                 balances: [dec!(1000), dec!(1000)],
-                venues: [Venue::Aster, hedge_venue],
+                venues: pair,
             };
             let mut core = Exchange::new(params, wall_us());
             core.trust_feed();
             let band = Some((dec!(0.95), dec!(1.05)));
             let aster = Filters { tick: dec!(0.001), step: dec!(0.01), min_qty: dec!(0.01), min_notional: dec!(5), percent_price: band, sig_figs: None };
-            let hedge_filters = Filters { tick: dec!(0.0001), step: dec!(0.01), min_qty: dec!(0.07), min_notional: dec!(10), percent_price: band, sig_figs: None };
-            let (hedge_market, hedge_streams) = match hedge_venue {
-                Venue::Hyperliquid => ("HYPE", vec!["l2Book/HYPE".to_string(), "bbo/HYPE".to_string()]),
-                _ => ("24", vec!["order_book/24".to_string()]),
+            let other = Filters { tick: dec!(0.0001), step: dec!(0.01), min_qty: dec!(0.07), min_notional: dec!(10), percent_price: band, sig_figs: None };
+            // Each venue's market key, streams and filters.
+            let listing = |venue| match venue {
+                Venue::Aster => ("HYPEUSDT", aster_streams("HYPEUSDT").to_vec(), aster.clone(), Some(20)),
+                Venue::Lighter => ("24", vec!["order_book/24".to_string()], other.clone(), None),
+                Venue::Hyperliquid => ("HYPE", vec!["l2Book/HYPE".to_string(), "bbo/HYPE".to_string()], other.clone(), None),
             };
-            core.add_market(Venue::Aster, "HYPEUSDT", Some(20), aster);
-            core.add_market(hedge_venue, hedge_market, None, hedge_filters);
+            let listings = pair.map(listing);
+            for (venue, (market, _, filters, depth)) in pair.into_iter().zip(&listings) {
+                core.add_market(venue, market, *depth, filters.clone());
+            }
             let shift = SHIFT_MS * 1_000;
-            let hubs = [Arc::new(Mutex::new(Hub::new(shift, aster_streams("HYPEUSDT")))), Arc::new(Mutex::new(Hub::new(shift, hedge_streams)))];
+            let hubs = listings.each_ref().map(|(_, streams, ..)| Arc::new(Mutex::new(Hub::new(shift, streams.clone()))));
             let (inputs, feed) = mpsc::unbounded_channel();
             let venues = Venues::start(core, feed, hubs.clone(), [Latency::ZERO; 2], 1, None);
-            let aster = serve(0, Aster::new(venues.clone(), ASTER_EXCHANGE_INFO.into(), vec!["HYPEUSDT".into()], dec!(1))).await.unwrap();
-            let hedge = match hedge_venue {
-                Venue::Hyperliquid => serve(0, super::hyperliquid::Hyperliquid::new(venues.clone(), HYPERLIQUID_META, dec!(1)).unwrap()).await.unwrap(),
-                _ => {
-                    let markets = serde_json::from_str::<OrderBooksResponse>(ORDER_BOOKS).unwrap().order_books;
-                    serve(0, Lighter::new(venues.clone(), ORDER_BOOKS.into(), markets, [dec!(0); 2], dec!(1))).await.unwrap()
-                }
-            };
-            let (aster_top, lighter_nonce) = (Mutex::new((dec!(99), dec!(101))), AtomicI64::new(1));
-            let world = Self { aster, hedge, hedge_venue, venues, inputs, hubs, aster_top, lighter_nonce };
-            world.aster_book(dec!(99), dec!(101));
-            match hedge_venue {
-                Venue::Hyperliquid => world.hyperliquid_book(),
-                _ => world.lighter_book(dec!(99), dec!(101)),
+            let mut urls = Vec::new();
+            for venue in pair {
+                urls.push(match venue {
+                    Venue::Aster => serve(0, Aster::new(venues.clone(), ASTER_EXCHANGE_INFO.into(), vec!["HYPEUSDT".into()], dec!(1))).await.unwrap(),
+                    Venue::Hyperliquid => serve(0, super::hyperliquid::Hyperliquid::new(venues.clone(), HYPERLIQUID_META, dec!(1)).unwrap()).await.unwrap(),
+                    Venue::Lighter => {
+                        let markets = serde_json::from_str::<OrderBooksResponse>(ORDER_BOOKS).unwrap().order_books;
+                        serve(0, Lighter::new(venues.clone(), ORDER_BOOKS.into(), markets, [dec!(0); 2], dec!(1))).await.unwrap()
+                    }
+                });
             }
-            world.venues.warm(&[(Venue::Aster, "HYPEUSDT"), (hedge_venue, hedge_market)]).await;
+            let [aster, hedge] = <[String; 2]>::try_from(urls).unwrap();
+            let top = || Mutex::new((dec!(99), dec!(101)));
+            let world = Self { aster, hedge, pair, venues, inputs, hubs, aster_top: top(), hyperliquid_top: top(), lighter_nonce: AtomicI64::new(1) };
+            for venue in pair {
+                match venue {
+                    Venue::Aster => world.aster_book(dec!(99), dec!(101)),
+                    Venue::Lighter => world.lighter_book(dec!(99), dec!(101)),
+                    Venue::Hyperliquid => world.hyperliquid_book(),
+                }
+            }
+            world.venues.warm(&[(pair[0], listings[0].0), (pair[1], listings[1].0)]).await;
             world
         }
 
-        /// Hyperliquid's l2Book and bbo at 99 / 101, as the venue pushes them.
+        /// Hyperliquid's l2Book and bbo at its top, 5 on each side, as the venue pushes them.
         fn hyperliquid_book(&self) {
-            let time = Self::due_ms();
-            let level = |px: &str| json!({"px": px, "sz": "5", "n": 1});
+            let (time, (bid, ask)) = (Self::due_ms(), *self.hyperliquid_top.lock().unwrap());
+            let level = |px: Decimal| json!({"px": px.to_string(), "sz": "5", "n": 1});
             for (channel, data) in [
-                ("l2Book", json!({"coin": "HYPE", "time": time, "levels": [[level("99")], [level("101")]]})),
-                ("bbo", json!({"coin": "HYPE", "time": time, "bbo": [level("99"), level("101")]})),
+                ("l2Book", json!({"coin": "HYPE", "time": time, "levels": [[level(bid)], [level(ask)]]})),
+                ("bbo", json!({"coin": "HYPE", "time": time, "bbo": [level(bid), level(ask)]})),
             ] {
                 let text = json!({"channel": channel, "data": data}).to_string();
                 self.publish(hyperliquid_frame(&text, SHIFT_MS * 1_000).unwrap().unwrap());
             }
         }
 
+        /// Moves the Hyperliquid top; [`World::keep_fresh`] repeats it.
+        pub(crate) fn set_hyperliquid(&self, bid: Decimal, ask: Decimal) {
+            *self.hyperliquid_top.lock().unwrap() = (bid, ask);
+            self.hyperliquid_book();
+        }
+
         /// As the upstream does: to the core and to the bot's streams.
         fn publish(&self, frame: Frame) {
-            let hub = &self.hubs[frame.venue.ix([Venue::Aster, self.hedge_venue])];
+            let hub = &self.hubs[frame.venue.ix(self.pair)];
             forward(frame, hub, &self.inputs);
         }
 
@@ -748,11 +774,15 @@ pub(crate) mod tests {
             let world = self.clone();
             tokio::spawn(async move {
                 loop {
-                    let (bid, ask) = *world.aster_top.lock().unwrap();
-                    world.aster_book(bid, ask);
-                    match world.hedge_venue {
-                        Venue::Hyperliquid => world.hyperliquid_book(),
-                        _ => world.lighter_tick(),
+                    for venue in world.pair {
+                        match venue {
+                            Venue::Aster => {
+                                let (bid, ask) = *world.aster_top.lock().unwrap();
+                                world.aster_book(bid, ask);
+                            }
+                            Venue::Lighter => world.lighter_tick(),
+                            Venue::Hyperliquid => world.hyperliquid_book(),
+                        }
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -764,10 +794,13 @@ pub(crate) mod tests {
     pub(crate) fn shipped_config(market: &World, dir: &Path) -> BotConfig {
         std::fs::write(dir.join("bot.toml"), include_str!("../../bot.toml")).unwrap();
         let mut cfg = BotConfig::load(&dir.join("bot.toml")).unwrap();
-        cfg.maker.live.aster.base_url = market.aster.clone();
-        match market.hedge_venue {
-            Venue::Hyperliquid => cfg.maker.live.hyperliquid.base_url = market.hedge.clone(),
-            _ => cfg.maker.live.lighter.base_url = market.hedge.clone(),
+        let live = &mut cfg.maker.live;
+        for (venue, url) in market.pair.into_iter().zip([&market.aster, &market.hedge]) {
+            match venue {
+                Venue::Aster => live.aster.base_url = url.clone(),
+                Venue::Lighter => live.lighter.base_url = url.clone(),
+                Venue::Hyperliquid => live.hyperliquid.base_url = url.clone(),
+            }
         }
         let fixed = |ms: f64| Latency::try_from([ms, ms]).unwrap();
         cfg.dry_run = Some(DryRunCfg {

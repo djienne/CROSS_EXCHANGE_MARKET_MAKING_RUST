@@ -68,7 +68,7 @@ def taker(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, 
         trades["net_bps"].append(float(econ["net_bps"]))
         trades["net_usd"].append(float(econ["net_usd"]))
         if opp:
-            buy_aster = r["direction"].endswith("_BUY_ASTER")
+            buy_aster = r["direction"].endswith("_BUY_" + str(r.get("first_venue", "aster")).upper())
             aster_px, lighter_px = float(a["vwap"]), float(lf["vwap"])
             buy, sell = float(opp["buy_px"]), float(opp["sell_px"])
             # Positive = filled worse than the decision price; the two legs sum to the edge lost.

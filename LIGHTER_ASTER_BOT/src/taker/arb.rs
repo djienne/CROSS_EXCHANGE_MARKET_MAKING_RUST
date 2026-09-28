@@ -42,7 +42,7 @@ use crate::taker::aster::ws::AsterBookFeed;
 use crate::taker::book::OrderBook;
 use crate::taker::config::{Config, MarketCfg};
 use crate::taker::connectors::{rest_book, rest_specs};
-use crate::config::HedgeVenue;
+use crate::config::{FirstVenue, HedgeVenue};
 use crate::decimal::bps_to_rate;
 use crate::taker::decimal::{common_qty_step, floor_to_step};
 use crate::taker::entry_gate::{OpportunityGate, OpportunityGateInput};
@@ -53,7 +53,7 @@ use crate::taker::venues::hyperliquid::HyperliquidVenue;
 use crate::taker::venues::lighter::{
     LighterFillConfirmation, LighterVenue, PendingFill, SubmitOutcome as LighterOutcome,
 };
-use crate::taker::venues::{OtherLeg, TerminalOrders};
+use crate::taker::venues::{FirstLeg, OtherLeg, TerminalOrders};
 
 static EXECUTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -64,13 +64,16 @@ pub(super) enum Direction {
 }
 
 impl Direction {
-    /// The ledger's name, naming the second leg's real venue.
-    pub(super) fn as_str(self, hedge: HedgeVenue) -> &'static str {
-        match (self, hedge) {
-            (Direction::SellAsterBuyLighter, HedgeVenue::Lighter) => "SELL_ASTER_BUY_LIGHTER",
-            (Direction::SellLighterBuyAster, HedgeVenue::Lighter) => "SELL_LIGHTER_BUY_ASTER",
-            (Direction::SellAsterBuyLighter, HedgeVenue::Hyperliquid) => "SELL_ASTER_BUY_HYPERLIQUID",
-            (Direction::SellLighterBuyAster, HedgeVenue::Hyperliquid) => "SELL_HYPERLIQUID_BUY_ASTER",
+    /// The ledger's name, naming both legs' real venues (a Lighter first leg trades only against
+    /// Hyperliquid).
+    pub(super) fn as_str(self, first: FirstVenue, hedge: HedgeVenue) -> &'static str {
+        match (self, first, hedge) {
+            (Direction::SellAsterBuyLighter, FirstVenue::Aster, HedgeVenue::Lighter) => "SELL_ASTER_BUY_LIGHTER",
+            (Direction::SellLighterBuyAster, FirstVenue::Aster, HedgeVenue::Lighter) => "SELL_LIGHTER_BUY_ASTER",
+            (Direction::SellAsterBuyLighter, FirstVenue::Aster, HedgeVenue::Hyperliquid) => "SELL_ASTER_BUY_HYPERLIQUID",
+            (Direction::SellLighterBuyAster, FirstVenue::Aster, HedgeVenue::Hyperliquid) => "SELL_HYPERLIQUID_BUY_ASTER",
+            (Direction::SellAsterBuyLighter, FirstVenue::Lighter, _) => "SELL_LIGHTER_BUY_HYPERLIQUID",
+            (Direction::SellLighterBuyAster, FirstVenue::Lighter, _) => "SELL_HYPERLIQUID_BUY_LIGHTER",
         }
     }
 
@@ -276,6 +279,23 @@ impl AccountSnapshot {
     fn age_ms(self) -> u128 {
         self.refreshed_at.elapsed().as_millis()
     }
+
+    /// The controller's status of a lone taker, in the field names of XEMM's
+    /// (`livebot::status`): the `aster_*` fields are the first leg's, the `lighter_*` the second's.
+    fn status_json(self, spec: &MarketSpec) -> serde_json::Value {
+        let (m, p) = (self.margins, self.position);
+        serde_json::json!({
+            "timestamp": Utc::now(), "market": spec.market_id.to_string(), "bot": crate::controller::supervisor::TAKER_BOT,
+            "first_venue": spec.first, "hedge_venue": spec.hedge,
+            "positions": {"aster_qty": p.aster_qty, "lighter_qty": p.lighter_qty, "net_qty": p.net_qty()},
+            "accounts": {
+                "aster_available_usd": m.aster_available_usd, "aster_equity_usd": m.aster_equity_usd,
+                "lighter_available_usd": m.lighter_available_usd, "lighter_equity_usd": m.lighter_equity_usd,
+                "total_equity_usd": m.total_equity_usd(),
+                "aster_open_orders": self.aster_open_orders, "lighter_open_orders": self.lighter_open_orders,
+            },
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -303,6 +323,8 @@ pub struct RunOptions {
     /// The controller's network pause: while set, no new entry starts (in-flight executions,
     /// recovery closes and shutdown carry on).
     pub pause: Option<Arc<AtomicBool>>,
+    /// Under `run` without XEMM: each account snapshot, as the controller's status.
+    pub status: Option<watch::Sender<Option<(tokio::time::Instant, serde_json::Value)>>>,
 }
 
 impl Default for RunOptions {
@@ -317,6 +339,7 @@ impl Default for RunOptions {
             want: None,
             reduce_cooldown_ms: 5_000,
             pause: None,
+            status: None,
         }
     }
 }
@@ -389,7 +412,7 @@ fn publish_account(tx: &watch::Sender<AccountSnapshot>, snapshot: AccountSnapsho
 }
 
 fn spawn_control_refresher(
-    lease_rx: Option<watch::Receiver<Option<ExecutionLease>>>, spec: MarketSpec, cfg: Config, aster: Arc<AsterRest>,
+    lease_rx: Option<watch::Receiver<Option<ExecutionLease>>>, spec: MarketSpec, cfg: Config, aster: Arc<FirstLeg>,
     lighter: Arc<OtherLeg>, execution_epoch: Arc<AtomicU64>,
     account_tx: watch::Sender<AccountSnapshot>, wake: Arc<Notify>, session: ActiveSession,
 ) -> LeaseCache {
@@ -422,9 +445,9 @@ fn spawn_control_refresher(
                     if new_lease {
                         let _ = tx.send(state.clone());
                         wake.notify_one();
-                        let (nonce, snapshot) = tokio::join!(lighter.refresh_nonce(),
+                        let (nonce, first_nonce, snapshot) = tokio::join!(lighter.refresh_nonce(), aster.refresh_nonce(),
                             refresh_account_snapshot(&spec.market_id, &aster, &lighter, &execution_epoch));
-                        if nonce.is_ok() {
+                        if nonce.is_ok() && first_nonce.is_ok() {
                             if let Ok(snapshot) = snapshot {
                                 let armed = if cfg.pnl.enabled {
                                     if let Some(equity) = snapshot.margins.total_equity_usd() { session.arm_with_equity(equity).await }
@@ -814,18 +837,28 @@ impl ExecutionError {
     }
 }
 
-/// Run the taker engine until `stop` is cancelled, the duration/trade limit is reached or a
-/// safety stop fires. Stopping never interrupts an execution: the loop checks `stop` only
-/// between iterations, then verifies flat orders/positions before clearing the session.
-pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, stop: CancellationToken) -> Result<()> {
-    let hedge_venue = markets.first().map(|m| m.hedge_venue).unwrap_or_default();
-    if hedge_venue == HedgeVenue::Hyperliquid {
-        // The second leg pays its own venue's fee. Hyperliquid pushes whole books, so there is
-        // no incremental state for the book sanity check to catch.
+/// Prices each leg at its own venue: the `aster_*` fee and slippage keys price the first leg and
+/// the `lighter_*` ones the second, so a Lighter first leg takes Lighter's and a Hyperliquid
+/// second leg Hyperliquid's fee. Hyperliquid pushes whole books, so there is no incremental
+/// state for the book sanity check to catch.
+fn price_legs(cfg: &mut Config, first: FirstVenue, hedge: HedgeVenue) -> Result<()> {
+    if first == FirstVenue::Lighter {
+        (cfg.arb.aster_taker_fee_bps, cfg.arb.max_aster_slippage_bps) = (cfg.arb.lighter_taker_fee_bps, cfg.arb.max_lighter_slippage_bps);
+    }
+    if hedge == HedgeVenue::Hyperliquid {
         cfg.arb.lighter_taker_fee_bps = cfg.arb.hyperliquid_taker_fee_bps
             .context("a market hedged on Hyperliquid needs [taker.arb] hyperliquid_taker_fee_bps")?;
         cfg.arb.book_sanity.enabled = false;
     }
+    Ok(())
+}
+
+/// Run the taker engine until `stop` is cancelled, the duration/trade limit is reached or a
+/// safety stop fires. Stopping never interrupts an execution: the loop checks `stop` only
+/// between iterations, then verifies flat orders/positions before clearing the session.
+pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, stop: CancellationToken) -> Result<()> {
+    let (first_venue, hedge_venue) = markets.first().map(|m| (m.first_venue, m.hedge_venue)).unwrap_or_default();
+    price_legs(&mut cfg, first_venue, hedge_venue)?;
     if !cfg.live.enabled || !cfg.live.mode.eq_ignore_ascii_case("live") {
         bail!("refusing to run: set [live] enabled = true and mode = \"live\"");
     }
@@ -846,11 +879,13 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
     let spec = specs.first().context("no resolved market spec")?.clone();
     let math = MarketMathF64::from_config_spec(&cfg, &spec)?;
     info!(
-        "resolved market {}: Aster {} step={} min_notional={} | Lighter {} market_id={} qty_step={} min_notional={} common_qty_step={}",
+        "resolved market {}: {:?} {} step={} min_notional={} | {:?} {} market_id={} qty_step={} min_notional={} common_qty_step={}",
         spec.market_id,
+        spec.first,
         spec.aster_symbol,
         spec.step,
         spec.aster_min_notional,
+        spec.hedge,
         spec.lighter_symbol,
         spec.lighter_market_id,
         spec.lighter_qty_step,
@@ -921,15 +956,24 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
     }
 
     let dry = cfg.venues.dry_run;
-    let acreds = if dry { AsterCreds::dry_run() } else { AsterCreds::from_env()? };
-    let aster_account_id = acreds.user.clone();
-    let aster_signer: Arc<dyn AsterSigner> =
-        Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);
-    let aster = Arc::new(AsterRest::new(
-        cfg.venues.aster_base_url.clone(),
-        aster_signer,
-        &specs,
-    )?);
+    // The slots keep Aster's names (`aster`, `aster_qty`, ...) and mean the first leg.
+    let (aster, aster_account_id) = match first_venue {
+        FirstVenue::Aster => {
+            let acreds = if dry { AsterCreds::dry_run() } else { AsterCreds::from_env()? };
+            let account = acreds.user.clone();
+            let signer: Arc<dyn AsterSigner> = Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);
+            let rest = Arc::new(AsterRest::new(cfg.venues.aster_base_url.clone(), signer, &specs)?);
+            let books = AsterBookFeed::spawn_from_rest_base(&cfg.venues.aster_base_url, &spec.aster_symbol);
+            (FirstLeg::Aster { rest, books }, Some(account))
+        }
+        FirstVenue::Lighter => {
+            let lcreds = if dry { LighterCreds::dry_run() } else { LighterCreds::from_env()? };
+            let signers = Path::new(&cfg.venues.signers_dir);
+            let venue = LighterVenue::new(&cfg.venues.lighter_base_url, signers, lcreds, &[spec.first_leg_view()]).await?;
+            (FirstLeg::Other(OtherLeg::Lighter(venue)), None)
+        }
+    };
+    let aster = Arc::new(aster);
     let lighter = Arc::new(match hedge_venue {
         HedgeVenue::Lighter => {
             let lcreds = if dry { LighterCreds::dry_run() } else { LighterCreds::from_env()? };
@@ -942,19 +986,20 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
     });
     let session = ActiveSession::new(crate::taker::pnl::session_path(&cfg.pnl, &spec.market_id), serde_json::json!({
         "schema_version": 2, "session_id": next_execution_id(), "process_id": std::process::id(), "started_at": Utc::now(), "status": "active",
-        "market": spec.market_id.to_string(), "aster_account": aster_account_id,
+        "market": spec.market_id.to_string(), "aster_account": aster_account_id, "first_venue": first_venue,
         "hedge_venue": hedge_venue, "lighter_market_index": spec.lighter_market_id,
-        "lighter_account_index": match &*lighter { OtherLeg::Lighter(l) => Some(l.account_index()), OtherLeg::Hyperliquid(_) => None },
+        "lighter_account_index": match (&*aster, &*lighter) {
+            (FirstLeg::Other(OtherLeg::Lighter(l)), _) | (_, OtherLeg::Lighter(l)) => Some(l.account_index()),
+            _ => None,
+        },
     }));
     let execution_journal = ColdJournal::new(execution_log_path(&cfg, &spec.market_id), true)?;
     let scan_wake = Arc::new(Notify::new());
-    let aster_books =
-        AsterBookFeed::spawn_from_rest_base(&cfg.venues.aster_base_url, &spec.aster_symbol);
-    aster_books.set_scan_notify(scan_wake.clone());
+    aster.set_scan_notify(scan_wake.clone());
     lighter.set_scan_notify(scan_wake.clone());
 
-    aster_books.wait_ready(Duration::from_secs(20)).await?;
-    info!("Aster websocket book ready: market={}", spec.market_id);
+    aster.wait_ready(&spec.market_id, Duration::from_secs(20)).await?;
+    info!("{first_venue:?} websocket book ready: market={}", spec.market_id);
     lighter
         .wait_ready(&spec.market_id, Duration::from_secs(20))
         .await?;
@@ -963,7 +1008,6 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
     ensure_clean_start(
         &cfg,
         &spec,
-        &aster_books,
         &aster,
         &lighter,
         options.observe_only || standby_until_lease,
@@ -980,6 +1024,16 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
         } else { session.arm().await?; }
     }
     let (account_tx, mut account_rx) = watch::channel(account);
+    if let Some(status) = options.status.clone() {
+        let (mut snapshots, spec) = (account_tx.subscribe(), spec.clone());
+        tokio::spawn(async move {
+            loop {
+                let snapshot = *snapshots.borrow_and_update();
+                status.send_replace(Some((snapshot.refreshed_at, snapshot.status_json(&spec))));
+                if snapshots.changed().await.is_err() { break; }
+            }
+        });
+    }
     let account_refresh_now = Arc::new(Notify::new());
     let _account_refresh_task = spawn_account_snapshot_refresher(
         &cfg,
@@ -995,7 +1049,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
     let book_sanity = crate::taker::book_sanity::start(
         cfg.clone(),
         spec.clone(),
-        aster_books.clone(),
+        match &*aster { FirstLeg::Aster { books, .. } => Some(books.clone()), FirstLeg::Other(_) => None },
         lighter.clone(),
         http.clone(),
     );
@@ -1128,7 +1182,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
             }
         }
 
-        let (aster_book, lighter_book) = match fetch_books(&spec, &aster_books, &lighter) {
+        let (aster_book, lighter_book) = match fetch_books(&spec, &aster, &lighter) {
             Ok(v) => {
                 if let Some(lasted) = book_outage.recovered(tokio::time::Instant::now()) {
                     info!("books back after {:.1}s without one", lasted.as_secs_f64());
@@ -1423,7 +1477,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
                     warn!(
                         "book sanity blocked new ARB entry market={} direction={} qty={} reason={:?} blocked_until={:?} failure_streak={} success_streak={}",
                         spec.market_id,
-                        opp.direction.as_str(spec.hedge),
+                        opp.direction.as_str(spec.first, spec.hedge),
                         opp.qty,
                         sanity.last_reason,
                         sanity.blocked_until,
@@ -1441,7 +1495,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
         if tracing::enabled!(Level::DEBUG) {
             debug!(
                 "arb opportunity {} qty={} gross={}bps net_margin={}bps sell_vwap={} buy_vwap={} expected_gross=${} expected_fee=${} expected_net=${} threshold_margin=${} min_qty={} desired_qty={} top_depth={} depth_supported={} liquidity_multiple={} sell_depth_target={} buy_depth_target={} sell_depth_available={} buy_depth_available={} sell_levels_used={} buy_levels_used={} headroom={} margin_room={}",
-                opp.direction.as_str(spec.hedge),
+                opp.direction.as_str(spec.first, spec.hedge),
                 opp.qty,
                 opp.gross_edge_bps,
                 opp.expected_net_margin_bps,
@@ -1469,7 +1523,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
         let gate = entry_gate.evaluate(
             OpportunityGateInput {
                 timestamp: now,
-                direction: opp.direction.as_str(spec.hedge),
+                direction: opp.direction.as_str(spec.first, spec.hedge),
                 gross_edge_bps: opp.gross_edge_bps,
                 expected_net_margin_bps: opp.expected_net_margin_bps,
                 expected_net_usd: opp.expected_net_usd,
@@ -1532,12 +1586,12 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
         if !execution_enabled {
             if let (Some(tx), None) = (&options.want, &want) {
                 if !options.pause.as_ref().is_some_and(|pause| pause.load(Ordering::Acquire))
-                    && lighter.tx_ready() && !session.unresolved() {
+                    && lighter.tx_ready() && aster.tx_ready() && !session.unresolved() {
                     next_want_id += 1;
                     want = Some(Want { id: next_want_id, at: tokio::time::Instant::now(), granted: false, attempted: false });
                     tx.send_replace(Some(next_want_id));
                     info!("asking XEMM for the execution rights market={} direction={} gross={}bps want_id={next_want_id}",
-                        spec.market_id, opp.direction.as_str(spec.hedge), opp.gross_edge_bps);
+                        spec.market_id, opp.direction.as_str(spec.first, spec.hedge), opp.gross_edge_bps);
                 }
             }
             // Standby/observe hits this every poll while an edge exists; 5s heartbeat.
@@ -1549,7 +1603,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
                 info!(
                     "standby skip order submission market={} direction={} qty={} gross={}bps expected_net=${} gate_decision={} threshold={:?} samples={} recorded={} observe_only={} lease_required={}",
                     spec.market_id,
-                    opp.direction.as_str(spec.hedge),
+                    opp.direction.as_str(spec.first, spec.hedge),
                     opp.qty,
                     opp.gross_edge_bps,
                     opp.expected_net_usd,
@@ -1578,7 +1632,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
             warn!(
                 "reduce-only execution guard skipped non-reducing opportunity market={} direction={} qty={} pos_aster={} pos_lighter={}",
                 spec.market_id,
-                opp.direction.as_str(spec.hedge),
+                opp.direction.as_str(spec.first, spec.hedge),
                 opp.qty,
                 pos.aster_qty,
                 pos.lighter_qty
@@ -1590,13 +1644,13 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
         let final_now = Utc::now();
         let final_account = *account_rx.borrow();
         // A feed reset between the two reads is a skip, like the first read, not a process exit.
-        let Ok((final_aster, final_lighter)) = fetch_books(&spec, &aster_books, &lighter) else {
+        let Ok((final_aster, final_lighter)) = fetch_books(&spec, &aster, &lighter) else {
             wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
             continue;
         };
         if !execution_lease_enabled(&mut lease_cache, &options, &spec, final_now, want.is_some()).0
             || options.pause.as_ref().is_some_and(|pause| pause.load(Ordering::Acquire))
-            || !lighter.tx_ready() || !entry_gate.healthy() || !execution_journal.healthy() || session.unresolved()
+            || !lighter.tx_ready() || !aster.tx_ready() || !entry_gate.healthy() || !execution_journal.healthy() || session.unresolved()
             || !Arc::ptr_eq(&final_aster, &aster_book) || !Arc::ptr_eq(&final_lighter, &lighter_book)
             || !book_ok(&final_aster, final_now, cfg.arb.max_book_staleness_ms)
             || !book_ok(&final_lighter, final_now, cfg.arb.max_book_staleness_ms)
@@ -1786,7 +1840,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
         match refresh_account_snapshot(&spec.market_id, &aster, &lighter, &execution_epoch).await {
             Ok(snapshot) if snapshot.aster_open_orders == 0 && snapshot.lighter_open_orders == 0 => {
                 // Book errors join the shutdown result so they cannot mask `run_result`.
-                match fetch_books(&spec, &aster_books, &lighter) {
+                match fetch_books(&spec, &aster, &lighter) {
                     Ok((a_book, l_book)) if net_mismatch_notional(snapshot.position, &a_book, &l_book)
                         .is_some_and(|amount| amount <= cfg.risk.max_position_mismatch_usd) => session.clear_verified().await,
                     Ok(_) => Err(anyhow::anyhow!("shutdown position mismatch; session remains armed")),
@@ -1802,10 +1856,10 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
 
 fn fetch_books(
     spec: &MarketSpec,
-    aster_books: &AsterBookFeed,
+    aster: &FirstLeg,
     lighter: &OtherLeg,
 ) -> Result<(Arc<OrderBook>, Arc<OrderBook>)> {
-    let aster = aster_books.order_book_arc()?;
+    let aster = aster.order_book_arc(&spec.market_id)?;
     let lighter_book = lighter.order_book_arc(&spec.market_id)?;
     Ok((aster, lighter_book))
 }
@@ -2380,6 +2434,59 @@ pub(crate) fn aster_order_identity(outcome: &AsterOutcome, side: Side, qty: Deci
     identity
 }
 
+/// The first leg's IOC outcome: Aster's, or that of the venue standing in for it.
+enum FirstOutcome {
+    Aster(AsterOutcome),
+    Other(LighterOutcome),
+}
+
+impl std::fmt::Debug for FirstOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Aster(outcome) => outcome.fmt(f),
+            Self::Other(outcome) => outcome.fmt(f),
+        }
+    }
+}
+
+async fn submit_first_ioc(
+    first: &FirstLeg, market: &MarketId, side: Side, qty: Decimal, bound: Decimal, reduce_only: bool,
+) -> (FirstOutcome, Option<PendingFill>) {
+    match first {
+        FirstLeg::Aster { rest, .. } => (FirstOutcome::Aster(rest.submit_ioc_order(market, side, qty, bound, reduce_only).await), None),
+        FirstLeg::Other(leg) => {
+            let (outcome, pending) = leg.submit_market_order_deferred_fill(market, side, qty, bound, reduce_only).await;
+            (FirstOutcome::Other(outcome), pending)
+        }
+    }
+}
+
+fn first_order_identity(first: &FirstLeg, outcome: &FirstOutcome, side: Side, qty: Decimal) -> serde_json::Value {
+    match (first, outcome) {
+        (FirstLeg::Other(leg), FirstOutcome::Other(outcome)) => other_order_identity(leg, outcome, side, qty),
+        (_, FirstOutcome::Aster(outcome)) => aster_order_identity(outcome, side, qty),
+        (FirstLeg::Aster { .. }, FirstOutcome::Other(outcome)) => lighter_order_identity(outcome, side, qty),
+    }
+}
+
+async fn resolve_first_evidence(
+    spec: &MarketSpec, first: &FirstLeg, outcome: &FirstOutcome, pending: Option<PendingFill>,
+    side: Side, qty: Decimal, timeout: Duration,
+) -> LegEvidence {
+    match (first, outcome) {
+        (FirstLeg::Aster { rest, .. }, FirstOutcome::Aster(outcome)) => resolve_aster_evidence(spec, rest, outcome, timeout).await,
+        (FirstLeg::Other(leg), FirstOutcome::Other(outcome)) => resolve_lighter_evidence(spec, leg, outcome, pending, side, qty, timeout).await,
+        _ => LegEvidence::unresolved("the first leg's outcome is from another venue".to_string()),
+    }
+}
+
+/// A second-leg venue's order identity, naming that venue.
+fn other_order_identity(leg: &OtherLeg, outcome: &LighterOutcome, side: Side, qty: Decimal) -> serde_json::Value {
+    let mut identity = lighter_order_identity(outcome, side, qty);
+    identity["venue"] = serde_json::json!(leg.name());
+    identity
+}
+
 pub(crate) fn lighter_order_identity(outcome: &LighterOutcome, side: Side, qty: Decimal) -> serde_json::Value {
     let mut identity = match outcome {
         LighterOutcome::Accepted { client_order_index, tx_hash, nonce, .. }
@@ -2500,7 +2607,7 @@ pub(crate) async fn resolve_lighter_evidence(
 }
 
 async fn wait_position_evidence(
-    cfg: &Config, spec: &MarketSpec, aster: &AsterRest, lighter: &OtherLeg,
+    cfg: &Config, spec: &MarketSpec, aster: &FirstLeg, lighter: &OtherLeg,
     expected: PositionSnapshot, reference: Decimal,
 ) -> Result<PositionSnapshot> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -2518,7 +2625,7 @@ async fn wait_position_evidence(
 }
 
 async fn execute_opportunity(
-    cfg: &Config, spec: &MarketSpec, aster: &AsterRest, lighter: &OtherLeg,
+    cfg: &Config, spec: &MarketSpec, aster: &FirstLeg, lighter: &OtherLeg,
     opp: &Opportunity, pre_position: PositionSnapshot, margin_before: MarginSnapshot,
     reduce_only: bool, journal: &ExecutionJournal, session: &ActiveSession,
 ) -> std::result::Result<TradeReport, ExecutionError> {
@@ -2531,24 +2638,25 @@ async fn execute_opportunity(
     // The durable session was armed cold. This bounded queue operation never waits for disk.
     journal.try_append(ExecutionRecord::Start(ExecutionStart { schema_version:2,economic_status:"incomplete",
         timestamp:started_at,execution_id:execution_id.clone(),session_id:session.id().to_string(),
-        market:spec.market_id.to_string(),outcome:"submitting",direction:opp.direction.as_str(spec.hedge),qty:opp.qty }))?;
-    let (a_res, (l_res, pending)) = tokio::join!(
-        aster.submit_ioc_order(&spec.market_id, aster_side, opp.qty, aster_bound, reduce_only),
+        market:spec.market_id.to_string(),outcome:"submitting",direction:opp.direction.as_str(spec.first, spec.hedge),qty:opp.qty }))?;
+    let ((a_res, a_pending), (l_res, pending)) = tokio::join!(
+        submit_first_ioc(aster, &spec.market_id, aster_side, opp.qty, aster_bound, reduce_only),
         lighter.submit_market_order_deferred_fill(&spec.market_id, lighter_side, opp.qty, lighter_bound, reduce_only),
     );
-    let mut orders = vec![aster_order_identity(&a_res, aster_side, opp.qty), lighter_order_identity(&l_res, lighter_side, opp.qty)];
+    let mut orders = vec![first_order_identity(aster, &a_res, aster_side, opp.qty), other_order_identity(lighter, &l_res, lighter_side, opp.qty)];
     session.record_unresolved(serde_json::json!({ "schema_version": 2, "economic_status": "incomplete",
         "timestamp": Utc::now(), "execution_id": execution_id, "session_id": session.id(),
         "market": spec.market_id.to_string(), "outcome": "resolving", "orders": orders,
         "orders_complete": true, "pre_positions": {"aster_qty": pre_position.aster_qty, "lighter_qty": pre_position.lighter_qty} })).await?;
     let (a, l) = tokio::join!(
-        resolve_aster_evidence(spec, aster, &a_res, Duration::from_secs(10)),
+        resolve_first_evidence(spec, aster, &a_res, a_pending, aster_side, opp.qty, Duration::from_secs(10)),
         resolve_lighter_evidence(spec, lighter, &l_res, pending, lighter_side, opp.qty, Duration::from_secs(10)),
     );
     let mut row = serde_json::json!({
         "schema_version": 2, "economic_status": "incomplete", "timestamp": Utc::now(),
         "started_at": started_at, "execution_id": execution_id, "session_id": session.id(), "market": spec.market_id.to_string(),
-        "execution_mode": "concurrent_confirm_rescue", "direction": opp.direction.as_str(spec.hedge), "hedge_venue": spec.hedge,
+        "execution_mode": "concurrent_confirm_rescue", "direction": opp.direction.as_str(spec.first, spec.hedge),
+        "first_venue": spec.first, "hedge_venue": spec.hedge,
         "qty": opp.qty, "reduce_only": reduce_only, "orders": orders, "orders_complete": true,
         "aster_submit": format!("{a_res:?}"), "lighter_submit": format!("{l_res:?}"),
         "aster_confirmation": a, "lighter_confirmation": l,
@@ -2625,7 +2733,7 @@ async fn execute_opportunity(
             return Err(ExecutionError::Unreconciled { details: retry.error.unwrap_or_else(|| "missing hedge could not be completed".to_string()) });
         }
     }
-    let (a_open, l_open, margin_after) = tokio::join!(aster.open_orders(&spec.market_id),
+    let (a_open, l_open, margin_after) = tokio::join!(aster.open_orders_count(&spec.market_id),
         lighter.rest_open_orders_count(&spec.market_id), reconcile_margins(aster, lighter));
     let economics = match (aster_fill, lighter_fill) {
         (Some(a), Some(l)) => actual_economics(cfg, opp, a, l),
@@ -2639,7 +2747,7 @@ async fn execute_opportunity(
     row["lighter_client_order_index"] = serde_json::json!(lighter_client_order_index);
     row["final_positions"] = serde_json::json!({"aster_qty": position.aster_qty,
         "lighter_rest_qty": position.lighter_qty, "net_qty": position.net_qty()});
-    let clean_orders = a_open.as_ref().is_ok_and(|orders| orders.is_empty()) && l_open.as_ref().is_ok_and(|count| *count == 0);
+    let clean_orders = a_open.as_ref().is_ok_and(|count| *count == 0) && l_open.as_ref().is_ok_and(|count| *count == 0);
     row["outcome"] = serde_json::json!(if economics.is_ok() && clean_orders && margin_after.is_ok() { "success" } else { "accounting_unavailable" });
     if let Ok(economics) = &economics {
         row["economic_status"] = serde_json::json!("confirmed");
@@ -2656,9 +2764,8 @@ async fn execute_opportunity(
         session.resolve_execution().await?;
         return Err(ExecutionError::Skipped { details: "both legs confirmed terminal without fills".to_string() });
     }
-    let lighter_ws_qty = lighter.ws_position_qty(&spec.market_id).ok();
-    Ok(TradeReport { execution_id, lighter_fee_evidence, position, lighter_ws_qty,
-        lighter_ws_rest_divergence_qty: lighter_ws_qty.map(|ws| (ws - position.lighter_qty).abs()),
+    let (lighter_ws_qty, lighter_ws_rest_divergence_qty) = lighter_ws_divergence(aster, lighter, &spec.market_id, position);
+    Ok(TradeReport { execution_id, lighter_fee_evidence, position, lighter_ws_qty, lighter_ws_rest_divergence_qty,
         margin_before, margin_after, economics, aster_order_id, lighter_client_order_index, hedge_retry_action_taken })
 }
 
@@ -2689,6 +2796,7 @@ fn recovery_loss_row(spec: &MarketSpec, recovery: &RecoveryReport) -> TradeLedge
         actual_net_bps: Decimal::ZERO,
         fill_qty_mismatch: Decimal::ZERO,
         aster_fill: zero_fill_summary().with_fee_provenance(FeeProvenance::Unknown),
+        first_venue: spec.first,
         hedge_venue: spec.hedge,
         hedge_fill: zero_fill_summary().with_fee_provenance(FeeProvenance::Unknown),
         hedge_fee_evidence: Vec::new(),
@@ -2749,7 +2857,7 @@ fn pnl_trade_row(spec: &MarketSpec, opp: &Opportunity, report: &TradeReport) -> 
         source_event_id: Some(report.execution_id.clone()),
         timestamp: Utc::now(),
         market: spec.market_id.0.clone(),
-        direction: opp.direction.as_str(spec.hedge).to_string(),
+        direction: opp.direction.as_str(spec.first, spec.hedge).to_string(),
         qty: report
             .economics
             .aster_fill
@@ -2762,6 +2870,7 @@ fn pnl_trade_row(spec: &MarketSpec, opp: &Opportunity, report: &TradeReport) -> 
         actual_net_bps: report.economics.net_bps,
         fill_qty_mismatch: report.economics.fill_qty_mismatch,
         aster_fill: report.economics.aster_fill,
+        first_venue: spec.first,
         hedge_venue: spec.hedge,
         hedge_fill: report.economics.lighter_fill,
         hedge_fee_evidence: report.lighter_fee_evidence.clone(),
@@ -2972,7 +3081,7 @@ async fn submit_lighter_hedge_retry(
             Some("submission identity unavailable at deadline".to_string()), serde_json::json!({
                 "venue":"lighter","submitted":true,"identity_unavailable":true,"side":plan.side.as_str(),"qty":plan.qty}),Vec::new()),
     };
-    let identity = lighter_order_identity(&outcome, plan.side, plan.qty);
+    let identity = other_order_identity(lighter, &outcome, plan.side, plan.qty);
     let evidence = resolve_lighter_evidence(spec, lighter, &outcome, pending, plan.side, plan.qty,
         timeout.saturating_sub(start.elapsed())).await;
     (format!("{outcome:?}"), evidence.fill,
@@ -2982,7 +3091,7 @@ async fn submit_lighter_hedge_retry(
 async fn try_missing_hedge_retry(
     cfg: &Config,
     spec: &MarketSpec,
-    aster: &AsterRest,
+    aster: &FirstLeg,
     lighter: &OtherLeg,
     opp: &Opportunity,
     pre_position: PositionSnapshot,
@@ -3015,9 +3124,10 @@ async fn try_missing_hedge_retry(
             cfg.arb.hedge_retry_slippage_bps
         );
         let (submit_result, fill, fill_status, submit_error, identity, fee_evidence) = match plan.venue {
-            HedgeRetryVenue::Aster => {
-                submit_aster_hedge_retry(cfg, spec, aster, plan, reduce_only, timeout).await
-            }
+            HedgeRetryVenue::Aster => match aster {
+                FirstLeg::Aster { rest, .. } => submit_aster_hedge_retry(cfg, spec, rest, plan, reduce_only, timeout).await,
+                FirstLeg::Other(leg) => submit_lighter_hedge_retry(spec, leg, plan, reduce_only, timeout).await,
+            },
             HedgeRetryVenue::Lighter => {
                 submit_lighter_hedge_retry(spec, lighter, plan, reduce_only, timeout).await
             }
@@ -3044,7 +3154,7 @@ async fn try_missing_hedge_retry(
         let verified = tokio::time::timeout_at(deadline, async { tokio::join!(
             wait_post_trade_reconciled_for(cfg, spec, aster, lighter, opp,
                 deadline.saturating_duration_since(tokio::time::Instant::now())),
-            aster.open_orders(&spec.market_id),
+            aster.open_orders_count(&spec.market_id),
             lighter.rest_open_orders_count(&spec.market_id),
         ) }).await;
         let (reconciled, open_a, open_l) = match verified {
@@ -3053,12 +3163,12 @@ async fn try_missing_hedge_retry(
         };
         match (reconciled, open_a, open_l) {
             (Ok((position, net_notional)), Ok(aster_orders), Ok(lighter_orders))
-                if aster_orders.is_empty() && lighter_orders == 0 =>
+                if aster_orders == 0 && lighter_orders == 0 =>
             {
                 report.succeeded = true;
                 report.final_position = Some(position);
                 report.net_notional = Some(net_notional);
-                report.aster_open_orders = Some(aster_orders.len());
+                report.aster_open_orders = Some(aster_orders);
                 report.lighter_open_orders = Some(lighter_orders);
                 warn!(
                     "missing hedge retry succeeded attempt={} venue={} final_aster={} final_lighter={} net_notional=${}",
@@ -3074,11 +3184,11 @@ async fn try_missing_hedge_retry(
                 current_position = position;
                 report.final_position = Some(position);
                 report.net_notional = Some(net_notional);
-                report.aster_open_orders = Some(aster_orders.len());
+                report.aster_open_orders = Some(aster_orders);
                 report.lighter_open_orders = Some(lighter_orders);
                 report.error = Some(format!(
                     "hedge retry left open orders: aster={} lighter={}",
-                    aster_orders.len(),
+                    aster_orders,
                     lighter_orders
                 ));
             }
@@ -3091,7 +3201,7 @@ async fn try_missing_hedge_retry(
                 report.error = Some(format!(
                     "hedge retry verification failed: reconciled={:?} aster_open={:?} lighter_open={:?}",
                     reconciled.as_ref().map(|(_, notional)| *notional),
-                    open_a.as_ref().map(|orders| orders.len()),
+                    open_a,
                     open_l
                 ));
             }
@@ -3145,7 +3255,7 @@ fn hedge_retry_report_json(report: Option<&HedgeRetryReport>) -> serde_json::Val
 async fn wait_post_trade_reconciled_for(
     cfg: &Config,
     spec: &MarketSpec,
-    aster: &AsterRest,
+    aster: &FirstLeg,
     lighter: &OtherLeg,
     opp: &Opportunity,
     timeout: Duration,
@@ -3188,7 +3298,7 @@ async fn wait_post_trade_reconciled_for(
 }
 
 async fn recover_if_needed(
-    cfg: &Config, spec: &MarketSpec, aster: &AsterRest, lighter: &OtherLeg,
+    cfg: &Config, spec: &MarketSpec, aster: &FirstLeg, lighter: &OtherLeg,
     http: &reqwest::Client, margin_before: MarginSnapshot, session: &ActiveSession,
     journal: &ExecutionJournal,
 ) -> Result<RecoveryReport> {
@@ -3202,12 +3312,11 @@ async fn recover_if_needed(
         for attempt in 0..=3 {
             let (position, a_book, l_book) = tokio::join!(
                 reconcile_positions(&spec.market_id, aster, lighter),
-                rest_book::fetch_aster_book(http, &cfg.venues.aster_base_url, &spec.aster_symbol, 20),
-                async { match &*lighter {
-                    OtherLeg::Lighter(_) => rest_book::fetch_lighter_book(http, &cfg.venues.lighter_base_url, spec.lighter_market_id, 20).await,
-                    OtherLeg::Hyperliquid(_) => crate::connectors::rest_book::fetch_hyperliquid_book(http, &cfg.venues.hyperliquid_base_url, &spec.lighter_symbol)
-                        .await.map(crate::taker::venues::hyperliquid::taker_book),
+                async { match aster {
+                    FirstLeg::Aster { .. } => rest_book::fetch_aster_book(http, &cfg.venues.aster_base_url, &spec.aster_symbol, 20).await,
+                    FirstLeg::Other(leg) => fetch_other_rest_book(http, cfg, leg, &spec.first_leg_view()).await,
                 } },
+                fetch_other_rest_book(http, cfg, lighter, spec),
             );
             let position = position?;
             if baseline.is_none() { baseline = Some(position); }
@@ -3219,12 +3328,12 @@ async fn recover_if_needed(
             // Recovery removes the unhedged residual only; the hedged inventory stays open.
             let balanced = position.net_qty().abs() * mark <= cfg.risk.max_position_mismatch_usd;
             if balanced {
-                let (a_open, l_open, margins) = tokio::join!(aster.open_orders(&spec.market_id),
+                let (a_open, l_open, margins) = tokio::join!(aster.open_orders_count(&spec.market_id),
                     lighter.rest_open_orders_count(&spec.market_id), reconcile_margins(aster, lighter));
-                anyhow::ensure!(a_open?.is_empty() && l_open? == 0, "recovery has unverified/live open orders");
+                anyhow::ensure!(a_open? == 0 && l_open? == 0, "recovery has unverified/live open orders");
                 let margins = margins?;
                 return Ok::<_, anyhow::Error>(RecoveryReport { execution_id: execution_id.clone(), action_taken,
-                    position, lighter_ws_qty: lighter.ws_position_qty(&spec.market_id).ok(),
+                    position, lighter_ws_qty: lighter_ws_divergence(aster, lighter, &spec.market_id, position).0,
                     margin_after: margins, estimated_loss_usdc: estimated_recovery_loss(margin_before, margins),
                     aster_open_orders: 0, lighter_open_orders: 0 });
             }
@@ -3234,7 +3343,7 @@ async fn recover_if_needed(
             in_flight = true;
             let (a_result, l_result) = tokio::join!(
                 async { if a_qty > Decimal::ZERO {
-                    Some(aster.submit_ioc_order(&spec.market_id, a_side, a_qty,
+                    Some(submit_first_ioc(aster, &spec.market_id, a_side, a_qty,
                         emergency_close_bound(mark, a_side, cfg.arb.emergency_slippage_bps), true).await)
                 } else { None } },
                 async { if l_qty > Decimal::ZERO {
@@ -3243,8 +3352,8 @@ async fn recover_if_needed(
                 } else { None } },
             );
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now()).min(Duration::from_secs(5));
-            if let Some(outcome) = &a_result { orders.push(aster_order_identity(outcome, a_side, a_qty)); }
-            if let Some((outcome, _)) = &l_result { orders.push(lighter_order_identity(outcome, l_side, l_qty)); }
+            if let Some((outcome, _)) = &a_result { orders.push(first_order_identity(aster, outcome, a_side, a_qty)); }
+            if let Some((outcome, _)) = &l_result { orders.push(other_order_identity(lighter, outcome, l_side, l_qty)); }
             in_flight = false;
             session.record_unresolved(serde_json::json!({"schema_version":2,"economic_status":"incomplete",
                 "execution_id":execution_id,"session_id":session.id(),"market":spec.market_id.to_string(),
@@ -3252,8 +3361,8 @@ async fn recover_if_needed(
                 "pre_positions":baseline.map(|position|serde_json::json!({"aster_qty":position.aster_qty,"lighter_qty":position.lighter_qty}))})).await?;
             action_taken |= a_result.is_some() || l_result.is_some();
             let (a_evidence, l_evidence) = tokio::join!(
-                async { match &a_result {
-                    Some(outcome) => resolve_aster_evidence(spec, aster, outcome, remaining).await,
+                async { match a_result {
+                    Some((outcome, pending)) => resolve_first_evidence(spec, aster, &outcome, pending, a_side, a_qty, remaining).await,
                     None => LegEvidence::not_submitted(),
                 } },
                 async { match l_result {
@@ -3352,7 +3461,7 @@ fn emergency_close_bound(mark: Decimal, side: Side, bps: Decimal) -> Decimal {
 
 async fn reconcile_positions(
     market: &MarketId,
-    aster: &AsterRest,
+    aster: &FirstLeg,
     lighter: &OtherLeg,
 ) -> Result<PositionSnapshot> {
     let (a, l) = tokio::join!(
@@ -3367,39 +3476,36 @@ async fn reconcile_positions(
 
 async fn refresh_account_snapshot(
     market: &MarketId,
-    aster: &AsterRest,
+    aster: &FirstLeg,
     lighter: &OtherLeg,
     execution_epoch: &AtomicU64,
 ) -> Result<AccountSnapshot> {
     let epoch = execution_epoch.load(Ordering::Acquire);
     anyhow::ensure!(epoch % 2 == 0, "execution active; account refresh deferred");
     let observed_at = tokio::time::Instant::now();
-    let (aster_pos, aster_balance, lighter_account, aster_orders, lighter_orders) = tokio::join!(
-        aster.position_qty(market),
-        aster.balance_snapshot(),
+    let (aster_account, lighter_account, aster_orders, lighter_orders) = tokio::join!(
+        aster.account_snapshot(market),
         lighter.account_snapshot(market),
-        aster.open_orders(market),
+        aster.open_orders_count(market),
         lighter.rest_open_orders_count(market)
     );
     anyhow::ensure!(execution_epoch.load(Ordering::Acquire) == epoch,
         "execution changed while account query was in flight");
-    let lighter_account = lighter_account?;
-    let aster_balance = aster_balance?;
+    let (aster_account, lighter_account) = (aster_account?, lighter_account?);
     let position = PositionSnapshot {
-        aster_qty: aster_pos?,
+        aster_qty: aster_account.position_qty,
         lighter_qty: lighter_account.position_qty,
     };
-    let lighter_ws_qty = lighter.ws_position_qty(market).ok();
-    let lighter_ws_rest_divergence_qty = lighter_ws_qty.map(|ws| (ws - position.lighter_qty).abs());
+    let (lighter_ws_qty, lighter_ws_rest_divergence_qty) = lighter_ws_divergence(aster, lighter, market, position);
     let margins = MarginSnapshot {
-        aster_available_usd: aster_balance.available_usd,
+        aster_available_usd: aster_account.available_usdc,
         lighter_available_usd: lighter_account.available_usdc,
-        aster_equity_usd: aster_balance.equity_usd(),
+        aster_equity_usd: aster_account.equity_usdc(),
         lighter_equity_usd: lighter_account.equity_usdc(),
     };
     Ok(AccountSnapshot {
         execution_epoch: epoch,
-        aster_open_orders: aster_orders?.len(),
+        aster_open_orders: aster_orders?,
         lighter_open_orders: lighter_orders?,
         position,
         lighter_ws_qty,
@@ -3409,10 +3515,29 @@ async fn refresh_account_snapshot(
     })
 }
 
+/// The Lighter leg's websocket position and how far the REST one is from it: the first leg's
+/// when Lighter stands in for Aster, else the second's (Hyperliquid pushes none).
+fn lighter_ws_divergence(aster: &FirstLeg, lighter: &OtherLeg, market: &MarketId, position: PositionSnapshot) -> (Option<Decimal>, Option<Decimal>) {
+    let (ws, rest) = match aster.ws_position_qty(market) {
+        Some(ws) => (Some(ws), position.aster_qty),
+        None => (lighter.ws_position_qty(market).ok(), position.lighter_qty),
+    };
+    (ws, ws.map(|ws| (ws - rest).abs()))
+}
+
+/// A second-leg venue's REST book, for the market `spec` describes in its `lighter_*` fields.
+async fn fetch_other_rest_book(http: &reqwest::Client, cfg: &Config, leg: &OtherLeg, spec: &MarketSpec) -> Result<OrderBook> {
+    match leg {
+        OtherLeg::Lighter(_) => rest_book::fetch_lighter_book(http, &cfg.venues.lighter_base_url, spec.lighter_market_id, 20).await,
+        OtherLeg::Hyperliquid(_) => crate::connectors::rest_book::fetch_hyperliquid_book(http, &cfg.venues.hyperliquid_base_url, &spec.lighter_symbol)
+            .await.map(crate::taker::venues::hyperliquid::taker_book),
+    }
+}
+
 fn spawn_account_snapshot_refresher(
     cfg: &Config,
     market: MarketId,
-    aster: Arc<AsterRest>,
+    aster: Arc<FirstLeg>,
     lighter: Arc<OtherLeg>,
     tx: watch::Sender<AccountSnapshot>,
     execution_epoch: Arc<AtomicU64>,
@@ -3485,15 +3610,15 @@ fn is_rate_limit_error(error: &anyhow::Error) -> bool {
     })
 }
 
-async fn reconcile_margins(aster: &AsterRest, lighter: &OtherLeg) -> Result<MarginSnapshot> {
+async fn reconcile_margins(aster: &FirstLeg, lighter: &OtherLeg) -> Result<MarginSnapshot> {
     // Same endpoints as the available-only reads (Aster /fapi/v3/balance, Lighter
     // account payload), so carrying equity costs no extra REST calls.
-    let (a, l) = tokio::join!(aster.balance_snapshot(), lighter.rest_margin_snapshot());
+    let (a, l) = tokio::join!(aster.margin_snapshot(), lighter.rest_margin_snapshot());
     let (a, l) = (a?, l?);
     Ok(MarginSnapshot {
-        aster_available_usd: a.available_usd,
+        aster_available_usd: a.available_usdc,
         lighter_available_usd: l.available_usdc,
-        aster_equity_usd: a.equity_usd(),
+        aster_equity_usd: a.equity_usdc,
         lighter_equity_usd: l.equity_usdc,
     })
 }
@@ -3501,27 +3626,26 @@ async fn reconcile_margins(aster: &AsterRest, lighter: &OtherLeg) -> Result<Marg
 async fn ensure_clean_start(
     cfg: &Config,
     spec: &MarketSpec,
-    aster_books: &AsterBookFeed,
-    aster: &AsterRest,
+    aster: &FirstLeg,
     lighter: &OtherLeg,
     observe_only: bool,
 ) -> Result<()> {
     let pos = reconcile_positions(&spec.market_id, aster, lighter).await?;
-    let lighter_ws_qty = lighter.ws_position_qty(&spec.market_id).ok();
-    let (aster_book, lighter_book) = fetch_books(spec, aster_books, lighter)?;
-    let open_a = aster.open_orders(&spec.market_id).await?;
+    let (lighter_ws_qty, divergence_qty) = lighter_ws_divergence(aster, lighter, &spec.market_id, pos);
+    let (aster_book, lighter_book) = fetch_books(spec, aster, lighter)?;
+    let open_a = aster.open_orders_count(&spec.market_id).await?;
     let open_l = lighter.open_orders_count(&spec.market_id).await?;
-    if !open_a.is_empty() || open_l > 0 {
+    if open_a > 0 || open_l > 0 {
         if observe_only {
             warn!(
                 "observe-only start: existing open orders present; continuing without order submission: Aster open_orders={} Lighter open_orders={}",
-                open_a.len(),
+                open_a,
                 open_l
             );
         } else {
             bail!(
                 "clean-start failed: Aster open_orders={} Lighter open_orders={}",
-                open_a.len(),
+                open_a,
                 open_l
             );
         }
@@ -3531,8 +3655,8 @@ async fn ensure_clean_start(
         .or_else(|| lighter_book.mid())
         .unwrap_or(Decimal::ONE);
     let mismatch = pos.net_qty().abs() * mark;
-    if let Some(ws_qty) = lighter_ws_qty {
-        let divergence_notional = (ws_qty - pos.lighter_qty).abs() * mark;
+    if let (Some(ws_qty), Some(divergence_qty)) = (lighter_ws_qty, divergence_qty) {
+        let divergence_notional = divergence_qty * mark;
         if divergence_notional > cfg.risk.max_position_mismatch_usd {
             bail!(
                 "clean-start failed: Lighter REST/WS position divergence rest={} ws={} divergence_notional=${}",
@@ -3567,7 +3691,7 @@ async fn ensure_clean_start(
         pos.aster_qty,
         pos.lighter_qty,
         lighter_ws_qty,
-        open_a.len(),
+        open_a,
         open_l,
         observe_only
     );
@@ -3657,6 +3781,24 @@ mod tests {
     use rust_decimal_macros::dec;
 
     #[test]
+    fn each_leg_pays_its_own_venue_fee() {
+        let shipped: toml::Value = toml::from_str(include_str!("../../bot.toml")).unwrap();
+        let cfg = Config::from_table(shipped["taker"].clone()).unwrap();
+        // Aster 4, Lighter 0, Hyperliquid 4.5, and the 2 bps margin.
+        for (market, edge) in [("HYPE", dec!(6.0)), ("HYPE-HL", dec!(10.5)), ("HYPE-LH", dec!(6.5))] {
+            let (m, mut priced) = (&cfg.select_markets(Some(market))[0], cfg.clone());
+            price_legs(&mut priced, m.first_venue, m.hedge_venue).unwrap();
+            assert_eq!(priced.arb.required_gross_edge_bps(), edge, "{market}");
+        }
+        let mut refused = shipped["taker"].clone();
+        refused["markets"][2].as_table_mut().unwrap().insert("aster_symbol".into(), "HYPEUSDT".into());
+        assert!(Config::from_table(refused).is_err(), "a Lighter first leg has no Aster symbol");
+        let mut refused = shipped["taker"].clone();
+        refused["markets"][2]["hedge_venue"] = "lighter".into();
+        assert!(Config::from_table(refused).is_err(), "Lighter cannot be both legs");
+    }
+
+    #[test]
     fn a_missing_book_warns_once_then_every_five_seconds() {
         let (t0, ms) = (tokio::time::Instant::now(), Duration::from_millis);
         let mut outage = BookOutage::default();
@@ -3724,7 +3866,7 @@ mod tests {
             lighter_market_id: 24,
             lighter_price_decimals: 4,
             lighter_size_decimals: 2,
-            lighter_price_tick: dec!(0.0001), hedge: Default::default(),
+            lighter_price_tick: dec!(0.0001), hedge: Default::default(), first: Default::default(), first_market_index: 0,
             tick: dec!(0.001),
             step: dec!(0.01),
             aster_min_qty: dec!(0.01),

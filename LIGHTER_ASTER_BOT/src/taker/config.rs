@@ -122,6 +122,10 @@ impl Config {
             if !ids.insert(m.id().0) {
                 bail!("duplicate market_id in [[markets]]");
             }
+            let aster_first = m.first_venue == crate::config::FirstVenue::Aster;
+            if aster_first == m.aster_symbol.is_empty() || !(aster_first || m.hedge_venue == crate::config::HedgeVenue::Hyperliquid) {
+                bail!("{}: an Aster first leg needs aster_symbol; a Lighter one has none and trades against hedge_venue = \"hyperliquid\"", m.id());
+            }
         }
         Ok(())
     }
@@ -541,8 +545,12 @@ impl Default for RiskCfg {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketCfg {
+    #[serde(default)]
+    pub first_venue: crate::config::FirstVenue,
+    /// Empty unless the first leg is Aster.
+    #[serde(default)]
     pub aster_symbol: String,
-    /// The second leg's coin, on Hyperliquid as on Lighter.
+    /// The coin on each leg that is not Aster: Lighter's or Hyperliquid's.
     pub lighter_symbol: String,
     #[serde(default)]
     pub hedge_venue: crate::config::HedgeVenue,
@@ -576,6 +584,7 @@ mod tests {
             venues: VenueCfg::default(),
             risk: RiskCfg::default(),
             markets: vec![MarketCfg {
+                first_venue: Default::default(),
                 aster_symbol: "HYPEUSDT".to_string(),
                 lighter_symbol: "HYPE".to_string(),
                 hedge_venue: Default::default(),

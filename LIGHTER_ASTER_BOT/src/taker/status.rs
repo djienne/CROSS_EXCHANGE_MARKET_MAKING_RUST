@@ -508,7 +508,7 @@ fn direction_status(
     };
 
     DirectionStatus {
-        direction: direction.as_str(spec.hedge),
+        direction: direction.as_str(spec.first, spec.hedge),
         aster_side: direction.aster_side().as_str(),
         lighter_side: direction.lighter_side().as_str(),
         gross_edge_bps,
@@ -545,7 +545,7 @@ fn direction_status(
 fn empty_direction(direction: Direction, reason: &'static str) -> DirectionStatus {
     DirectionStatus {
         // `taker status` reads Lighter markets only.
-        direction: direction.as_str(crate::config::HedgeVenue::Lighter),
+        direction: direction.as_str(Default::default(), crate::config::HedgeVenue::Lighter),
         aster_side: direction.aster_side().as_str(),
         lighter_side: direction.lighter_side().as_str(),
         gross_edge_bps: None,

@@ -319,6 +319,9 @@ pub struct TradeLedgerRow {
     pub actual_net_bps: Decimal,
     pub fill_qty_mismatch: Decimal,
     pub aster_fill: FillSummary,
+    /// The first leg's venue, whose fill `aster_fill` is; rows from before it were Aster's.
+    #[serde(default)]
+    pub first_venue: crate::config::FirstVenue,
     /// The second leg's venue; rows from before it hedged on Lighter.
     #[serde(default)]
     pub hedge_venue: crate::config::HedgeVenue,
@@ -663,6 +666,7 @@ mod tests {
             fill_qty_mismatch: Decimal::ZERO,
             aster_fill: FillSummary::from_qty_notional(dec!(0.17), dec!(10), Decimal::ZERO)
                 .unwrap(),
+            first_venue: Default::default(),
             hedge_venue: Default::default(),
             hedge_fill: FillSummary::from_qty_notional(dec!(0.17), dec!(10), Decimal::ZERO)
                 .unwrap(),

@@ -1,4 +1,5 @@
-//! The supervisor loop: runs both engine tasks for the whole session and halts fail-closed.
+//! The supervisor loop: runs both engine tasks (or a lone taker) for the whole session and
+//! halts fail-closed.
 //! * at start: both venues verified clear, then XEMM and the taker spawned once;
 //! * every 250 ms: an engine that exited halts the bot;
 //! * every `poll_sec` (`tick`): read the accounts' status, update the loss stops and the
@@ -81,6 +82,10 @@ pub struct EngineIo {
 
 /// What the supervisor drives: the real engines in production, fakes in tests.
 pub trait Engines {
+    /// The engines to run, in stop order.
+    fn bots(&self) -> &'static [Bot] {
+        &[Bot::Xemm, Bot::Taker]
+    }
     fn spawn(&mut self, bot: Bot, io: &EngineIo, stop: CancellationToken) -> JoinHandle<Result<()>>;
     /// The status of the accounts both engines trade, as JSON (`livebot::status`).
     fn status(&self) -> impl Future<Output = Result<Value>>;
@@ -210,13 +215,17 @@ impl<E: Engines> Supervisor<E> {
     pub async fn run(mut self) -> Result<()> {
         self.events.emit("bot_started", json!({"market": self.market, "run_mode": self.run_mode.as_str()}));
         self.trades.prime();
-        // In-process engines die with the process: a crash can leave orders resting, so no
-        // engine starts until both venues are verified clear.
-        if let Err(status) = self.verify_orders_clear(STARTUP_ORDERS_CLEAR_TIMEOUT).await {
-            self.safe_halt("startup_orders_not_clear", json!({"xemm_status": status})).await;
+        // In-process engines die with the process: a crash can leave XEMM's quotes resting, so
+        // no engine starts until both venues are verified clear. A lone taker sends only IOCs,
+        // and its own clean-start check refuses any open order.
+        let bots = self.engines.bots();
+        if bots.contains(&Bot::Xemm) {
+            if let Err(status) = self.verify_orders_clear(STARTUP_ORDERS_CLEAR_TIMEOUT).await {
+                self.safe_halt("startup_orders_not_clear", json!({"xemm_status": status})).await;
+            }
         }
         if !self.stopping() {
-            for bot in [Bot::Xemm, Bot::Taker] {
+            for &bot in bots {
                 let stop = CancellationToken::new();
                 let handle = self.engines.spawn(bot, &self.io, stop.clone());
                 self.events.emit("bot_started_engine", json!({"bot": bot.label()}));
@@ -255,7 +264,7 @@ impl<E: Engines> Supervisor<E> {
 
     /// Who holds the execution rights now.
     fn rights(&self) -> &'static str {
-        if self.io.lease.borrow().is_some() { "taker" } else { "xemm" }
+        if self.io.lease.borrow().is_some() || !self.engines.bots().contains(&Bot::Xemm) { "taker" } else { "xemm" }
     }
 
     async fn tick(&mut self) {
@@ -332,7 +341,8 @@ impl<E: Engines> Supervisor<E> {
         };
         self.equity_failures = 0;
         let accounts = status.get("accounts").cloned().unwrap_or(Value::Null);
-        self.equity.record(equity, XEMM_BOT, &accounts, Utc::now(), &mut self.events)
+        let source = self.engines.bots()[0].label();
+        self.equity.record(equity, source, &accounts, Utc::now(), &mut self.events)
     }
 
     /// Stops XEMM, then the taker; the first failure is returned once both were tried.
@@ -382,13 +392,15 @@ impl<E: Engines> Supervisor<E> {
     /// `halt` is set once a safe halt latched.
     fn write_state(&mut self, status: Option<&Value>, halt: Value) {
         let field = |key: &str| status.and_then(|s| s.get(key)).cloned().unwrap_or(Value::Null);
+        // Whose status it is: XEMM's, or a lone taker's.
+        let source = if self.engines.bots().contains(&Bot::Xemm) { "xemm" } else { "taker" };
         let state = json!({
             "timestamp": iso(Utc::now()), "market": self.market, "run_mode": self.run_mode.as_str(),
             "rights": self.rights(), "halt": halt,
             "pnl": self.equity.summary(),
             "trades": self.trades.summary(),
-            "positions": {"xemm": field("positions")},
-            "accounts": {"xemm": field("accounts")},
+            "positions": {source: field("positions")},
+            "accounts": {source: field("accounts")},
         });
         if let Err(error) = write_json_atomic(&self.files.state, &state, false) {
             self.events.emit("state_write_failed", json!({"error": format!("{error:#}")}));

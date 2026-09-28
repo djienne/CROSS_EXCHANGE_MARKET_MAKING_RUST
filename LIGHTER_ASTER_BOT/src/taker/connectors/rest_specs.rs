@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
-use crate::config::HedgeVenue;
+use crate::config::{FirstVenue, HedgeVenue};
 use crate::taker::config::MarketCfg;
 use crate::taker::decimal::parse_dec;
 use crate::taker::markets::MarketSpec;
@@ -42,8 +42,14 @@ pub async fn build_market_specs(
     hyperliquid_base_url: Option<&str>,
 ) -> Result<Vec<MarketSpec>> {
     let client = client()?;
-    let aster = fetch_aster_exchange_info(&client, aster_base_url).await?;
-    let needs_lighter_rest = markets.iter().any(|m| m.hedge_venue == HedgeVenue::Lighter && manual_lighter_meta(m).is_none());
+    let aster = if markets.iter().any(|m| m.first_venue == FirstVenue::Aster) {
+        fetch_aster_exchange_info(&client, aster_base_url).await?
+    } else {
+        HashMap::new()
+    };
+    let needs_lighter_rest = markets.iter().any(|m| {
+        (m.hedge_venue == HedgeVenue::Lighter || m.first_venue == FirstVenue::Lighter) && manual_lighter_meta(m).is_none()
+    });
     let lighter = if needs_lighter_rest {
         fetch_lighter_meta(&client, lighter_base_url).await?
     } else {
@@ -52,20 +58,29 @@ pub async fn build_market_specs(
 
     let mut specs = Vec::new();
     for m in markets {
-        let symbol = m.aster_symbol.to_ascii_uppercase();
-        let (tick, step, min_qty, min_notional) = aster
-            .get(&symbol)
-            .copied()
-            .ok_or_else(|| anyhow!("Aster symbol {} not found in exchangeInfo", m.aster_symbol))?;
-        let lm = match (m.hedge_venue, hyperliquid_base_url) {
-            (HedgeVenue::Lighter, _) => manual_lighter_meta(m)
+        let lighter_meta = || {
+            manual_lighter_meta(m)
                 .or_else(|| lighter.get(&m.lighter_symbol.to_ascii_uppercase()).cloned())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Lighter symbol {} not configured and not found in orderBooks",
-                        m.lighter_symbol
-                    )
-                })?,
+                .ok_or_else(|| anyhow!("Lighter symbol {} not configured and not found in orderBooks", m.lighter_symbol))
+        };
+        // Lighter's minimum size is one size step, as its hedges assume.
+        let (symbol, (tick, step, min_qty, min_notional), first_market_index) = match m.first_venue {
+            FirstVenue::Aster => {
+                let symbol = m.aster_symbol.to_ascii_uppercase();
+                let filters = aster
+                    .get(&symbol)
+                    .copied()
+                    .ok_or_else(|| anyhow!("Aster symbol {} not found in exchangeInfo", m.aster_symbol))?;
+                (symbol, filters, 0)
+            }
+            FirstVenue::Lighter => {
+                let lm = lighter_meta()?;
+                let step = Decimal::new(1, lm.size_decimals);
+                (lm.symbol, (Decimal::new(1, lm.price_decimals), step, step, lm.min_quote_amount), lm.market_id)
+            }
+        };
+        let lm = match (m.hedge_venue, hyperliquid_base_url) {
+            (HedgeVenue::Lighter, _) => lighter_meta()?,
             (HedgeVenue::Hyperliquid, Some(base)) => hyperliquid_meta(&client, base, &m.lighter_symbol).await?,
             (HedgeVenue::Hyperliquid, None) => bail!("{} hedges on Hyperliquid, which this command does not trade", m.id()),
         };
@@ -84,6 +99,8 @@ pub async fn build_market_specs(
             lighter_qty_step: Decimal::new(1, lm.size_decimals),
             lighter_min_notional: lm.min_quote_amount,
             hedge: m.hedge_venue,
+            first: m.first_venue,
+            first_market_index,
         });
     }
     Ok(specs)

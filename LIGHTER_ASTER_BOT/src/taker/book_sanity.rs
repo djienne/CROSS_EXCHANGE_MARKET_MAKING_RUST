@@ -162,7 +162,7 @@ struct VenueSanityReport {
 pub fn start(
     cfg: Config,
     spec: MarketSpec,
-    aster_books: AsterBookFeed,
+    aster_books: Option<AsterBookFeed>,
     lighter: Arc<OtherLeg>,
     http: reqwest::Client,
 ) -> BookSanityHandle {
@@ -172,9 +172,9 @@ pub fn start(
     if let Err(e) = persist_snapshot(&state_path, &handle.snapshot()) {
         warn!("failed to initialize book sanity state {}: {e:#}", state_path.display());
     }
-    if !cfg.arb.book_sanity.enabled {
+    let Some(aster_books) = aster_books.filter(|_| cfg.arb.book_sanity.enabled) else {
         return handle;
-    }
+    };
 
     info!(
         "book_sanity enabled market={} interval_ms={} top_threshold={}bps vwap_threshold={}bps required_failures={} required_successes={} block_cooldown_ms={} rest_depth_levels={} liquidity_multiple={}",
@@ -503,7 +503,7 @@ mod tests {
             lighter_market_id: 24,
             lighter_price_decimals: 4,
             lighter_size_decimals: 2,
-            lighter_price_tick: dec!(0.0001), hedge: Default::default(),
+            lighter_price_tick: dec!(0.0001), hedge: Default::default(), first: Default::default(), first_market_index: 0,
             step: dec!(0.01),
             tick: dec!(0.001),
             aster_min_qty: dec!(0.01),

@@ -5,15 +5,16 @@
 # never baked. The runs/ dir (journals, ledgers, latches, controller state) is a persistent
 # bind mount.
 #
-# `docker compose build` / `up -d` touch only `dryrun` and `dryrun-hl`, the same bot against
-# simulated venues (no credentials, files in runs/dry-run/, image lighter_aster_bot:dryrun;
-# `dryrun-hl` trades HYPE-HL, hedged on Hyperliquid), and `recorder`, the
+# `docker compose build` / `up -d` touch only `dryrun`, `dryrun-hl` and `dryrun-lh`, the same bot
+# against simulated venues (no credentials, files in runs/dry-run/, image lighter_aster_bot:dryrun;
+# `dryrun-hl` trades HYPE-HL, hedged on Hyperliquid; `dryrun-lh` HYPE-LH, taker only on Lighter
+# against Hyperliquid), and `recorder`, the
 # market-data tape for backtests (public data only, files in data/). The real-money
 # `bot` service sits behind the `live` profile: only a command naming it builds or starts it,
 # so never set COMPOSE_PROFILES=live here.
 #
 # ---- Dry run (safe unattended; the fleet's start_all.bat starts it) ---------------
-#   docker compose up -d --build dryrun dryrun-hl
+#   docker compose up -d --build dryrun dryrun-hl dryrun-lh
 #   docker compose logs -f dryrun
 #   docker compose restart dryrun     # after a halt: the restart is the review
 #
@@ -106,6 +107,17 @@ services:
     container_name: lighter-aster-dryrun-hl
     command: ["run", "--market", "HYPE-HL", "--mode", "dry-run", "--ack-breaker"]
     # Declared again: cpu_limits.bat keeps each service's own `cpus`.
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+
+  # HYPE-LH: the taker alone, Lighter against Hyperliquid (no Aster leg, so no XEMM).
+  dryrun-lh:
+    <<: *dryrun
+    container_name: lighter-aster-dryrun-lh
+    command: ["run", "--market", "HYPE-LH", "--mode", "dry-run", "--ack-breaker"]
     deploy:
       resources:
         limits:

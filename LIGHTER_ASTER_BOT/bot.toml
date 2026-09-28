@@ -108,6 +108,18 @@ aster_symbol = "HYPEUSDT"
 lighter_symbol = "HYPE"
 hedge_venue = "hyperliquid"
 
+# Taker only: Lighter against Hyperliquid, with no Aster leg for XEMM to quote on. Each leg pays
+# its own venue's fee: 0 + 4.5 + margin 2 = 6.5 bps of required edge.
+[[taker.markets]]
+market_id = "HYPE-LH"
+first_venue = "lighter"
+lighter_symbol = "HYPE"
+lighter_market_index = 24
+lighter_size_decimals = 2
+lighter_price_decimals = 4
+lighter_min_notional = "10"
+hedge_venue = "hyperliquid"
+
 [maker.edge]
 # The required quoted edge is 14 + 1.5 + 2 + 1 = 18.5 bps above configured
 # fees. This is an admission estimate; realized outcomes depend on fills and
