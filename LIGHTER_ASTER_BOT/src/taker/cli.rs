@@ -303,7 +303,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let buy = timed_aster_ioc(&aster, &spec, qty, ask.px * (Decimal::ONE + bps_to_rate(cfg.arb.max_aster_slippage_bps)), "buy").await;
             let closed = std::cell::Cell::new(Decimal::ZERO);
             let operation = async {
-                let miss = crate::taker::arb::resolve_aster_evidence(&spec, &aster, &miss, Duration::from_secs(5)).await;
+                let miss = crate::taker::arb::resolve_aster_evidence(&spec, &aster, &miss, Duration::from_secs(5), true).await;
                 anyhow::ensure!(miss.terminal && miss.qty == Some(Decimal::ZERO), "the IOC under the bid did not end unfilled");
                 ensure_accepted("buy", &buy)?;
                 let t = std::time::Instant::now();
@@ -584,7 +584,7 @@ async fn cleanup_aster_diagnostic(
     let mut orders = vec![crate::taker::arb::aster_order_identity(buy, Side::Buy, quantity)];
     let mut in_flight = false;
     let result = tokio::time::timeout(Duration::from_secs(30), async {
-        let buy_evidence = crate::taker::arb::resolve_aster_evidence(spec, aster, buy, Duration::from_secs(10)).await;
+        let buy_evidence = crate::taker::arb::resolve_aster_evidence(spec, aster, buy, Duration::from_secs(10), true).await;
         anyhow::ensure!(buy_evidence.terminal, "initial Aster buy is unresolved");
         let mut expected = buy_evidence.qty.context("Aster buy quantity unavailable")? - closed.get();
         let http = rest_book::client()?;
@@ -615,7 +615,7 @@ async fn cleanup_aster_diagnostic(
             orders.push(crate::taker::arb::aster_order_identity(&close, Side::Sell, qty));
             in_flight = false;
             attempts += 1;
-            let evidence = crate::taker::arb::resolve_aster_evidence(spec, aster, &close, Duration::from_secs(5)).await;
+            let evidence = crate::taker::arb::resolve_aster_evidence(spec, aster, &close, Duration::from_secs(5), true).await;
             anyhow::ensure!(evidence.terminal, "Aster diagnostic close remains unresolved");
             expected -= evidence.qty.context("Aster close quantity unavailable")?;
             println!("cleanup_close={close:?} fill={:?}", evidence.fill);

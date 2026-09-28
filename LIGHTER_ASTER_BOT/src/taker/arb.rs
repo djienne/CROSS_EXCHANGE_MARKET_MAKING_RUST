@@ -2471,10 +2471,10 @@ fn first_order_identity(first: &FirstLeg, outcome: &FirstOutcome, side: Side, qt
 
 async fn resolve_first_evidence(
     spec: &MarketSpec, first: &FirstLeg, outcome: &FirstOutcome, pending: Option<PendingFill>,
-    side: Side, qty: Decimal, timeout: Duration,
+    side: Side, qty: Decimal, timeout: Duration, aster_fees: bool,
 ) -> LegEvidence {
     match (first, outcome) {
-        (FirstLeg::Aster { rest, .. }, FirstOutcome::Aster(outcome)) => resolve_aster_evidence(spec, rest, outcome, timeout).await,
+        (FirstLeg::Aster { rest, .. }, FirstOutcome::Aster(outcome)) => resolve_aster_evidence(spec, rest, outcome, timeout, aster_fees).await,
         (FirstLeg::Other(leg), FirstOutcome::Other(outcome)) => resolve_lighter_evidence(spec, leg, outcome, pending, side, qty, timeout).await,
         _ => LegEvidence::unresolved("the first leg's outcome is from another venue".to_string()),
     }
@@ -2500,8 +2500,10 @@ pub(crate) fn lighter_order_identity(outcome: &LighterOutcome, side: Side, qty: 
     identity
 }
 
+/// `wait_fees` false: a fill keeps the result's quantity and notional, its fee unknown, without
+/// waiting for userTrades (~1 RTT after the result).
 pub(crate) async fn resolve_aster_evidence(
-    spec: &MarketSpec, aster: &AsterRest, outcome: &AsterOutcome, timeout: Duration,
+    spec: &MarketSpec, aster: &AsterRest, outcome: &AsterOutcome, timeout: Duration, wait_fees: bool,
 ) -> LegEvidence {
     let (client, initial) = match outcome {
         AsterOutcome::Accepted { client_order_id, raw, .. } => (client_order_id, Some(raw.clone())),
@@ -2522,19 +2524,15 @@ pub(crate) async fn resolve_aster_evidence(
                     let immediate = immediate_fill_from_order_response(&raw)?;
                     let order_id = order.get("orderId").and_then(serde_json::Value::as_i64)
                         .context("Aster terminal order lacks order id")?;
+                    let unpriced = if immediate.qty == Decimal::ZERO { Some(FillSummary::zero()) }
+                        else { FillSummary::from_qty_notional(immediate.qty, immediate.notional, Decimal::ZERO)
+                            .map(|fill| fill.with_fee_provenance(FeeProvenance::Unknown)) };
                     known_terminal = Some(LegEvidence { fee_evidence:Vec::new(), terminal: true, qty: Some(immediate.qty),
-                        fill: if immediate.qty == Decimal::ZERO { Some(FillSummary::zero()) }
-                            else { FillSummary::from_qty_notional(immediate.qty, immediate.notional, Decimal::ZERO)
-                                .map(|fill| fill.with_fee_provenance(FeeProvenance::Unknown)) },
-                        order_id: Some(order_id), error: Some("fill accounting deadline".to_string()) });
-                    let fill = if immediate.qty == Decimal::ZERO { Some(FillSummary::zero()) }
+                        fill: unpriced, order_id: Some(order_id), error: Some("fill accounting deadline".to_string()) });
+                    let fill = if immediate.qty == Decimal::ZERO || !wait_fees { unpriced }
                         else {
                             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                            match aster.wait_order_fill_summary(&spec.market_id, order_id, immediate.qty, remaining).await {
-                                Ok(fill) => Some(fill),
-                                Err(_) => FillSummary::from_qty_notional(immediate.qty, immediate.notional, Decimal::ZERO)
-                                    .map(|fill| fill.with_fee_provenance(FeeProvenance::Unknown)),
-                            }
+                            aster.wait_order_fill_summary(&spec.market_id, order_id, immediate.qty, remaining).await.ok().or(unpriced)
                         };
                     return Ok::<_, anyhow::Error>(LegEvidence { fee_evidence:Vec::new(), terminal: true, qty: Some(immediate.qty),
                         fill, order_id: Some(order_id), error: None });
@@ -2649,9 +2647,18 @@ async fn execute_opportunity(
         "market": spec.market_id.to_string(), "outcome": "resolving", "orders": orders,
         "orders_complete": true, "pre_positions": {"aster_qty": pre_position.aster_qty, "lighter_qty": pre_position.lighter_qty} })).await?;
     let (a, l) = tokio::join!(
-        resolve_first_evidence(spec, aster, &a_res, a_pending, aster_side, opp.qty, Duration::from_secs(10)),
+        resolve_first_evidence(spec, aster, &a_res, a_pending, aster_side, opp.qty, Duration::from_secs(10), false),
         resolve_lighter_evidence(spec, lighter, &l_res, pending, lighter_side, opp.qty, Duration::from_secs(10)),
     );
+    // Aster's fee reaches userTrades ~1 RTT after its result. It resolves on its own task, so the
+    // position check and a missing-hedge retry never wait for it.
+    let aster_fees = match (aster, a.order_id, a.qty) {
+        (FirstLeg::Aster { rest, .. }, Some(order_id), Some(qty)) if qty > Decimal::ZERO => {
+            let (rest, market) = (rest.clone(), spec.market_id.clone());
+            Some(tokio::spawn(async move { rest.wait_order_fill_summary(&market, order_id, qty, Duration::from_secs(10)).await }))
+        }
+        _ => None,
+    };
     let mut row = serde_json::json!({
         "schema_version": 2, "economic_status": "incomplete", "timestamp": Utc::now(),
         "started_at": started_at, "execution_id": execution_id, "session_id": session.id(), "market": spec.market_id.to_string(),
@@ -2673,7 +2680,7 @@ async fn execute_opportunity(
         append_execution_record(journal,row).await?;
         return Err(ExecutionError::OutcomeUnresolved { details: "submission terminal evidence unavailable; session remains armed".to_string() });
     }
-    let mut aster_fill = a.fill;
+    let mut aster_retry_fills = Vec::new();
     let mut lighter_fill = l.fill;
     let mut lighter_fee_evidence = l.fee_evidence.clone();
     let a_sign = if aster_side == Side::Buy { Decimal::ONE } else { -Decimal::ONE };
@@ -2713,7 +2720,7 @@ async fn execute_opportunity(
             }
             match attempt.venue {
                 HedgeRetryVenue::Aster => {
-                    aster_fill = add_fill_summary(aster_fill, attempt.fill);
+                    aster_retry_fills.push(attempt.fill);
                     if aster_order_id == 0 { aster_order_id = attempt.identity.get("order_id").and_then(serde_json::Value::as_i64).unwrap_or(0); }
                 }
                 HedgeRetryVenue::Lighter => {
@@ -2733,8 +2740,10 @@ async fn execute_opportunity(
             return Err(ExecutionError::Unreconciled { details: retry.error.unwrap_or_else(|| "missing hedge could not be completed".to_string()) });
         }
     }
-    let (a_open, l_open, margin_after) = tokio::join!(aster.open_orders_count(&spec.market_id),
-        lighter.rest_open_orders_count(&spec.market_id), reconcile_margins(aster, lighter));
+    let (a_open, l_open, margin_after, priced) = tokio::join!(aster.open_orders_count(&spec.market_id),
+        lighter.rest_open_orders_count(&spec.market_id), reconcile_margins(aster, lighter),
+        async { match aster_fees { Some(task) => task.await.ok().and_then(Result::ok), None => None } });
+    let aster_fill = aster_retry_fills.into_iter().fold(priced.or(a.fill), add_fill_summary);
     let economics = match (aster_fill, lighter_fill) {
         (Some(a), Some(l)) => actual_economics(cfg, opp, a, l),
         _ => Err(ExecutionError::AccountingUnavailable { details: "terminal fill economics incomplete".to_string() }),
@@ -3064,7 +3073,7 @@ async fn submit_aster_hedge_retry(
                 "venue":"aster","submitted":true,"identity_unavailable":true,"side":plan.side.as_str(),"qty":plan.qty}),Vec::new()),
     };
     let identity = aster_order_identity(&outcome, plan.side, plan.qty);
-    let evidence = resolve_aster_evidence(spec, aster, &outcome, timeout.saturating_sub(start.elapsed())).await;
+    let evidence = resolve_aster_evidence(spec, aster, &outcome, timeout.saturating_sub(start.elapsed()), true).await;
     (format!("{outcome:?}"), evidence.fill,
         Some(if evidence.terminal { "terminal" } else { "unresolved" }.to_string()), evidence.error, identity, evidence.fee_evidence)
 }
@@ -3362,7 +3371,7 @@ async fn recover_if_needed(
             action_taken |= a_result.is_some() || l_result.is_some();
             let (a_evidence, l_evidence) = tokio::join!(
                 async { match a_result {
-                    Some((outcome, pending)) => resolve_first_evidence(spec, aster, &outcome, pending, a_side, a_qty, remaining).await,
+                    Some((outcome, pending)) => resolve_first_evidence(spec, aster, &outcome, pending, a_side, a_qty, remaining, true).await,
                     None => LegEvidence::not_submitted(),
                 } },
                 async { match l_result {
@@ -4213,6 +4222,22 @@ mod tests {
         publish_account(&tx, snapshot(0, dec!(0)));
         assert_eq!(rx.borrow().execution_epoch, 2);
         assert_eq!(rx.borrow().position.aster_qty, dec!(1));
+    }
+
+    #[tokio::test]
+    async fn a_filled_aster_result_resolves_without_waiting_for_its_fee() {
+        // Nothing listens here: a userTrades read would retry until the 10 s deadline.
+        let aster = AsterRest::new("http://127.0.0.1:9".into(),
+            Arc::new(crate::taker::aster::sign::test_support::TestSigner::new()), &[test_spec()]).unwrap();
+        let outcome = AsterOutcome::Accepted { venue_order_id: Some(7), client_order_id: "c".into(),
+            raw: r#"{"orderId":7,"clientOrderId":"c","status":"FILLED","executedQty":"0.1","cumQuote":"10.1"}"#.into() };
+        let evidence = tokio::time::timeout(Duration::from_millis(500),
+            resolve_aster_evidence(&test_spec(), &aster, &outcome, Duration::from_secs(10), false)).await
+            .expect("the fill waited for its fee");
+        let fill = evidence.fill.unwrap();
+        assert!(evidence.terminal && evidence.error.is_none());
+        assert_eq!((evidence.qty, fill.qty, fill.notional, fill.fee_provenance),
+            (Some(dec!(0.1)), dec!(0.1), dec!(10.1), FeeProvenance::Unknown));
     }
 
     #[test]

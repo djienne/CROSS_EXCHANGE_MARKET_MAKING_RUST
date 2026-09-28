@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -360,20 +360,75 @@ pub fn summarize_path(path: &Path, market: Option<&str>, since_ms: Option<i64>) 
     summarize(BufReader::new(File::open(path).with_context(|| format!("opening {}", path.display()))?), market, since_ms)
 }
 
-fn summarize<R: BufRead>(reader: R, market_filter: Option<&str>, since_ms: Option<i64>) -> Result<LiveReportSummary> {
-    let mut groups: BTreeMap<(String, String), Group> = BTreeMap::new();
-    let mut malformed = 0;
-    for (index, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("reading journal line {}", index + 1))?;
-        if line.trim().is_empty() { continue; }
-        let row: Value = match serde_json::from_str(&line) { Ok(row) => row, Err(_) => { malformed += 1; continue; } };
-        let Some(market) = row.get("market").and_then(Value::as_str) else { continue; };
-        if market_filter.is_some_and(|wanted| wanted != market) { continue; }
+fn summarize<R: BufRead>(reader: R, market: Option<&str>, since_ms: Option<i64>) -> Result<LiveReportSummary> {
+    let mut groups = Groups::new(market);
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("reading journal line {}", groups.lines + 1))?;
+        groups.feed(&line);
+    }
+    groups.finish(since_ms)
+}
+
+/// A journal summarized as it grows: each call reads only the complete lines appended since the
+/// last. A shrunken file was rotated or truncated, and is read again from the start.
+pub struct JournalTail {
+    groups: Groups,
+    offset: u64,
+}
+
+impl JournalTail {
+    pub fn new(market: Option<&str>) -> Self {
+        Self { groups: Groups::new(market), offset: 0 }
+    }
+
+    pub fn summarize(&mut self, path: &Path, since_ms: Option<i64>) -> Result<LiveReportSummary> {
+        let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        if file.metadata()?.len() < self.offset {
+            *self = Self::new(self.groups.market.as_deref());
+        }
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line)
+                .with_context(|| format!("reading journal line {}", self.groups.lines + 1))?;
+            if read == 0 || !line.ends_with('\n') {
+                break; // a partial trailing line waits for the writer to finish it
+            }
+            self.offset += read as u64;
+            self.groups.feed(&line);
+        }
+        self.groups.finish(since_ms)
+    }
+}
+
+/// Journal rows folded into logical execution groups, in file order.
+struct Groups {
+    market: Option<String>,
+    groups: BTreeMap<(String, String), Group>,
+    malformed: usize,
+    lines: usize,
+}
+
+impl Groups {
+    fn new(market: Option<&str>) -> Self {
+        Self { market: market.map(str::to_owned), groups: BTreeMap::new(), malformed: 0, lines: 0 }
+    }
+
+    fn feed(&mut self, line: &str) {
+        let index = self.lines;
+        self.lines += 1;
+        let malformed = &mut self.malformed;
+        if line.trim().is_empty() { return; }
+        let row: Value = match serde_json::from_str(line) { Ok(row) => row, Err(_) => { *malformed += 1; return; } };
+        let Some(market) = row.get("market").and_then(Value::as_str) else { return; };
+        if self.market.as_deref().is_some_and(|wanted| wanted != market) { return; }
         let kind = row.get("kind").and_then(Value::as_str).unwrap_or_default();
-        if !matches!(kind, "maker_fill" | "execution_trade" | "execution_progress" | "maker_order_progress" | "fill" | "hedge_fill") { continue; }
-        let Some(detail) = row.get("detail").filter(|detail| detail.is_object()) else { malformed += 1; continue; };
-        let Some(logical) = identifier(detail, "logical_id").or_else(|| identifier(detail, "cloid")) else { malformed += 1; continue; };
-        let group = groups.entry((market.to_string(), logical.clone())).or_default();
+        if !matches!(kind, "maker_fill" | "execution_trade" | "execution_progress" | "maker_order_progress" | "fill" | "hedge_fill") { return; }
+        let Some(detail) = row.get("detail").filter(|detail| detail.is_object()) else { *malformed += 1; return; };
+        let Some(logical) = identifier(detail, "logical_id").or_else(|| identifier(detail, "cloid")) else { *malformed += 1; return; };
+        let group = self.groups.entry((market.to_string(), logical.clone())).or_default();
         group.legacy |= row.get("schema_version").and_then(Value::as_u64).unwrap_or(1) < 2;
         if let Some(mono) = row.get("mono_ns").and_then(Value::as_i64).filter(|value| *value > 0) {
             if group.first_mono_ns == 0 { group.first_mono_ns = mono; }
@@ -384,7 +439,7 @@ fn summarize<R: BufRead>(reader: R, market_filter: Option<&str>, since_ms: Optio
             let attempt = identifier(detail, "attempt_id").or_else(|| identifier(detail, "client_id"));
             let qty = amount(detail.get("cumulative_qty")).filter(|qty| *qty >= Decimal::ZERO);
             let venue = detail.get("venue").and_then(Value::as_str).unwrap_or("aster");
-            let (Some(attempt), Some(qty), Some(venue)) = (attempt, qty, Venue::parse(venue)) else { malformed += 1; continue; };
+            let (Some(attempt), Some(qty), Some(venue)) = (attempt, qty, Venue::parse(venue)) else { *malformed += 1; return; };
             if group.progress.get(&attempt).is_none_or(|old| qty >= old.qty) {
                 let (economic_time, economic_ordinal) = group.progress.get(&attempt)
                     .filter(|old| old.qty == qty)
@@ -407,17 +462,25 @@ fn summarize<R: BufRead>(reader: R, market_filter: Option<&str>, since_ms: Optio
                 group.unidentified.entry(attempt).and_modify(|old| {
                     *old = old.zip(lower).map(|(old, next)| old.max(next));
                 }).or_insert(lower);
-                continue;
+                return;
             }
             match parse_fill(&row, detail, kind, &logical, index) {
                 Ok((identity, mut fill)) => {
                     if let Some(old) = group.fills.get(&identity) { fill.ordinal = old.ordinal; }
                     group.fills.insert(identity, fill);
                 }
-                Err(_) => malformed += 1,
+                Err(_) => *malformed += 1,
             }
         }
     }
+
+    /// Prices every group; the fed rows stay, so later lines can extend them.
+    fn finish(&self, since_ms: Option<i64>) -> Result<LiveReportSummary> {
+        price(&self.groups, self.malformed, since_ms)
+    }
+}
+
+fn price(groups: &BTreeMap<(String, String), Group>, mut malformed: usize, since_ms: Option<i64>) -> Result<LiveReportSummary> {
     let mut output = LiveReportSummary {
         schema_version: 2, economic_status: "confirmed", gross_pnl: Some(Decimal::ZERO),
         venue_realized_pnl_usdc: Some(Decimal::ZERO), execution_spread_usdc: Some(Decimal::ZERO),
@@ -426,9 +489,9 @@ fn summarize<R: BufRead>(reader: R, market_filter: Option<&str>, since_ms: Optio
     };
     let sum = |a: Option<Decimal>, b: Option<Decimal>| a.zip(b).and_then(|(a,b)| a.checked_add(b));
     for ((market, logical), group) in groups {
-        let fills = coverage(&group, &mut malformed)?;
+        let fills = coverage(group, &mut malformed)?;
         if !fills.iter().any(|fill| fill.qty > Decimal::ZERO) { continue; }
-        let trade = calculate(market, logical, &group, &fills)?;
+        let trade = calculate(market.clone(), logical.clone(), group, &fills)?;
         if since_ms.is_some_and(|since| trade.timestamp_ms.is_none_or(|time| time < since)) { continue; }
         output.unmatched_fills += usize::from(trade.qty > Decimal::ZERO && trade.lighter_qty.is_zero() && !trade.residual_qty.is_zero());
         output.unmatched_hedges += usize::from(trade.qty.is_zero() && trade.lighter_qty > Decimal::ZERO);
@@ -566,5 +629,34 @@ mod tests {
         let report = summarize(Cursor::new(malformed), None, None).unwrap();
         assert_eq!(report.malformed_rows, 1);
         assert!(report.net_pnl.is_none());
+    }
+
+    #[test]
+    fn a_journal_read_in_chunks_summarizes_as_the_whole_file() {
+        let fixtures: Vec<Value> = serde_json::from_str(include_str!("../../tests/fixtures/execution_economics.json")).unwrap();
+        let mut rows = Vec::new();
+        for (i, fixture) in fixtures.iter().enumerate() {
+            for row in fixture["rows"].as_array().unwrap() {
+                let mut row = row.clone();
+                let key = if row["detail"].get("logical_id").is_some() { "logical_id" } else { "cloid" };
+                row["detail"][key] = serde_json::json!(format!("t{i}"));
+                rows.push(row);
+            }
+        }
+        let text = rows_text(&rows) + "\nnot json\n";
+        let whole = |text: &str| serde_json::to_value(summarize(Cursor::new(text), Some("HYPE"), None).unwrap()).unwrap();
+        let path = std::env::temp_dir().join(format!("journal_tail_test_{}.jsonl", std::process::id()));
+        let mut tail = JournalTail::new(Some("HYPE"));
+        let cut = text.len() / 2;
+        assert!(!text[..cut].ends_with('\n'), "the first chunk ends mid-line");
+        std::fs::write(&path, &text[..cut]).unwrap();
+        tail.summarize(&path, None).unwrap();
+        std::fs::write(&path, &text).unwrap();
+        assert_eq!(serde_json::to_value(tail.summarize(&path, None).unwrap()).unwrap(), whole(&text));
+        // A shorter file was rotated: it is read again from the start.
+        let rotated = rows_text(&rows[..3]) + "\n";
+        std::fs::write(&path, &rotated).unwrap();
+        assert_eq!(serde_json::to_value(tail.summarize(&path, None).unwrap()).unwrap(), whole(&rotated));
+        let _ = std::fs::remove_file(&path);
     }
 }

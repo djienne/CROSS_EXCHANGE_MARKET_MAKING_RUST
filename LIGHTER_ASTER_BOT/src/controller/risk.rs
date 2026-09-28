@@ -249,6 +249,7 @@ pub struct RealizedTrades {
     taker_ledger: PathBuf,
     offset: u64,
     xemm_journal: PathBuf,
+    xemm: crate::live_report::JournalTail,
     /// Size and mtime of the journal at the last successful summary; unchanged = skip.
     journal_seen: Option<(u64, SystemTime)>,
     rows: HashMap<String, Impact>,
@@ -265,6 +266,7 @@ impl RealizedTrades {
             taker_ledger,
             offset: 0,
             xemm_journal,
+            xemm: crate::live_report::JournalTail::new(Some(market)),
             journal_seen: None,
             rows: HashMap::new(),
             totals: Totals::default(),
@@ -355,16 +357,14 @@ impl RealizedTrades {
         true
     }
 
-    /// Ponytail: re-summarizes the whole journal whenever it changed (it grows for the life
-    /// of the XEMM stem). Fine at hours-to-days of XEMM activity; past that, summarize
-    /// incrementally from an offset or rotate the journal per session.
+    /// Re-prices XEMM's trades whenever its journal changed, parsing only the appended lines.
     fn poll_xemm(&mut self, events: &mut EventLog) {
         let Ok(meta) = std::fs::metadata(&self.xemm_journal) else { return };
         let seen = (meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
         if self.journal_seen == Some(seen) {
             return;
         }
-        match crate::live_report::summarize_path(&self.xemm_journal, Some(&self.market), Some(self.since.timestamp_millis())) {
+        match self.xemm.summarize(&self.xemm_journal, Some(self.since.timestamp_millis())) {
             Ok(summary) => {
                 self.journal_seen = Some(seen);
                 self.xemm_report_failures = 0;

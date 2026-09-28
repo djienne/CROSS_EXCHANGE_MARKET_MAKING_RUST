@@ -2,6 +2,7 @@
 //! keeps request I/O off the strategy loop, and preserves ambiguous order outcomes.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -120,6 +121,8 @@ pub struct AsterRest {
     nonce: AsterNonce,
     markets: HashMap<MarketId, MarketWire>,
     deadman_countdown_ms: i64,
+    /// The worker sends one dead-man refresh at a time, each on its own task.
+    deadman_in_flight: AtomicBool,
     rate_limit_backoff_ms: i64,
     max_rest_requests_per_minute: u32,
 }
@@ -155,6 +158,7 @@ impl AsterRest {
             nonce,
             markets,
             deadman_countdown_ms: deadman_countdown_ms.max(1000),
+            deadman_in_flight: AtomicBool::new(false),
             rate_limit_backoff_ms: rate_limit_backoff_ms.max(1000),
             max_rest_requests_per_minute: max_rest_requests_per_minute.max(1),
         })
@@ -679,6 +683,7 @@ pub async fn run_aster_worker(
     rest: AsterRest,
 ) {
     info!("aster live exec worker started (Aster V3 EIP-712)");
+    let rest = Arc::new(rest);
     let mut backoff_until: Option<tokio::time::Instant> = None;
     let mut limiter = RestCommandLimiter::new(rest.max_rest_requests_per_minute);
     let mut prio_open = true;
@@ -781,7 +786,7 @@ async fn process_cmd(
     cmd: ExecCommand,
     _from_prio: bool,
     tx: &Sender<ExecEvent>,
-    rest: &AsterRest,
+    rest: &Arc<AsterRest>,
     limiter: &mut RestCommandLimiter,
     backoff_until: &mut Option<tokio::time::Instant>,
 ) -> Option<ExecCommand> {
@@ -934,13 +939,22 @@ async fn process_cmd(
                 }
             }
             ExecCommand::RefreshDeadman { market } => {
-                limiter.record();
-                if let Err(e) = rest.refresh_deadman(&market).await {
-                    let reason = e.to_string();
-                    if is_aster_rate_limit_reason(&reason) {
-                        rate_limit_reason = Some(reason.clone());
-                    }
-                    warn!("aster deadman refresh failed: {e:#}");
+                // On its own task, like the listenKey keepalive: this round trip every 2 s must
+                // not hold up a place or cancel queued behind it. A 429 freezes the strategy;
+                // the worker's own backoff arms at the next request that meets it.
+                if !rest.deadman_in_flight.swap(true, Ordering::AcqRel) {
+                    limiter.record();
+                    let (rest, tx) = (rest.clone(), tx.clone());
+                    tokio::spawn(async move {
+                        if let Err(e) = rest.refresh_deadman(&market).await {
+                            warn!("aster deadman refresh failed: {e:#}");
+                            let reason = e.to_string();
+                            if is_aster_rate_limit_reason(&reason) {
+                                notify_rate_limited(&tx, reason, rest.rate_limit_backoff_ms).await;
+                            }
+                        }
+                        rest.deadman_in_flight.store(false, Ordering::Release);
+                    });
                 }
             }
             ExecCommand::Barrier { completion } => {
@@ -1172,6 +1186,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_deadman_refresh_does_not_delay_a_queued_place() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            // The two requests race to connect: take them in either order.
+            let (mut deadman, mut place) = (None, None);
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let deadman_request = read_http_request(&mut stream).await.contains("countdownCancelAll");
+                let slot = if deadman_request { &mut deadman } else { &mut place };
+                assert!(slot.replace(stream).is_none(), "two requests of one kind");
+            }
+            reply_http(place.as_mut().unwrap(), "200 OK", r#"{"orderId":1,"status":"NEW","clientOrderId":"P"}"#).await;
+            assert!(tokio::time::timeout(Duration::from_millis(200), listener.accept()).await.is_err(),
+                "the second refresh was sent while the first was in flight");
+            let _ = release_rx.await;
+            reply_http(deadman.as_mut().unwrap(), "200 OK", r#"{"symbol":"BTCUSDT","countdownTime":"5000"}"#).await;
+        });
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let (normal_tx, normal_rx) = mpsc::channel(8);
+        let (_priority_tx, priority_rx) = mpsc::channel(8);
+        normal_tx.send(ExecCommand::RefreshDeadman { market: "BTC".into() }).await.unwrap();
+        // A second refresh while the first is in flight is dropped, not queued or sent.
+        normal_tx.send(ExecCommand::RefreshDeadman { market: "BTC".into() }).await.unwrap();
+        normal_tx.send(ExecCommand::Place {
+            market: "BTC".into(), side: Side::Buy, price_ticks: 1000,
+            qty_lots: 10, client_id: "P".into(), permit: MakerPermit::for_test(),
+        }).await.unwrap();
+        let worker = tokio::spawn(run_aster_worker(normal_rx, priority_rx, events_tx, rest_at(&url)));
+        let event = tokio::time::timeout(Duration::from_secs(2), events_rx.recv()).await
+            .expect("the place waited behind the dead-man's response");
+        assert!(matches!(event, Some(ExecEvent::PlaceAck { client_id, .. }) if client_id == "P"));
+        release_tx.send(()).unwrap();
+        server.await.unwrap();
+        worker.abort();
+    }
+
+    #[tokio::test]
     async fn maker_cancelled_during_rate_limit_wait_is_never_sent() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1218,7 +1271,7 @@ mod tests {
             market: "BTC".into(), side: Side::Buy, price_ticks: 1000,
             qty_lots: 10, client_id: "claimed".into(), permit: permit.clone(),
         };
-        assert!(process_cmd(cmd.clone(), false, &tx, &rest_at("http://127.0.0.1:9"),
+        assert!(process_cmd(cmd.clone(), false, &tx, &Arc::new(rest_at("http://127.0.0.1:9")),
             &mut limiter, &mut backoff).await.is_none());
         send_backoff_reject(&tx, cmd, "backoff".into(), 1).await;
         assert!(matches!(rx.try_recv(), Ok(ExecEvent::AsterRateLimited { .. })));
