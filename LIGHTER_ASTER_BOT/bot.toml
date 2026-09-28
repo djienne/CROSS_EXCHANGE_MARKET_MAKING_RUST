@@ -242,8 +242,8 @@ lighter_symbol      = "BNB"
 aster_symbol = "ETHUSDT"
 lighter_symbol      = "ETH"
 
-# `--mode dry-run`: the same bot, signing with a dry-run identity no venue knows, against
-# simulated Aster and Lighter venues on loopback. Live market data feeds them as a bot in AWS
+# `--mode dry-run`: the same bot, signing with a dry-run identity no venue knows, against its
+# market's two venues simulated on loopback. Live market data feeds them as a bot in AWS
 # Tokyo (ap-northeast-1) would see it; files go to runs/dry-run/. Latencies are [p50, p99] ms,
 # drawn lognormal. Fees and leverage are the engines' own keys above.
 [dry_run]
@@ -253,8 +253,9 @@ lighter_symbol      = "ETH"
 # p50 ~200 ms, p99 ~390 ms; trades p99 up to ~620 ms. The shift itself is invisible to the bot.
 shift_ms = 1000
 seed     = 0
-aster_port   = 18081
-lighter_port = 18082
+aster_port       = 18081
+lighter_port     = 18082
+hyperliquid_port = 18083
 aster_balance_usdt   = "200"
 lighter_balance_usdc = "200"
 # A request takes effect at this fraction of its round trip; 0.9 puts most of the latency before
@@ -271,7 +272,7 @@ aster_feed_ms        = [5, 30]
 lighter_feed_ms      = [5, 30]
 aster_user_stream_ms = [10, 50]
 lighter_account_ms   = [5, 30]
-# A market hedged on Hyperliquid (lighter_port and lighter_balance_usdc serve its hedge venue).
+# Hyperliquid (its account starts with lighter_balance_usdc and follows lighter_account_ms).
 # Hyperliquid states a 0.2 s median end to end (one block) from Tokyo; from this host an IOC took
 # ~0.9 s with the network to Tokyo (probe 2026-09-27). Its feed is an estimate; calibrate both.
 hyperliquid_rtt_ms  = [200, 500]

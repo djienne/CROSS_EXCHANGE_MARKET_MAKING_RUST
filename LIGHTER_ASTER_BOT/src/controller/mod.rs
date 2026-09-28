@@ -147,7 +147,7 @@ pub(crate) async fn run_with(
         None
     } else {
         let dry_run = cfg.dry_run.clone().context("--mode dry-run needs a [dry_run] table in the config")?;
-        Some(crate::dryrun::start(&dry_run, &mut cfg, &maker_markets[0], &runs_dir).await?)
+        Some(crate::dryrun::start(&dry_run, &mut cfg, &taker_markets[0], &runs_dir).await?)
     };
     let parked = stop.clone();
     let result = async move {

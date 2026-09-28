@@ -291,7 +291,7 @@ mod tests {
         let fees = [Fees { maker: dec!(0), taker: dec!(0) }, Fees { maker: dec!(0.00015), taker: dec!(0.00045) }];
         let params = SimParams {
             shift_us: 300_000, seed: 1, effect_fraction: 0.9, rtt: [fixed; 2], private: [fixed; 2], lighter_taker_delay_us: 0,
-            hidden_queue_multiplier: dec!(0), fees, leverage: dec!(3), balances: [dec!(1000); 2], hedge: Venue::Hyperliquid,
+            hidden_queue_multiplier: dec!(0), fees, leverage: dec!(3), balances: [dec!(1000); 2], venues: [Venue::Aster, Venue::Hyperliquid],
         };
         let mut core = Exchange::new(params, wall_us());
         core.trust_feed();

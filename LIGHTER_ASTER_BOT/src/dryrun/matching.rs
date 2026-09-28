@@ -57,12 +57,10 @@ pub enum Venue {
 }
 
 impl Venue {
-    /// Its slot in the per-venue pairs: Aster, then the hedge venue (`SimParams::hedge`).
-    pub fn ix(self) -> usize {
-        match self {
-            Venue::Aster => 0,
-            Venue::Lighter | Venue::Hyperliquid => 1,
-        }
+    /// Its slot in a simulation's per-venue pairs (`SimParams::venues`); only the venues of the
+    /// pair are served, so any other is a bug.
+    pub fn ix(self, venues: [Venue; 2]) -> usize {
+        venues.iter().position(|&v| v == self).unwrap_or_else(|| panic!("{self:?} is not simulated here ({venues:?})"))
     }
 }
 
@@ -78,7 +76,7 @@ pub struct SimParams {
     pub seed: u64,
     /// Fraction of a round trip that passes before a request takes effect.
     pub effect_fraction: f64,
-    /// Request round trip, per venue (`[Aster, Lighter]`, as every pair below).
+    /// Request round trip, per venue (in `venues` order, as every pair below).
     pub rtt: [Latency; 2],
     /// Private-stream delay after an effect.
     pub private: [Latency; 2],
@@ -89,8 +87,8 @@ pub struct SimParams {
     pub fees: [Fees; 2],
     pub leverage: Decimal,
     pub balances: [Decimal; 2],
-    /// The venue in the second slot: Lighter or Hyperliquid.
-    pub hedge: Venue,
+    /// The two venues, e.g. `[Aster, Lighter]`.
+    pub venues: [Venue; 2],
 }
 
 #[derive(Debug, Clone, Default)]
@@ -597,8 +595,8 @@ pub struct Exchange {
 impl Exchange {
     pub fn new(p: SimParams, start_us: i64) -> Self {
         let mut venues = [VenueState::new(p.balances[0]), VenueState::new(p.balances[1])];
-        venues[0].limits = venue_limits(Venue::Aster);
-        venues[1].limits = venue_limits(p.hedge);
+        venues[0].limits = venue_limits(p.venues[0]);
+        venues[1].limits = venue_limits(p.venues[1]);
         Self {
             rng: Rng::new(p.seed),
             p,
@@ -621,8 +619,12 @@ impl Exchange {
         self.now
     }
 
-    pub fn hedge(&self) -> Venue {
-        self.p.hedge
+    pub fn venues(&self) -> [Venue; 2] {
+        self.p.venues
+    }
+
+    fn ix(&self, venue: Venue) -> usize {
+        venue.ix(self.p.venues)
     }
 
     /// For scripted feeds, which publish only when told: nothing waits for them.
@@ -649,8 +651,8 @@ impl Exchange {
                 ..saved
             };
         }
-        for venue in [Venue::Aster, self.p.hedge] {
-            let due: Vec<(String, i64)> = self.venues[venue.ix()].funding.iter()
+        for venue in self.p.venues {
+            let due: Vec<(String, i64)> = self.venues[self.ix(venue)].funding.iter()
                 .flat_map(|(market, rates)| rates.keys().map(move |&exch_us| (market.clone(), exch_us)))
                 .collect();
             for (market, exch_us) in due {
@@ -662,8 +664,8 @@ impl Exchange {
     /// Re-arms the restored deadmen: one that ran out while the venues were down cancels its
     /// market's orders now.
     pub fn resume(&mut self) {
-        for venue in [Venue::Aster, self.p.hedge] {
-            let armed: Vec<(String, i64)> = self.venues[venue.ix()].deadman.iter().map(|(m, &d)| (m.clone(), d)).collect();
+        for venue in self.p.venues {
+            let armed: Vec<(String, i64)> = self.venues[self.ix(venue)].deadman.iter().map(|(m, &d)| (m.clone(), d)).collect();
             for (market, deadline) in armed {
                 self.schedule(deadline, RANK_ACTION, Pending::Deadman { venue, market, deadline });
             }
@@ -672,20 +674,20 @@ impl Exchange {
 
     /// Adds a market; `depth` is how many levels per side its feed shows (None = full book).
     pub fn add_market(&mut self, venue: Venue, market: &str, depth: Option<usize>, filters: Filters) {
-        let st = &mut self.venues[venue.ix()];
+        let st = &mut self.venues[self.ix(venue)];
         st.books.entry(market.to_string()).or_insert_with(|| Replica::new(depth));
         st.filters.insert(market.to_string(), filters);
     }
 
     pub fn replica(&self, venue: Venue, market: &str) -> Option<&Replica> {
-        self.venues[venue.ix()].books.get(market)
+        self.venues[self.ix(venue)].books.get(market)
     }
 
     /// Queues a feed event, arriving now, for its shifted time, or for now if it arrived too
     /// late for that.
     pub fn ingest(&mut self, venue: Venue, market: &str, exch_us: i64, event: FeedEvent) {
         let at = exch_us + self.p.shift_us;
-        let diag = &mut self.diag[venue.ix()];
+        let diag = &mut self.diag[self.ix(venue)];
         diag.frames += 1;
         if at < self.now {
             diag.late_frames += 1;
@@ -701,7 +703,7 @@ impl Exchange {
         }
         self.schedule(at, rank, Pending::Feed { venue, market: market.to_string(), exch_us, event });
         // The feed has shown the market up to `at`: what waited for that runs after this frame.
-        let v = venue.ix();
+        let v = self.ix(venue);
         if stream.is_some() && at > self.known[v] {
             self.known[v] = at;
             let waiting = self.held[v].split_off(&(at + 1, 0, 0));
@@ -714,7 +716,7 @@ impl Exchange {
     /// Records the funding rate a settlement at `exch_us` will use (re-polls update it). A rate
     /// arriving after its settlement's shifted time is charged on arrival.
     pub fn funding(&mut self, venue: Venue, market: &str, exch_us: i64, rate: Decimal) {
-        let st = &mut self.venues[venue.ix()];
+        let st = &mut self.venues[self.ix(venue)];
         if st.settled.get(market).is_some_and(|&last| exch_us <= last) {
             return;
         }
@@ -728,8 +730,8 @@ impl Exchange {
     /// Sends a request now; its reply comes out of `advance` as `Output::Reply` with this ticket.
     pub fn submit(&mut self, envelope: Envelope) -> u64 {
         self.tickets += 1;
-        let rtt = self.p.rtt[envelope.venue.ix()].sample_us(&mut self.rng);
-        self.diag[envelope.venue.ix()].rtt_us.push(rtt);
+        let rtt = self.p.rtt[self.ix(envelope.venue)].sample_us(&mut self.rng);
+        self.diag[self.ix(envelope.venue)].rtt_us.push(rtt);
         let effect = self.now + (rtt as f64 * self.p.effect_fraction).round() as i64;
         // A lane answered by now holds nothing back: forget closed connections' lanes.
         if self.lanes.len() > 1_024 {
@@ -748,7 +750,7 @@ impl Exchange {
     /// The venue's account and open orders as of now, outside any request: what a private
     /// stream sends on subscription.
     pub fn peek(&self, venue: Venue) -> (AccountView, Vec<Order>) {
-        (self.account_view(venue), self.venues[venue.ix()].open.values().cloned().collect())
+        (self.account_view(venue), self.venues[self.ix(venue)].open.values().cloned().collect())
     }
 
     pub fn next_due(&self) -> Option<i64> {
@@ -765,7 +767,7 @@ impl Exchange {
             self.lateness_us.push(to - key.0);
             self.now = self.now.max(key.0);
             if let Some((venue, due)) = pending.acts_at() {
-                if due > self.known[venue.ix()] {
+                if due > self.known[self.ix(venue)] {
                     self.hold(venue, key, pending);
                     continue;
                 }
@@ -776,15 +778,15 @@ impl Exchange {
                 Pending::Gateway { ticket, reply_at, envelope, .. } => self.on_gateway(ticket, reply_at, envelope),
                 Pending::Execute { venue, request, .. } => self.execute_tx(venue, request),
                 Pending::Deadman { venue, market, deadline } => {
-                    if self.venues[venue.ix()].deadman.get(&market) == Some(&deadline) {
-                        self.venues[venue.ix()].deadman.remove(&market);
+                    if self.venues[self.ix(venue)].deadman.get(&market) == Some(&deadline) {
+                        self.venues[self.ix(venue)].deadman.remove(&market);
                         self.cancel_all(venue, Some(&market), End::Deadman);
                     }
                 }
                 Pending::Expire { venue, key } => {
                     // Only requests expire (`hold`).
-                    if let Some(Pending::Gateway { ticket, reply_at, .. }) = self.held[venue.ix()].remove(&key) {
-                        self.diag[venue.ix()].requests += 1;
+                    if let Some(Pending::Gateway { ticket, reply_at, .. }) = self.held[self.ix(venue)].remove(&key) {
+                        self.diag[self.ix(venue)].requests += 1;
                         let reply = self.reject(venue, Reject::Unavailable);
                         self.schedule(reply_at, RANK_DELIVER, Pending::Deliver(Output::Reply { ticket, reply }));
                     }
@@ -798,11 +800,11 @@ impl Exchange {
     /// Parks an action until the venue's feed reaches its time; a request gives up after
     /// [`HOLD_US`].
     fn hold(&mut self, venue: Venue, key: Key, action: Pending) {
-        self.diag[venue.ix()].held += 1;
+        self.diag[self.ix(venue)].held += 1;
         if let Pending::Gateway { due, .. } = action {
             self.schedule(due + HOLD_US, RANK_ACTION, Pending::Expire { venue, key });
         }
-        self.held[venue.ix()].insert(key, action);
+        self.held[self.ix(venue)].insert(key, action);
     }
 
     fn schedule(&mut self, at: i64, rank: u8, pending: Pending) {
@@ -811,17 +813,17 @@ impl Exchange {
     }
 
     fn reject(&mut self, venue: Venue, reject: Reject) -> Reply {
-        *self.diag[venue.ix()].rejects.entry(format!("{reject:?}")).or_default() += 1;
+        *self.diag[self.ix(venue)].rejects.entry(format!("{reject:?}")).or_default() += 1;
         Reply::Reject(reject)
     }
 
     fn account_view(&self, venue: Venue) -> AccountView {
-        let st = &self.venues[venue.ix()];
+        let st = &self.venues[self.ix(venue)];
         st.view(&st.working(), self.p.leverage)
     }
 
     fn push_event(&mut self, venue: Venue, event: Event) {
-        let v = venue.ix();
+        let v = self.ix(venue);
         let delay = self.p.private[v].sample_us(&mut self.rng);
         self.diag[v].private_us.push(delay);
         let at = (self.now + delay).max(self.streams[v]);
@@ -836,7 +838,7 @@ impl Exchange {
 
     fn on_gateway(&mut self, ticket: u64, reply_at: i64, envelope: Envelope) {
         let venue = envelope.venue;
-        let v = venue.ix();
+        let v = self.ix(venue);
         self.diag[v].requests += 1;
         let reply = if !admit(&mut self.venues[v].limits, self.now, envelope.weight, envelope.orders) {
             self.reject(venue, Reject::RateLimited)
@@ -868,7 +870,7 @@ impl Exchange {
             Request::Place(spec) => {
                 if let Err(reject) = self.place(venue, &spec) {
                     self.reject(venue, reject);
-                    let id = self.venues[venue.ix()].next_id();
+                    let id = self.venues[self.ix(venue)].next_id();
                     let order = Order {
                         id,
                         client_id: spec.client_id,
@@ -898,7 +900,7 @@ impl Exchange {
     }
 
     fn execute(&mut self, venue: Venue, request: Request) -> Reply {
-        let v = venue.ix();
+        let v = self.ix(venue);
         match request {
             Request::Place(spec) => match self.place(venue, &spec) {
                 Ok(order) => Reply::Order(order),
@@ -977,7 +979,7 @@ impl Exchange {
 
     /// The book state after the next update due within the lookahead, if any.
     fn next_state(&self, venue: Venue, market: &str) -> Option<Replica> {
-        let current = self.venues[venue.ix()].books.get(market)?;
+        let current = self.venues[self.ix(venue)].books.get(market)?;
         let window = (self.now, 0, 0)..=(self.now + LOOKAHEAD_US, u8::MAX, u64::MAX);
         self.pending.range(window).find_map(|(_, pending)| match pending {
             Pending::Feed { venue: v, market: m, exch_us, event: FeedEvent::Book(update) }
@@ -992,7 +994,7 @@ impl Exchange {
     }
 
     fn place(&mut self, venue: Venue, spec: &OrderSpec) -> Result<Order, Reject> {
-        let v = venue.ix();
+        let v = self.ix(venue);
         self.diag[v].orders += 1;
         if spec.tif == Tif::PostOnly && spec.price.is_none() {
             return Err(Reject::TickSize);
@@ -1087,11 +1089,11 @@ impl Exchange {
         if !order.reduce_only {
             return remaining;
         }
-        remaining.min(reducible(self.venues[venue.ix()].account.position(&order.market).qty, order.side))
+        remaining.min(reducible(self.venues[self.ix(venue)].account.position(&order.market).qty, order.side))
     }
 
     fn fill(&mut self, venue: Venue, order: &mut Order, price: Decimal, qty: Decimal, maker: bool) {
-        let v = venue.ix();
+        let v = self.ix(venue);
         let rates = &self.p.fees[v];
         let fee = price * qty * if maker { rates.maker } else { rates.taker };
         let st = &mut self.venues[v];
@@ -1144,7 +1146,7 @@ impl Exchange {
     }
 
     fn close(&mut self, venue: Venue, order: Order) {
-        let closed = &mut self.venues[venue.ix()].closed;
+        let closed = &mut self.venues[self.ix(venue)].closed;
         closed.push_back(order);
         if closed.len() > KEEP {
             closed.pop_front();
@@ -1156,14 +1158,14 @@ impl Exchange {
         if order.working() && order.reduce_only && self.fillable(venue, &order).is_zero() {
             self.finish(venue, &mut order, End::ReduceOnly);
         } else if order.working() {
-            self.venues[venue.ix()].open.insert(order.id, order);
+            self.venues[self.ix(venue)].open.insert(order.id, order);
         } else {
             self.close(venue, order);
         }
     }
 
     fn cancel_all(&mut self, venue: Venue, market: Option<&str>, end: End) {
-        let v = venue.ix();
+        let v = self.ix(venue);
         let ids: Vec<u64> = self.venues[v].open.values()
             .filter(|o| market.is_none_or(|m| o.market == m))
             .map(|o| o.id)
@@ -1177,7 +1179,7 @@ impl Exchange {
     /// Our resting orders in `market` (on `side`, if given), each side best price first, then
     /// oldest first.
     fn resting(&self, venue: Venue, market: &str, side: Option<Side>) -> Vec<u64> {
-        let mut orders: Vec<&Order> = self.venues[venue.ix()].open.values()
+        let mut orders: Vec<&Order> = self.venues[self.ix(venue)].open.values()
             .filter(|o| o.market == market && side.is_none_or(|s| o.side == s))
             .collect();
         orders.sort_by(|a, b| {
@@ -1193,7 +1195,7 @@ impl Exchange {
     }
 
     fn on_feed(&mut self, venue: Venue, market: &str, exch_us: i64, event: FeedEvent) {
-        let v = venue.ix();
+        let v = self.ix(venue);
         let Some(book) = self.venues[v].books.get_mut(market) else { return };
         match event {
             FeedEvent::Book(update) => {
@@ -1221,7 +1223,7 @@ impl Exchange {
     /// After a book update: cut each resting order's visible queue to what is left on its level
     /// (the only cancel credit), then fill whatever the book now crosses.
     fn on_book(&mut self, venue: Venue, market: &str) {
-        let v = venue.ix();
+        let v = self.ix(venue);
         let h = self.p.hidden_queue_multiplier;
         for id in self.resting(venue, market, None) {
             // A fill above may have closed it (reduce-only orders die with their position).
@@ -1247,7 +1249,7 @@ impl Exchange {
     }
 
     fn on_trade(&mut self, venue: Venue, market: &str, price: Decimal, qty: Decimal, taker: Side) {
-        let v = venue.ix();
+        let v = self.ix(venue);
         let passive = taker.opposite();
         let book = &self.venues[v].books[market];
         let diag = &mut self.diag[v];
@@ -1294,7 +1296,7 @@ impl Exchange {
     }
 
     fn on_funding(&mut self, venue: Venue, market: String, exch_us: i64) {
-        let v = venue.ix();
+        let v = self.ix(venue);
         // No mark before the first book (a restart): settle once there is one.
         let Some(mark) = self.venues[v].marks.get(&market).copied() else {
             self.schedule(self.now + 1_000_000, RANK_FUNDING, Pending::Funding { venue, market, exch_us });
@@ -1339,7 +1341,7 @@ mod tests {
             fees: [Fees { maker: dec!(0), taker: dec!(0.0004) }, Fees { maker: dec!(0), taker: dec!(0) }],
             leverage: dec!(1),
             balances: [dec!(1000), dec!(1000)],
-            hedge: Venue::Lighter,
+            venues: [Venue::Aster, Venue::Lighter],
         }
     }
 
@@ -1363,7 +1365,7 @@ mod tests {
 
         fn with(p: SimParams) -> Self {
             let mut sim = Self::cold(p, 0);
-            for venue in [Venue::Aster, Venue::Lighter] {
+            for venue in sim.ex.venues() {
                 sim.book(venue, 0, &[(dec!(99), dec!(5)), (dec!(98), dec!(5))], &[(dec!(101), dec!(5)), (dec!(102), dec!(5))]);
             }
             sim.at(0);
@@ -1372,7 +1374,7 @@ mod tests {
 
         /// The venues before any book, at exchange time `ms`.
         fn cold(p: SimParams, ms: i64) -> Self {
-            let shift = p.shift_us;
+            let (shift, venues) = (p.shift_us, p.venues);
             let mut ex = Exchange::new(p, ms * MS + shift);
             let filters = Filters {
                 tick: dec!(0.01),
@@ -1382,8 +1384,9 @@ mod tests {
                 percent_price: Some((dec!(0.98), dec!(1.02))),
                 sig_figs: None,
             };
-            ex.add_market(Venue::Aster, HYPE, Some(20), filters.clone());
-            ex.add_market(Venue::Lighter, HYPE, None, filters);
+            for venue in venues {
+                ex.add_market(venue, HYPE, (venue != Venue::Lighter).then_some(20), filters.clone());
+            }
             ex.trust_feed();
             Self { ex, shift, out: Vec::new(), nonce: 0 }
         }
@@ -1448,7 +1451,7 @@ mod tests {
         }
 
         fn open(&self, venue: Venue) -> Vec<&Order> {
-            self.ex.venues[venue.ix()].open.values().collect()
+            self.ex.venues[self.ex.ix(venue)].open.values().collect()
         }
     }
 
@@ -1862,6 +1865,28 @@ mod tests {
         // Long 2 at the first mark (99.2) pays 0.0001 of its value, once.
         assert_eq!((account.position(HYPE).qty, account.funding), (dec!(2), dec!(-0.01984)));
         assert_eq!(account.balance, account.initial + account.realized - account.fees + account.funding);
+    }
+
+    #[test]
+    fn a_lighter_and_hyperliquid_pair_trades_and_restores_in_its_own_slots() {
+        let mut p = params(500);
+        p.venues = [Venue::Lighter, Venue::Hyperliquid];
+        p.fees = [Fees { maker: dec!(0), taker: dec!(0) }, Fees { maker: dec!(0), taker: dec!(0.00045) }];
+        let mut sim = Sim::with(p.clone());
+        sim.tx(limit(Side::Buy, dec!(1), dec!(102), Tif::Ioc));
+        sim.send(Venue::Hyperliquid, limit(Side::Sell, dec!(1), dec!(98), Tif::Ioc));
+        sim.at(200);
+        // Lighter's speed bump holds its taker, in the first slot as in the second.
+        assert_eq!((sim.fills(Venue::Lighter), sim.fills(Venue::Hyperliquid)), (vec![], vec![(dec!(99), dec!(1), false)]));
+        sim.at(1_000);
+        assert_eq!(sim.fills(Venue::Lighter), vec![(dec!(101), dec!(1), false)]);
+        let saved = serde_json::to_string(sim.ex.state()).unwrap();
+        let mut back = Sim::cold(p, 2_000);
+        back.ex.restore(serde_json::from_str(&saved).unwrap());
+        let [lighter, hyperliquid] = back.ex.state().clone().map(|st| st.account);
+        assert_eq!((lighter.position(HYPE).qty, lighter.fees), (dec!(1), dec!(0)));
+        assert_eq!((hyperliquid.position(HYPE).qty, hyperliquid.fees), (dec!(-1), dec!(0.04455)), "Hyperliquid's own fee");
+        assert_eq!(back.ex.peek(Venue::Hyperliquid).0.positions[0].qty, dec!(-1));
     }
 
     #[test]
