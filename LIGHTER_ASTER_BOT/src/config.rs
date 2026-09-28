@@ -336,7 +336,7 @@ pub struct LiveAsterCfg {
     #[serde(default = "default_deadman_refresh_ms")]
     pub deadman_refresh_ms: i64,
     /// Live Aster REST write budget per minute. Counts real REST request units, not logical
-    /// strategy decisions: place=1, targeted cancel=1, cancel+place replace=2, each
+    /// strategy decisions: place=1, targeted cancel=1, amend=1, each
     /// CancelAllBot/deadman request=1. `0` resolves to the safe default, not unlimited.
     #[serde(default = "default_aster_max_rest_requests_per_minute")]
     pub max_rest_requests_per_minute: u32,

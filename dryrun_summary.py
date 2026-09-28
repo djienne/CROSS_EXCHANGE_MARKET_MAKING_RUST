@@ -46,6 +46,9 @@ def summary(market: str, since: str | None) -> None:
     h = c["handovers"]
     print(f"  hand-offs to the taker: {h['granted']} granted, cancel->grant p50 {dist(h['cancel_to_grant_ms'])} ms, "
           f"held p50 {dist(h['held_ms'])} ms, resume p50 {dist(h['resume_ms'])} ms, fills while yielding {h['fills_while_yielding']}")
+    q = stats["quotes"]
+    print(f"  xemm quotes/min {q['per_min']}, refresh round trip p50 {dist(q['refresh_round_trip_ms'])} ms, "
+          f"resting {q['uptime_pct']}%")
     print(f"  halts: {len(c['halts'])}{' (last ' + c['halts'][-1] + ')' if c['halts'] else ''}, network paused {c['network_paused_s']} s")
     for venue in ("aster", "lighter", "hyperliquid"):
         if venue in sim:

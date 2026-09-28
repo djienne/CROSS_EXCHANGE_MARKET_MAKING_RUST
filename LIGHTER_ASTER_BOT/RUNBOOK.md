@@ -391,7 +391,8 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
     flat-position evidence.
 - Measured 2026-09-28 from Windows, ~250 ms ping to both venues; venue time = RTT - ping:
   - Aster takes ~100 ms per order call: post-only ~360 ms, cancel ~340 ms, amend ~350 ms,
-    IOC result ~350 ms, so a refresh by cancel+place takes ~700 ms. The user stream has a
+    IOC result ~350 ms, so a refresh by cancel+place would take ~700 ms; the bot refreshes
+    a quote by one amend. The user stream has a
     fill 5-11 ms after the REST result; userTrades has its fee ~1 RTT later. The 10 s
     dead-man fired at 11.1 s.
   - Aster rejects an amend to a crossing price (-2036) and the order rests unchanged. A

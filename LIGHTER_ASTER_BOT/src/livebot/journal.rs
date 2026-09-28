@@ -223,7 +223,7 @@ fn persist_trip(state: &JournalState) -> Result<()> {
 }
 
 fn flush_immediately(kind: &str) -> bool {
-    !matches!(kind, "place" | "replace" | "cancel" | "quote_diagnostic")
+    !matches!(kind, "place" | "amend" | "cancel" | "quote_diagnostic")
 }
 
 /// Must run on its own OS thread: Write/flush are intentionally synchronous here.

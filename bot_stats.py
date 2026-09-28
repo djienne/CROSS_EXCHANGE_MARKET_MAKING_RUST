@@ -4,7 +4,7 @@
 combined_pnl.py says how much was made; this says why. It covers five things:
 - how much of the expected edge each taker trade kept, and which leg lost the rest;
 - how often the entry gate fired;
-- what XEMM trades earned and how fast they were hedged;
+- what XEMM trades earned and how fast they were hedged, and how its quotes were refreshed;
 - what the controller did, and how XEMM handed the rights to the taker;
 - for a dry run, whether the simulator stayed faithful to its latency model.
 The model's targets are in bot.toml [dry_run].
@@ -115,6 +115,47 @@ def xemm(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, A
             "residual": sum(t["residual_qty"] != 0 for t in trades), **{k: dist(v) for k, v in stats.items()}}
 
 
+def quotes(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, Any]:
+    """XEMM's quoting: records per minute, each refresh's round trip (sent to the venue's
+    answer), and the share of the time each side had an order resting."""
+    path = runs / f"bot-{market}-journal.jsonl"
+    lo, hi = since.timestamp() * 1000, now.timestamp() * 1000
+    kinds, answers, side_of = collections.Counter(), collections.Counter(), {}
+    asked: dict[str, int] = {}  # side -> when its refresh was sent
+    resting: dict[str, tuple[str, int]] = {}  # side -> (client id, resting since)
+    round_trip, up = [], collections.Counter()
+    for _, r in iter_jsonl(path) if path.exists() else ():
+        ts, kind, d = r.get("ts_ms", 0), r.get("kind"), r.get("detail")
+        if not lo <= ts <= hi or not isinstance(d, dict):
+            continue
+        cid, side = d.get("client_id"), d.get("side")
+        if kind in ("place", "replace", "amend", "cancel"):
+            kinds[kind] += 1
+            if cid and side:
+                side_of[cid] = side
+            if kind in ("replace", "amend"):
+                asked[side] = ts
+        elif kind == "order_update" and (side := side_of.get(cid)):
+            state, held = d.get("state"), resting.get(side)
+            answers[state] += 1
+            if state in ("accepted", "amended", "amend_rejected") and side in asked:
+                round_trip.append(ts - asked.pop(side))
+            if state in ("accepted", "amended") and (not held or held[0] != cid):
+                # An order that ended unjournaled (a sweep, a restart) counts as resting until
+                # the side's next one, so the uptime is an upper bound.
+                if held:
+                    up[side] += ts - held[1]
+                resting[side] = (cid, ts)
+            elif state in ("cancelled", "filled_or_expired") and held and held[0] == cid:
+                up[side] += ts - resting.pop(side)[1]
+    for side, (_, t) in resting.items():
+        up[side] += hi - t
+    minutes = max(hi - lo, 1) / 60_000
+    return {"per_min": {k: round(n / minutes, 2) for k, n in sorted(kinds.items())}, "answers": dict(answers),
+            "refresh_round_trip_ms": dist(round_trip),
+            "uptime_pct": {s: round(100 * t / max(hi - lo, 1), 1) for s, t in sorted(up.items())}}
+
+
 def controller(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, Any]:
     events = rows(runs / f"bot-{market}.events.jsonl", since, now)
     state_path = runs / f"bot-{market}.state.json"
@@ -179,6 +220,7 @@ def simulator(runs: Path, market: str, since: datetime, now: datetime) -> dict[s
 def report(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, Any]:
     return {"runs": str(runs), "since": iso(since), "now": iso(now), "hours": round((now - since).total_seconds() / 3600, 2),
             "taker": taker(runs, market, since, now), "xemm": xemm(runs, market, since, now),
+            "quotes": quotes(runs, market, since, now),
             "controller": controller(runs, market, since, now), "simulator": simulator(runs, market, since, now)}
 
 

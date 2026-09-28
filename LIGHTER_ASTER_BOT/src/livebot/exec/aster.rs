@@ -463,9 +463,9 @@ impl AsterRest {
 pub(crate) enum CancelOutcome {
     /// Venue explicitly confirmed cancel.
     Canceled,
-    /// Venue says it does not know the order. Safe for cancel, not safe for replace-place.
+    /// Venue says it does not know the order.
     AlreadyGone,
-    /// The order is no longer resting because it filled/expired. Safe for cancel, not for replace-place.
+    /// The order is no longer resting because it filled/expired; its fill may still be on the way.
     FilledOrExpired,
 }
 
@@ -497,9 +497,8 @@ fn parse_one_way(body: &str) -> Result<bool> {
 
 /// Classify a DELETE `/fapi/v3/order` response into cancel success/failure. Aster returns HTTP 200
 /// even for some venue errors, so the BODY decides. `-2011` ("unknown order") is already-gone =
-/// success for ordinary cancels, but not enough proof to place a replacement. `FILLED`/`EXPIRED`
-/// likewise means not resting, but the strategy must wait for the user stream/reconciler before
-/// placing a replacement. Any other code/status is a REAL failure the worker must report as a
+/// success. `FILLED`/`EXPIRED` likewise means not resting, but a fill may not have reached the
+/// strategy yet. Any other code/status is a REAL failure the worker must report as a
 /// `CancelReject` so the strategy keeps the (possibly still-resting) order and freezes.
 fn classify_cancel(body: &str) -> Result<CancelOutcome> {
     match serde_json::from_str::<AsterOrderResp>(body) {
@@ -521,6 +520,40 @@ fn classify_cancel(body: &str) -> Result<CancelOutcome> {
             }
         }
         Err(e) => anyhow::bail!("unparseable cancel response: {e}: {body}"),
+    }
+}
+
+/// A cancel's event: only a confirmed cancel (or an order already gone) closes the slot.
+fn cancel_event(client_id: String, outcome: Result<CancelOutcome>) -> ExecEvent {
+    match outcome {
+        Ok(CancelOutcome::Canceled | CancelOutcome::AlreadyGone) => ExecEvent::CancelAck { client_id },
+        Ok(CancelOutcome::FilledOrExpired) => ExecEvent::CancelFilledOrExpired { client_id },
+        Err(e) => {
+            warn!("aster cancel {client_id} failed: {e:#}");
+            ExecEvent::CancelReject { client_id, reason: e.to_string() }
+        }
+    }
+}
+
+/// Classify a PUT `/fapi/v3/order` outcome. The order keeps its ids, so resting at the new
+/// values is a `PlaceAck`. An order no longer open (-2013, or FILLED/CANCELED/EXPIRED: Aster
+/// cancels one amended to at most its filled qty) closes the slot like a cancel that found it
+/// gone. A definitive refusal (-2036 when it would cross, live 2026-09-28) leaves it resting
+/// unchanged. Anything else is ambiguous.
+fn classify_amend(client_id: String, outcome: Result<String>) -> ExecEvent {
+    let body = match outcome {
+        Ok(body) => body,
+        Err(e) if unknown_order(&e) => return ExecEvent::CancelFilledOrExpired { client_id },
+        Err(e) if definitive_no_fill(&e) => return ExecEvent::AmendReject { client_id, reason: e.to_string() },
+        Err(e) => return ExecEvent::PlaceUnknown { client_id, reason: e.to_string() },
+    };
+    match serde_json::from_str::<AsterOrderResp>(&body) {
+        Ok(AsterOrderResp { status: Some(status), order_id: Some(order_id), .. }) => match status.as_str() {
+            "NEW" | "PARTIALLY_FILLED" => ExecEvent::PlaceAck { client_id, venue_order_id: order_id.to_string() },
+            "FILLED" | "CANCELED" | "EXPIRED" => ExecEvent::CancelFilledOrExpired { client_id },
+            _ => ExecEvent::PlaceUnknown { client_id, reason: format!("unexpected amend status: {body}") },
+        },
+        _ => ExecEvent::PlaceUnknown { client_id, reason: format!("unparseable amend response: {body}") },
     }
 }
 
@@ -587,6 +620,7 @@ fn is_aster_rate_limit_reason(reason: &str) -> bool {
 fn exec_event_rate_limit_reason(ev: &ExecEvent) -> Option<&str> {
     match ev {
         ExecEvent::PlaceReject { reason, .. }
+        | ExecEvent::AmendReject { reason, .. }
         | ExecEvent::PlaceUnknown { reason, .. }
         | ExecEvent::CancelReject { reason, .. }
         | ExecEvent::AsterFlattenReject { reason, .. } if is_aster_rate_limit_reason(reason) => Some(reason.as_str()),
@@ -599,25 +633,24 @@ async fn notify_rate_limited(tx: &Sender<ExecEvent>, reason: String, backoff_ms:
     let _ = tx.send(ExecEvent::AsterRateLimited { reason, backoff_ms }).await;
 }
 
-async fn reject_unsent_maker(tx: &Sender<ExecEvent>, permit: &MakerPermit, client_id: String, reason: String) {
+async fn reject_unsent_maker(tx: &Sender<ExecEvent>, permit: &MakerPermit, unsent: ExecEvent) {
     permit.cancel_queued();
     // A duplicate of a claimed command cannot prove the original was not sent.
     if permit.is_cancelled() {
-        let _ = tx.send(ExecEvent::PlaceReject { client_id, reason }).await;
+        let _ = tx.send(unsent).await;
     }
 }
 
 async fn send_backoff_reject(tx: &Sender<ExecEvent>, cmd: ExecCommand, reason: String, backoff_ms: i64) {
     match cmd {
         ExecCommand::Place { client_id, permit, .. } => {
-            reject_unsent_maker(tx, &permit, client_id, reason.clone()).await;
+            reject_unsent_maker(tx, &permit, ExecEvent::PlaceReject { client_id, reason: reason.clone() }).await;
         }
         ExecCommand::Cancel { client_id, .. } => {
             let _ = tx.send(ExecEvent::CancelReject { client_id, reason: reason.clone() }).await;
         }
-        ExecCommand::Replace { old_client_id, new_client_id, permit, .. } => {
-            let _ = tx.send(ExecEvent::CancelReject { client_id: old_client_id, reason: reason.clone() }).await;
-            reject_unsent_maker(tx, &permit, new_client_id, "replace skipped because Aster REST backoff is active".into()).await;
+        ExecCommand::Amend { client_id, permit, .. } => {
+            reject_unsent_maker(tx, &permit, ExecEvent::AmendReject { client_id, reason: reason.clone() }).await;
         }
         ExecCommand::FlattenAster { intent, .. } => {
             intent.admission.cancel_queued();
@@ -738,20 +771,19 @@ pub async fn run_aster_worker(
                 .chain(std::iter::from_fn(|| rx.try_recv().ok())) {
                 match late {
                     ExecCommand::Place { client_id, permit, .. } => {
-                        reject_unsent_maker(&tx, &permit, client_id, "worker shutdown before send".into()).await;
+                        reject_unsent_maker(&tx, &permit, ExecEvent::PlaceReject { client_id, reason: "worker shutdown before send".into() }).await;
                     }
-                    ExecCommand::Replace { old_client_id, new_client_id, permit, .. } => {
-                        let _ = tx.send(ExecEvent::CancelReject { client_id: old_client_id, reason: "replace not sent during shutdown".into() }).await;
-                        reject_unsent_maker(&tx, &permit, new_client_id, "worker shutdown before send".into()).await;
+                    ExecCommand::Amend { client_id, permit, .. } => {
+                        reject_unsent_maker(&tx, &permit, ExecEvent::AmendReject { client_id, reason: "worker shutdown before send".into() }).await;
                     }
                     ExecCommand::Shutdown => {}
-                    other => { let _ = process_cmd(other, true, &tx, &rest, &mut limiter, &mut backoff_until).await; }
+                    other => process_cmd(other, true, &tx, &rest, &mut limiter, &mut backoff_until).await,
                 }
             }
             break;
         }
         if backoff_until.is_some_and(|until| tokio::time::Instant::now() < until) {
-            let _ = process_cmd(cmd, from_prio, &tx, &rest, &mut limiter, &mut backoff_until).await;
+            process_cmd(cmd, from_prio, &tx, &rest, &mut limiter, &mut backoff_until).await;
             continue;
         }
         if !from_prio {
@@ -762,7 +794,7 @@ pub async fn run_aster_worker(
                     priority = prio_rx.recv(), if prio_open => {
                         match priority {
                             Some(priority) => {
-                                let _ = process_cmd(priority, true, &tx, &rest, &mut limiter, &mut backoff_until).await;
+                                process_cmd(priority, true, &tx, &rest, &mut limiter, &mut backoff_until).await;
                             }
                             None => prio_open = false,
                         }
@@ -772,9 +804,7 @@ pub async fn run_aster_worker(
                 continue;
             }
         }
-        if let Some(followup) = process_cmd(cmd, from_prio, &tx, &rest, &mut limiter, &mut backoff_until).await {
-            pending_normal = Some(followup);
-        }
+        process_cmd(cmd, from_prio, &tx, &rest, &mut limiter, &mut backoff_until).await;
     }
     info!("aster live exec worker stopped");
 }
@@ -789,8 +819,7 @@ async fn process_cmd(
     rest: &Arc<AsterRest>,
     limiter: &mut RestCommandLimiter,
     backoff_until: &mut Option<tokio::time::Instant>,
-) -> Option<ExecCommand> {
-    let mut followup = None;
+) {
     {
         if let Some(until) = *backoff_until {
             let now = tokio::time::Instant::now();
@@ -803,7 +832,7 @@ async fn process_cmd(
                     remaining_ms.max(1),
                 )
                 .await;
-                return None;
+                return;
             }
             *backoff_until = None;
         }
@@ -812,11 +841,12 @@ async fn process_cmd(
         let mut rate_limit_reason: Option<String> = None;
         match cmd {
             ExecCommand::Place { market, side, price_ticks, qty_lots, client_id, permit } => {
-                // This runs after every rate-limit wait and after a Replace's cancel.
+                // This runs after every rate-limit wait.
                 // Revalidate the captured books, rights, and deadline at send ownership.
                 if !permit.try_claim(crate::hotpath::clock::mono_now_ns()) {
-                    reject_unsent_maker(tx, &permit, client_id, "maker admission revoked or expired before send".into()).await;
-                    return None;
+                    let reason = "maker admission revoked or expired before send".into();
+                    reject_unsent_maker(tx, &permit, ExecEvent::PlaceReject { client_id, reason }).await;
+                    return;
                 }
                 limiter.record();
                 let ev = rest.place(&market, side, price_ticks, qty_lots, &client_id, false).await;
@@ -829,59 +859,28 @@ async fn process_cmd(
                 // Only ack a cancel that actually succeeded — a failed cancel must NOT close the
                 // strategy's slot (the order may still be resting). Report the real outcome.
                 limiter.record();
-                let ev = match rest.cancel_order(&market, &client_id).await {
-                    Ok(CancelOutcome::Canceled | CancelOutcome::AlreadyGone) => ExecEvent::CancelAck { client_id },
-                    Ok(CancelOutcome::FilledOrExpired) => ExecEvent::CancelFilledOrExpired { client_id },
-                    Err(e) => {
-                        warn!("aster cancel {client_id} failed: {e:#}");
-                        ExecEvent::CancelReject { client_id, reason: e.to_string() }
-                    }
-                };
+                let outcome = rest.cancel_order(&market, &client_id).await;
+                let ev = cancel_event(client_id, outcome);
                 if let Some(reason) = exec_event_rate_limit_reason(&ev) {
                     rate_limit_reason = Some(reason.to_string());
                 }
                 let _ = tx.send(ev).await;
             }
-            ExecCommand::Replace { old_client_id, new_client_id, market, side, price_ticks, qty_lots, permit, .. } => {
-                // Cancel-then-place: NEVER place the new order unless the old cancel is
-                // VERIFIED — else both could rest at once.
+            ExecCommand::Amend { market, side, client_id, price_ticks, qty_lots, permit } => {
+                // One round trip where cancel-then-place took two. Books that moved, or rights
+                // revoked, before send pull the quote instead, as a replace's cancel always did.
                 limiter.record();
-                match rest.cancel_order(&market, &old_client_id).await {
-                    Ok(CancelOutcome::Canceled) => {
-                        let _ = tx.send(ExecEvent::CancelAck { client_id: old_client_id }).await;
-                        // Re-enter the worker select between cancel and optional replacement.
-                        followup = Some(ExecCommand::Place {
-                            market, side, price_ticks, qty_lots, client_id: new_client_id, permit,
-                        });
-                    }
-                    Ok(outcome) => {
-                        warn!(
-                            "aster replace: old {old_client_id} outcome {outcome:?}; NOT placing new {new_client_id}"
-                        );
-                        match outcome {
-                            CancelOutcome::AlreadyGone => {
-                                let _ = tx.send(ExecEvent::CancelAck { client_id: old_client_id }).await;
-                            }
-                            CancelOutcome::FilledOrExpired => {
-                                let _ = tx.send(ExecEvent::CancelFilledOrExpired { client_id: old_client_id }).await;
-                            }
-                            CancelOutcome::Canceled => unreachable!("handled above"),
-                        }
-                        reject_unsent_maker(tx, &permit, new_client_id,
-                            format!("replace skipped after old cancel outcome {outcome:?}")).await;
-                    }
-                    Err(e) => {
-                        let reason = e.to_string();
-                        if is_aster_rate_limit_reason(&reason) {
-                            rate_limit_reason = Some(reason.clone());
-                        }
-                        warn!("aster replace: cancel {old_client_id} failed ({e:#}); NOT placing new order");
-                        // Old order may still rest; keep the slot and let the strategy freeze/recover.
-                        let _ = tx.send(ExecEvent::CancelReject { client_id: old_client_id, reason }).await;
-                        reject_unsent_maker(tx, &permit, new_client_id,
-                            "replace skipped because old cancel failed".into()).await;
-                    }
+                let ev = if permit.try_claim(crate::hotpath::clock::mono_now_ns()) {
+                    let outcome = rest.amend(&market, side, price_ticks, qty_lots, &client_id).await;
+                    classify_amend(client_id, outcome)
+                } else {
+                    let outcome = rest.cancel_order(&market, &client_id).await;
+                    cancel_event(client_id, outcome)
+                };
+                if let Some(reason) = exec_event_rate_limit_reason(&ev) {
+                    rate_limit_reason = Some(reason.to_string());
                 }
+                let _ = tx.send(ev).await;
             }
             ExecCommand::CancelAllBot => {
                 for market in rest.markets.keys().cloned().collect::<Vec<_>>() {
@@ -907,7 +906,7 @@ async fn process_cmd(
                             cloid: intent.cloid, reason: "correction cancelled or expired before send".into(),
                         }).await;
                     }
-                    return None;
+                    return;
                 }
                 let market = intent.market.clone();
                 let side = intent.hedge_side;
@@ -969,7 +968,6 @@ async fn process_cmd(
             *backoff_until = Some(tokio::time::Instant::now() + Duration::from_millis(rest.rate_limit_backoff_ms as u64));
             notify_rate_limited(tx, reason, rest.rate_limit_backoff_ms).await;
         }
-    followup
 }
 
 fn order_progress(body: &str) -> Option<(Decimal, Option<Decimal>, bool, Option<String>, Option<i64>)> {
@@ -1067,8 +1065,7 @@ mod tests {
 
     #[test]
     fn classify_cancel_distinguishes_success_from_venue_error() {
-        // Ordinary cancels may ack every not-resting outcome, but replace-place only proceeds
-        // after the stronger Canceled outcome.
+        // A cancel acks every not-resting outcome; FILLED/EXPIRED is told apart for the fill wait.
         assert_eq!(
             classify_cancel(r#"{"orderId":1,"status":"CANCELED","clientOrderId":"X1"}"#).unwrap(),
             CancelOutcome::Canceled
@@ -1089,6 +1086,43 @@ mod tests {
         assert!(classify_cancel(r#"{"code":-4000,"msg":"rate limited"}"#).is_err());
         assert!(classify_cancel(r#"{"status":"NEW"}"#).is_err()); // unexpected: cancel didn't take
         assert!(classify_cancel("not json").is_err());
+    }
+
+    #[test]
+    fn a_refused_amend_leaves_the_order_and_a_gone_order_closes_the_slot() {
+        let venue = |status: u16, code: i64| -> Result<String> {
+            Err(VenueFailure { status, code: Some(code), body: String::new() }.into())
+        };
+        let ev = |outcome: Result<String>| classify_amend("X1".into(), outcome);
+        assert!(matches!(ev(Ok(r#"{"orderId":7,"status":"NEW","clientOrderId":"X1"}"#.into())),
+            ExecEvent::PlaceAck { venue_order_id, .. } if venue_order_id == "7"));
+        assert!(matches!(ev(Ok(r#"{"orderId":7,"status":"PARTIALLY_FILLED"}"#.into())), ExecEvent::PlaceAck { .. }));
+        assert!(matches!(ev(Ok(r#"{"orderId":7,"status":"CANCELED"}"#.into())), ExecEvent::CancelFilledOrExpired { .. }));
+        assert!(matches!(ev(venue(400, -2013)), ExecEvent::CancelFilledOrExpired { .. }));
+        assert!(matches!(ev(venue(400, -2036)), ExecEvent::AmendReject { .. }));
+        assert!(matches!(ev(venue(503, -1001)), ExecEvent::PlaceUnknown { .. }));
+        assert!(matches!(ev(Ok(r#"{"status":"NEW"}"#.into())), ExecEvent::PlaceUnknown { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_amend_whose_permit_lapsed_cancels_the_order_instead() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            reply_http(&mut stream, "200 OK", r#"{"orderId":1,"status":"CANCELED","clientOrderId":"A"}"#).await;
+            request
+        });
+        let permit = MakerPermit::for_test();
+        assert!(permit.cancel_queued(), "the strategy revoked it");
+        let (tx, mut rx) = mpsc::channel(8);
+        let amend = ExecCommand::Amend {
+            permit, market: "BTC".into(), side: Side::Buy, client_id: "A".into(), price_ticks: 1000, qty_lots: 10,
+        };
+        process_cmd(amend, false, &tx, &Arc::new(rest_at(&url)), &mut RestCommandLimiter::new(100), &mut None).await;
+        assert!(server.await.unwrap().starts_with("DELETE "), "a lapsed permit must not move the order");
+        assert!(matches!(rx.try_recv(), Ok(ExecEvent::CancelAck { client_id }) if client_id == "A"));
     }
 
     fn rest_at(base_url: &str) -> AsterRest {
@@ -1271,8 +1305,8 @@ mod tests {
             market: "BTC".into(), side: Side::Buy, price_ticks: 1000,
             qty_lots: 10, client_id: "claimed".into(), permit: permit.clone(),
         };
-        assert!(process_cmd(cmd.clone(), false, &tx, &Arc::new(rest_at("http://127.0.0.1:9")),
-            &mut limiter, &mut backoff).await.is_none());
+        process_cmd(cmd.clone(), false, &tx, &Arc::new(rest_at("http://127.0.0.1:9")),
+            &mut limiter, &mut backoff).await;
         send_backoff_reject(&tx, cmd, "backoff".into(), 1).await;
         assert!(matches!(rx.try_recv(), Ok(ExecEvent::AsterRateLimited { .. })));
         assert!(rx.try_recv().is_err(), "duplicate must retain the original unresolved ownership");

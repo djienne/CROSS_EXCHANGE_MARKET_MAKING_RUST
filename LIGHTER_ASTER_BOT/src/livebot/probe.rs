@@ -186,7 +186,7 @@ async fn probe_aster_place_cancel(cfg: &Config, target: &str, i_understand_live:
 async fn aster_steps(cfg: &Config, aster: &AsterRest, spec: &MarketSpec) -> Result<()> {
     let market = spec.market_id.clone();
     let (bid, ask) = aster_book_ticker(cfg, &spec.aster_symbol).await?;
-    // Three refreshes each way: today's cancel-then-place, then an amend in place.
+    // Three refreshes each way: cancel-then-place, then the bot's amend in place.
     let (mut cid, mut oid, lots) = place_ok(aster, spec, Side::Buy, bid * dec!(0.982)).await?;
     for step in 1..=3 {
         let t = Instant::now();

@@ -71,7 +71,7 @@ impl MakerPermit {
     }
 }
 
-/// Strategy → Aster execution worker. Maker placement / cancel / replace / safety cancels +
+/// Strategy → Aster execution worker. Maker placement / cancel / amend / safety cancels +
 /// the dead-man heartbeat.
 #[derive(Debug, Clone)]
 pub enum ExecCommand {
@@ -90,14 +90,14 @@ pub enum ExecCommand {
         client_id: String,
         venue_order_id: Option<String>,
     },
-    /// Cancel-then-place: the worker places the new order only after the old cancel is
-    /// confirmed, so both can never rest at once.
-    Replace {
+    /// Move a resting order to a new price and qty in place (Aster PUT `/fapi/v3/order`), one
+    /// round trip where cancel-then-place took two. The order keeps its ids; a rejected amend
+    /// leaves it resting unchanged.
+    Amend {
         permit: MakerPermit,
         market: MarketId,
         side: Side,
-        old_client_id: String,
-        new_client_id: String,
+        client_id: String,
         price_ticks: i64,
         qty_lots: i64,
     },
@@ -117,12 +117,13 @@ pub enum ExecCommand {
 }
 
 /// Commands eligible for the exec worker's priority lane (jump ahead of queued
-/// places/replaces). Safe by construction:
+/// places/amends). Safe by construction:
 /// - `Cancel` with `venue_order_id: Some(_)`: the id is set ONLY when the strategy has
 ///   processed the `PlaceAck` (orders.rs is the sole setter), which proves no `Place` for
 ///   that client id can still be queued — so reordering cannot produce the
 ///   `-2011 → AlreadyGone → slot cleared → ghost order rests` sequence. Un-acked cancels
-///   (`venue_order_id: None`) stay FIFO.
+///   (`venue_order_id: None`) stay FIFO. An `Amend` it overtakes finds no order (-2013) and
+///   changes nothing.
 /// - `FlattenAster`: reduce-only MARKET with no slot interaction.
 /// - `CancelAllBot` must stay FIFO: sweeping ahead of queued `Place`s
 ///   would let those places rest AFTER the sweep.
@@ -180,6 +181,8 @@ pub struct ExecutionTrade {
 pub enum ExecEvent {
     PlaceAck { client_id: String, venue_order_id: String },
     PlaceReject { client_id: String, reason: String },
+    /// The venue refused an amend: the order rests unchanged at its old price and qty.
+    AmendReject { client_id: String, reason: String },
     /// Placement outcome is ambiguous: the request may have reached the venue, but
     /// the worker did not receive a definitive response. The strategy must freeze
     /// and sweep/reconcile; it must NOT close the local slot as if this were a reject.
@@ -188,7 +191,7 @@ pub enum ExecEvent {
     /// Aster REST quota / overload signal (HTTP 429 or venue code -1003). The strategy freezes
     /// maker quoting and backs off Aster command dispatch briefly.
     AsterRateLimited { reason: String, backoff_ms: i64 },
-    /// A cancel/replace-cancel that FAILED at the venue (or returned a venue error body). The
+    /// A cancel that FAILED at the venue (or returned a venue error body). The
     /// order may still be resting — the strategy must NOT close the slot; it freezes + reconciles.
     CancelReject { client_id: String, reason: String },
     /// The cancel found the order FILLED or EXPIRED: it no longer rests, but a fill may not

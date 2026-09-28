@@ -61,6 +61,7 @@ fn fail(reject: Reject, side: Option<Side>) -> Fail {
         Reject::PriceBand => Fail(400, -4016, "Price is higher than mark price multiplier cap."),
         Reject::ReduceOnly => Fail(400, -2022, "ReduceOnly Order is rejected."),
         Reject::Margin => Fail(400, -2019, "Margin is insufficient."),
+        Reject::WouldCross => Fail(400, -2036, "order modification price cross."),
         Reject::BadNonce => NONCE_EXPIRED,
     }
 }
@@ -374,19 +375,23 @@ impl Aster {
                 };
                 Ok(Value::from(orders.iter().map(order_json).collect::<Vec<_>>()).to_string())
             }
-            ("GET", "/fapi/v3/order") | ("DELETE", "/fapi/v3/order") => {
+            (method @ ("GET" | "DELETE" | "PUT"), "/fapi/v3/order") => {
                 let symbol = symbol.ok_or(MALFORMED)?.to_string();
                 let order = match (get("origClientOrderId"), get("orderId").and_then(|id| id.parse().ok())) {
                     (Some(client_id), _) => OrderRef::Client(client_id.to_string()),
                     (None, Some(id)) => OrderRef::Id(id),
                     (None, None) => return Err(MALFORMED),
                 };
-                let cancel = request.method == "DELETE";
-                let request = if cancel { Request::Cancel { market: symbol, order } } else { Request::Order { order } };
-                match self.call(lane, 1, 0, request).await {
+                let request = match method {
+                    "DELETE" => Request::Cancel { market: symbol, order },
+                    "PUT" => Request::Amend { market: symbol, order, qty: decimal("quantity")?, price: decimal("price")? },
+                    _ => Request::Order { order },
+                };
+                // An amend counts against the order limits.
+                match self.call(lane, 1, u32::from(method == "PUT"), request).await {
                     Ok(Reply::Order(order)) => Ok(order_json(&order).to_string()),
                     // A cancel of an order that is no longer open.
-                    Err(NO_SUCH_ORDER) if cancel => Err(Fail(400, -2011, "Unknown order sent.")),
+                    Err(NO_SUCH_ORDER) if method == "DELETE" => Err(Fail(400, -2011, "Unknown order sent.")),
                     Err(fail) => Err(fail),
                     Ok(_) => Err(fail(Reject::Unavailable, None)),
                 }

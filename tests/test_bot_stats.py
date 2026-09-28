@@ -57,6 +57,30 @@ class BotStatsTests(unittest.TestCase):
         # A Hyperliquid-hedged market's simulator reports its own venues.
         self.assertEqual([v for v in ("aster", "lighter", "hyperliquid") if v in hl], ["aster", "hyperliquid"])
 
+    def test_quote_refreshes_are_timed_and_a_side_rests_until_its_order_ends(self) -> None:
+        t = 1_790_000_000_000
+        rec = lambda ms, kind, **detail: {"ts_ms": t + ms, "kind": kind, "market": "HYPE", "detail": detail}
+        answer = lambda ms, cid, state: rec(ms, "order_update", client_id=cid, state=state)
+        rows = [
+            rec(0, "place", side="Buy", client_id="b1"), answer(100, "b1", "accepted"),
+            # Cancel-then-place: down from the cancel to the new order's ack.
+            rec(1_000, "replace", side="Buy", client_id="b1"), answer(1_100, "b1", "cancelled"),
+            rec(1_100, "place", side="Buy", client_id="b2"), answer(1_200, "b2", "accepted"),
+            # An amend keeps the order resting.
+            rec(2_000, "amend", side="Buy", client_id="b2"), answer(2_100, "b2", "amended"),
+            rec(3_000, "amend", side="Buy", client_id="b2"), answer(3_050, "b2", "amend_rejected"),
+            answer(5_000, "b2", "cancelled"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp)
+            write_jsonl(runs / "bot-HYPE-journal.jsonl", rows)
+            since, until = (datetime.fromtimestamp((t + ms) / 1000, timezone.utc) for ms in (0, 10_000))
+            q = bot_stats.quotes(runs, "HYPE", since, until)
+        self.assertEqual(q["refresh_round_trip_ms"]["n"], 3)
+        self.assertEqual((q["refresh_round_trip_ms"]["p50"], q["refresh_round_trip_ms"]["p90"]), (100, 200))
+        self.assertEqual(q["uptime_pct"], {"Buy": 48.0})  # 100..1100 and 1200..5000 of 10 s
+        self.assertEqual(q["answers"]["amend_rejected"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

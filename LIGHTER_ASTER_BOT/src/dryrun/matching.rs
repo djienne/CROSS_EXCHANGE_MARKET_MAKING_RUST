@@ -126,6 +126,8 @@ pub enum Reject {
     PriceBand,
     ReduceOnly,
     Margin,
+    /// An amend to a price that would take: the order rests unchanged.
+    WouldCross,
 }
 
 /// Why an order stopped working.
@@ -220,6 +222,8 @@ pub struct OrderSpec {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
     Place(OrderSpec),
+    /// Aster's modify of a resting order: its new price and total qty.
+    Amend { market: String, order: OrderRef, qty: Decimal, price: Decimal },
     Cancel { market: String, order: OrderRef },
     CancelAll { market: Option<String> },
     /// Aster `countdownCancelAll`: cancels the market's orders unless re-armed in time; 0 disarms.
@@ -478,6 +482,17 @@ impl VenueState {
     fn view(&self, working: &BTreeMap<String, Working>, leverage: Decimal) -> AccountView {
         self.account.view(&|market: &str| self.marks.get(market).copied(), working, leverage)
     }
+
+    /// Whether the margin covers the open orders plus `qty` more working on `side`.
+    fn affords(&self, market: &str, side: Side, qty: Decimal, leverage: Decimal) -> bool {
+        let mut working = self.working();
+        let w = working.entry(market.to_string()).or_default();
+        match side {
+            Side::Buy => w.buys += qty,
+            Side::Sell => w.sells += qty,
+        }
+        self.view(&working, leverage).available >= Decimal::ZERO
+    }
 }
 
 /// When a pending event is due: `(at, rank, seq)`.
@@ -501,7 +516,7 @@ impl Pending {
     fn acts_at(&self) -> Option<(Venue, i64)> {
         match *self {
             Pending::Gateway { due, ref envelope, .. }
-                if matches!(envelope.request, Request::Place(_) | Request::Cancel { .. } | Request::CancelAll { .. }) =>
+                if matches!(envelope.request, Request::Place(_) | Request::Amend { .. } | Request::Cancel { .. } | Request::CancelAll { .. }) =>
             {
                 Some((envelope.venue, due))
             }
@@ -906,14 +921,12 @@ impl Exchange {
                 Ok(order) => Reply::Order(order),
                 Err(reject) => self.reject(venue, reject),
             },
+            Request::Amend { market, order: which, qty, price } => match self.amend(venue, &market, &which, qty, price) {
+                Ok(order) => Reply::Order(order),
+                Err(reject) => self.reject(venue, reject),
+            },
             Request::Cancel { market, order: which } => {
-                let found = self.venues[v].open.values()
-                    .find(|o| o.market == market && match &which {
-                        OrderRef::Id(id) => o.id == *id,
-                        OrderRef::Client(client_id) => &o.client_id == client_id,
-                    })
-                    .map(|o| o.id);
-                let Some(id) = found else { return self.reject(venue, Reject::UnknownOrder) };
+                let Some(id) = self.find_open(v, &market, &which) else { return self.reject(venue, Reject::UnknownOrder) };
                 let mut order = self.venues[v].open.remove(&id).unwrap();
                 self.finish(venue, &mut order, End::Canceled);
                 Reply::Order(order)
@@ -1015,16 +1028,8 @@ impl Exchange {
                 return Err(Reject::ReduceOnly);
             }
             qty = qty.min(room);
-        } else {
-            let mut working = st.working();
-            let w = working.entry(spec.market.clone()).or_default();
-            match spec.side {
-                Side::Buy => w.buys += qty,
-                Side::Sell => w.sells += qty,
-            }
-            if st.view(&working, self.p.leverage).available < Decimal::ZERO {
-                return Err(Reject::Margin);
-            }
+        } else if !st.affords(&spec.market, spec.side, qty, self.p.leverage) {
+            return Err(Reject::Margin);
         }
         let next = self.next_state(venue, &spec.market);
         let id = self.venues[v].next_id();
@@ -1069,17 +1074,87 @@ impl Exchange {
                 self.finish(venue, &mut order, End::Ioc);
                 return Ok(order);
             }
-            let price = spec.price.unwrap();
-            if let Some(size) = self.venues[v].books[&spec.market].visible(spec.side, price) {
-                let later = next.as_ref().and_then(|n| n.visible(spec.side, price)).unwrap_or_default();
-                let visible = size.max(later);
-                (order.ahead, order.hidden) = (Some(visible), visible * self.p.hidden_queue_multiplier);
-                self.diag[v].queue_ahead.push(visible + order.hidden);
-            }
+            self.join_queue(venue, &mut order, next.as_ref());
         }
         let snapshot = order.clone();
         self.settle(venue, order);
         Ok(snapshot)
+    }
+
+    /// Aster's modify: a resting order takes a new price and total qty and keeps its ids, at
+    /// the back of the queue. One that would take is refused and rests unchanged (live
+    /// 2026-09-28, -2036); one whose new qty is already filled ends Canceled. Live Aster also
+    /// streams an AMENDMENT update, which the bot does not read; none is sent here.
+    fn amend(&mut self, venue: Venue, market: &str, which: &OrderRef, qty: Decimal, price: Decimal) -> Result<Order, Reject> {
+        let v = self.ix(venue);
+        self.diag[v].orders += 1;
+        let Some(id) = self.find_open(v, market, which) else { return Err(Reject::UnknownOrder) };
+        let mut order = self.venues[v].open.remove(&id).unwrap();
+        if let Err(reject) = self.amend_allowed(venue, &order, qty, price) {
+            self.venues[v].open.insert(id, order);
+            return Err(reject);
+        }
+        if qty <= order.filled {
+            self.finish(venue, &mut order, End::Canceled);
+            return Ok(order);
+        }
+        (order.qty, order.price, order.ahead, order.hidden, order.updated_us) = (qty, Some(price), None, Decimal::ZERO, self.now);
+        let next = self.next_state(venue, market);
+        self.join_queue(venue, &mut order, next.as_ref());
+        let snapshot = order.clone();
+        self.settle(venue, order);
+        Ok(snapshot)
+    }
+
+    /// An amend's checks, against the book and the account without the order it amends.
+    fn amend_allowed(&self, venue: Venue, order: &Order, qty: Decimal, price: Decimal) -> Result<(), Reject> {
+        let st = &self.venues[self.ix(venue)];
+        let (Some(book), Some(filters)) = (st.books.get(&order.market), st.filters.get(&order.market)) else {
+            return Err(Reject::UnknownMarket);
+        };
+        if !book.warm() {
+            return Err(Reject::Unavailable);
+        }
+        let spec = OrderSpec {
+            market: order.market.clone(),
+            client_id: order.client_id.clone(),
+            side: order.side,
+            qty,
+            price: Some(price),
+            tif: order.tif,
+            reduce_only: order.reduce_only,
+        };
+        check_filters(filters, &spec, st.marks.get(&order.market).copied())?;
+        if book.crosses(order.side, price) {
+            return Err(Reject::WouldCross);
+        }
+        let rest = (qty - order.filled).max(Decimal::ZERO);
+        if !order.reduce_only && !st.affords(&order.market, order.side, rest, self.p.leverage) {
+            return Err(Reject::Margin);
+        }
+        Ok(())
+    }
+
+    /// Puts a resting order at the back of its level: behind the visible size there now or in
+    /// the update due next, whichever is larger, and the hidden size assumed with it.
+    fn join_queue(&mut self, venue: Venue, order: &mut Order, next: Option<&Replica>) {
+        let v = self.ix(venue);
+        let Some(price) = order.price else { return };
+        if let Some(size) = self.venues[v].books[&order.market].visible(order.side, price) {
+            let later = next.and_then(|n| n.visible(order.side, price)).unwrap_or_default();
+            let visible = size.max(later);
+            (order.ahead, order.hidden) = (Some(visible), visible * self.p.hidden_queue_multiplier);
+            self.diag[v].queue_ahead.push(visible + order.hidden);
+        }
+    }
+
+    fn find_open(&self, v: usize, market: &str, which: &OrderRef) -> Option<u64> {
+        self.venues[v].open.values()
+            .find(|o| o.market == market && match which {
+                OrderRef::Id(id) => o.id == *id,
+                OrderRef::Client(client_id) => &o.client_id == client_id,
+            })
+            .map(|o| o.id)
     }
 
     /// What a resting or taking order can still fill: its remainder, capped for reduce-only
@@ -1415,7 +1490,7 @@ mod tests {
         }
 
         fn send(&mut self, venue: Venue, request: Request) -> u64 {
-            let orders = u32::from(matches!(request, Request::Place(_)));
+            let orders = u32::from(matches!(request, Request::Place(_) | Request::Amend { .. }));
             self.ex.submit(Envelope { venue, lane: 1, weight: 1, orders, nonce: None, request })
         }
 
@@ -1508,6 +1583,39 @@ mod tests {
         sim.at(500);
         assert_eq!(sim.fills(Venue::Aster), vec![(dec!(99), dec!(1.5), true), (dec!(99), dec!(0.5), true)]);
         assert!(sim.open(Venue::Aster).is_empty());
+    }
+
+    #[test]
+    fn an_amend_keeps_the_ids_rejoins_the_queue_and_never_takes() {
+        let mut sim = Sim::new();
+        let ticket = sim.send(Venue::Aster, limit(Side::Buy, dec!(2), dec!(98), Tif::PostOnly));
+        sim.print(Venue::Aster, 200, dec!(98), dec!(3), Side::Sell);
+        sim.at(300);
+        let order = placed(&sim, ticket);
+        let amend = |qty, price| Request::Amend { market: HYPE.into(), order: OrderRef::Client("c".into()), qty, price };
+        // Onto the ask: refused, and the order rests as it was, 2 behind at 98.
+        let cross = sim.send(Venue::Aster, amend(dec!(2), dec!(101)));
+        sim.at(400);
+        assert_eq!(sim.reply(cross), Some(&Reply::Reject(Reject::WouldCross)));
+        let rest = sim.open(Venue::Aster)[0];
+        assert_eq!((rest.price, rest.qty, rest.ahead), (Some(dec!(98)), dec!(2), Some(dec!(2))));
+        // Up to 99 for 3: the same order, at the back of the 99 queue.
+        let moved = sim.send(Venue::Aster, amend(dec!(3), dec!(99)));
+        sim.at(500);
+        let now = placed(&sim, moved);
+        assert_eq!((now.id, now.price, now.qty, now.status), (order.id, Some(dec!(99)), dec!(3), Status::New));
+        assert_eq!((now.ahead, now.hidden), (Some(dec!(5)), dec!(2.5)));
+        sim.print(Venue::Aster, 600, dec!(99), dec!(8.5), Side::Sell);
+        sim.at(700);
+        assert_eq!(sim.fills(Venue::Aster), vec![(dec!(99), dec!(1), true)]);
+        // Down to what already filled: it ends.
+        let shrink = sim.send(Venue::Aster, amend(dec!(1), dec!(99)));
+        sim.at(800);
+        assert_eq!(placed(&sim, shrink).status, Status::Done(End::Canceled));
+        assert!(sim.open(Venue::Aster).is_empty());
+        let gone = sim.send(Venue::Aster, amend(dec!(2), dec!(99)));
+        sim.at(900);
+        assert_eq!(sim.reply(gone), Some(&Reply::Reject(Reject::UnknownOrder)));
     }
 
     #[test]

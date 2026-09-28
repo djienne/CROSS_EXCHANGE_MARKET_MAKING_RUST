@@ -39,7 +39,7 @@ use super::exec::command::{ExecCommand, ExecEvent, HedgeCommand, MakerPermit};
 use super::fills::{AsterFill, FillDedup, HedgeIntent, HedgeState, IntentPurpose};
 use super::ids::{SessionId, Cloid};
 use super::journal::{Journal, JournalDetail, QuoteRecord, DiagnosticRecord};
-use super::orders::{CancelAfterAckReason, CancelTarget, OrderLifecycle, OrderManager};
+use super::orders::{CancelTarget, MakerSlot, OrderLifecycle, OrderManager, MAX_AMENDS_PER_ORDER};
 use super::risk::{evaluate_maker_gate, position_mismatch, CooldownScope, CooldownState, MakerGateInputs};
 use super::precheck::{hot_precheck_side, HotPrecheck};
 use super::scale::MarketScale;
@@ -742,7 +742,6 @@ pub struct Strategy {
     /// account snapshot proves no bot-owned Aster orders remain.
     sweep_pending: Option<SweepState>,
     /// Rolling one-minute budget of Aster REST commands successfully enqueued by the strategy.
-    /// A cancel+place replace counts as two because the worker performs two REST writes.
     aster_cmd_times_ns: VecDeque<i64>,
     /// Local freeze/backoff deadline after an Aster HTTP 429 / code -1003 notification.
     aster_rate_limited_until_ns: i64,
@@ -1246,7 +1245,6 @@ impl Strategy {
 
     fn aster_command_cost(&self, cmd: &ExecCommand) -> u32 {
         match cmd {
-            ExecCommand::Replace { .. } => 2, // worker performs cancel + place
             ExecCommand::CancelAllBot => self.markets.len().max(1) as u32,
             ExecCommand::Shutdown | ExecCommand::Barrier { .. } => 0,
             _ => 1,
@@ -2268,28 +2266,30 @@ impl Strategy {
                 if qty_lots <= 0 {
                     return;
                 }
-                let old_cid = match self.orders.slot(market, side) {
-                    Some(s) if s.state == OrderLifecycle::Open => s.client_id.clone(),
-                    None => None,
+                let (client_id, amends) = match self.orders.slot(market, side) {
+                    Some(s) if s.state == OrderLifecycle::Open => (s.client_id.clone(), s.amends),
+                    None => (None, 0),
                     Some(_) => return,
                 };
-                let Some(old_cid) = old_cid else { return };
+                let Some(client_id) = client_id else { return };
                 if self.sweep_pending.is_some() {
                     return;
                 }
-                let full_replace_budget_ok = self.aster_budget_allows(AsterCommandPriority::Optional, 2, now_ns);
-                if non_urgent && (self.exec_queue_low_for_optional_work() || !full_replace_budget_ok) {
+                let amend_budget_ok = self.aster_budget_allows(AsterCommandPriority::Optional, 1, now_ns);
+                if non_urgent && (self.exec_queue_low_for_optional_work() || !amend_budget_ok) {
                     debug!(
-                        "exec queue/budget backpressure: skipping optional replace for {market} {side:?} ({}) (capacity={} budget_ok={})",
+                        "exec queue/budget backpressure: skipping optional amend for {market} {side:?} ({}) (capacity={} budget_ok={})",
                         reason.as_str(),
                         self.exec_tx.capacity(),
-                        full_replace_budget_ok
+                        amend_budget_ok
                     );
                     return;
                 }
-                if !non_urgent && (self.exec_queue_low_for_optional_work() || !full_replace_budget_ok) {
-                    // Under backpressure, prefer a cancel-only risk reduction over adding a cancel+place
-                    // replace. This drains stale/unprofitable exposure while preserving queue reserve.
+                let amend_capped = amends >= MAX_AMENDS_PER_ORDER;
+                if amend_capped || (!non_urgent && (self.exec_queue_low_for_optional_work() || !amend_budget_ok)) {
+                    // Under backpressure, prefer a cancel-only risk reduction over an amend. This
+                    // drains stale/unprofitable exposure while preserving queue reserve. An order
+                    // at the amend cap is cancelled too; the next tick places a fresh one.
                     let target = self.cancel_target(market, side, now_ns);
                     let CancelTarget::Send { client_id, venue_order_id } = target else {
                         return;
@@ -2302,7 +2302,8 @@ impl Strategy {
                     match self.try_send_aster_cmd(cmd, AsterCommandPriority::RiskReducing, now_ns) {
                         ExecDispatch::Sent => {
                             self.orders.on_cancel_sent(market, side, now_ns);
-                            self.journal.reason(now_ns, "cancel", Some(market.0.clone()), "BACKPRESSURE_CANCEL_ONLY");
+                            let why = if amend_capped { "AMEND_CAP_CANCEL" } else { "BACKPRESSURE_CANCEL_ONLY" };
+                            self.journal.reason(now_ns, "cancel", Some(market.0.clone()), why);
                         }
                         ExecDispatch::BudgetBlocked => {
                             self.note_aster_budget_block(now_ns, "urgent_cancel_only_budget_blocked", AsterCommandPriority::RiskReducing);
@@ -2315,44 +2316,39 @@ impl Strategy {
                     }
                     return;
                 }
-                if let Some(new_cid) = self.orders.next_client_id(market, side) {
-                    let permit = self.maker_permit(market, now_ns, versions);
-                    let admission = permit.admission.clone();
-                    let cmd = ExecCommand::Replace {
-                        permit,
-                        market: market.clone(),
-                        side,
-                        old_client_id: old_cid,
-                        new_client_id: new_cid.clone(),
-                        price_ticks,
-                        qty_lots,
-                    };
-                    let priority = if non_urgent { AsterCommandPriority::Optional } else { AsterCommandPriority::RiskReducing };
-                    match self.try_send_aster_cmd(cmd, priority, now_ns) {
-                        ExecDispatch::Sent => {
-                            // Keep the old client id active until its cancel is verified. The worker
-                            // emits CancelAck(old) before PlaceAck(new); only then do we promote the
-                            // replacement to PendingPlace. This preserves fill/cancel attribution during
-                            // the cancel-then-place race window.
-                            self.orders.on_replace_sent(market, side, new_cid, price_ticks, qty_lots, now_ns);
-                            self.orders.bind_admission(market, side, admission);
-                            self.clear_aster_touch_guard(market, side, now_ns);
-                            self.journal.typed(now_ns, "replace", Some(market.0.clone()), JournalDetail::Quote(QuoteRecord { side, price: Some(desired.price), qty: Some(desired.qty), reason: Some(reason.as_str()), client_id: self.orders.slot(market, side).and_then(|s| s.client_id.clone()) }), "confirmed");
-                        }
-                        ExecDispatch::BudgetBlocked if non_urgent => {
-                            debug!("Aster command budget/backoff: optional replace deferred for {market} {side:?} ({})", reason.as_str());
-                        }
-                        ExecDispatch::BudgetBlocked => {
-                            self.note_aster_budget_block(now_ns, "urgent_replace_budget_blocked", AsterCommandPriority::RiskReducing);
-                            self.freeze_and_sweep(now_ns, "aster_command_budget_exhausted");
-                        }
-                        ExecDispatch::QueueFull if non_urgent => {
-                            warn!("exec queue full: optional replace deferred for {market} {side:?} ({})", reason.as_str());
-                        }
-                        ExecDispatch::QueueFull | ExecDispatch::QueueClosed => {
-                            warn!("exec queue full/closed: replace NOT sent for {market} {side:?}; freezing + safety sweep");
-                            self.freeze_and_sweep(now_ns, "exec_queue_send_failed");
-                        }
+                let permit = self.maker_permit(market, now_ns, versions);
+                let admission = permit.admission.clone();
+                let cmd = ExecCommand::Amend {
+                    permit,
+                    market: market.clone(),
+                    side,
+                    client_id: client_id.clone(),
+                    price_ticks,
+                    qty_lots,
+                };
+                let priority = if non_urgent { AsterCommandPriority::Optional } else { AsterCommandPriority::RiskReducing };
+                match self.try_send_aster_cmd(cmd, priority, now_ns) {
+                    ExecDispatch::Sent => {
+                        // The order keeps its client id, so fills and cancels stay attributed
+                        // while the amend is in flight.
+                        self.orders.on_amend_sent(market, side, price_ticks, qty_lots, now_ns);
+                        self.orders.bind_admission(market, side, admission);
+                        self.clear_aster_touch_guard(market, side, now_ns);
+                        self.journal.typed(now_ns, "amend", Some(market.0.clone()), JournalDetail::Quote(QuoteRecord { side, price: Some(desired.price), qty: Some(desired.qty), reason: Some(reason.as_str()), client_id: Some(client_id) }), "confirmed");
+                    }
+                    ExecDispatch::BudgetBlocked if non_urgent => {
+                        debug!("Aster command budget/backoff: optional amend deferred for {market} {side:?} ({})", reason.as_str());
+                    }
+                    ExecDispatch::BudgetBlocked => {
+                        self.note_aster_budget_block(now_ns, "urgent_amend_budget_blocked", AsterCommandPriority::RiskReducing);
+                        self.freeze_and_sweep(now_ns, "aster_command_budget_exhausted");
+                    }
+                    ExecDispatch::QueueFull if non_urgent => {
+                        warn!("exec queue full: optional amend deferred for {market} {side:?} ({})", reason.as_str());
+                    }
+                    ExecDispatch::QueueFull | ExecDispatch::QueueClosed => {
+                        warn!("exec queue full/closed: amend NOT sent for {market} {side:?}; freezing + safety sweep");
+                        self.freeze_and_sweep(now_ns, "exec_queue_send_failed");
                     }
                 }
             }
@@ -2532,56 +2528,29 @@ impl Strategy {
     pub fn handle_exec_event(&mut self, ev: ExecEvent, now_ns: i64) {
         if matches!(&ev, ExecEvent::MakerOrderProgress { .. } | ExecEvent::ExecutionProgress { .. }
             | ExecEvent::AsterFlattenAck { .. }) { self.revoke_makers(); }
+        let amended = |id: &str| self.find_slot_by_client(id).and_then(|(m, side)| self.orders.slot(&m, side)).is_some_and(MakerSlot::amending);
         let order_evidence = match &ev {
-            ExecEvent::PlaceAck { client_id, venue_order_id } => Some(JournalDetail::Order { client_id: client_id.clone(), venue_order_id: Some(venue_order_id.clone()), state: "accepted" }),
+            ExecEvent::PlaceAck { client_id, venue_order_id } => Some(JournalDetail::Order { client_id: client_id.clone(), venue_order_id: Some(venue_order_id.clone()),
+                state: if amended(client_id) { "amended" } else { "accepted" } }),
+            ExecEvent::AmendReject { client_id, .. } => Some(JournalDetail::Order { client_id: client_id.clone(), venue_order_id: None, state: "amend_rejected" }),
             ExecEvent::CancelAck { client_id } => Some(JournalDetail::Order { client_id: client_id.clone(), venue_order_id: None, state: "cancelled" }),
             ExecEvent::CancelFilledOrExpired { client_id } => Some(JournalDetail::Order { client_id: client_id.clone(), venue_order_id: None, state: "filled_or_expired" }),
             _ => None,
         };
         match ev {
             ExecEvent::PlaceAck { client_id, venue_order_id } => {
-                if let Some((market, side, cancel_venue_order_id, cancel_reason)) =
-                    self.ack_by_client_id(&client_id, venue_order_id)
-                {
-                    warn!(
-                        "replacement {client_id} acked after {}; cancelling it immediately",
-                        cancel_reason.as_str()
-                    );
-                    let cmd = ExecCommand::Cancel {
-                        market: market.clone(),
-                        client_id: client_id.clone(),
-                        venue_order_id: cancel_venue_order_id,
-                    };
-                    if self.sweep_pending.is_some() {
-                        warn!(
-                            "cancel-after-ack for {market} {side:?} suppressed while safety sweep is pending; sweep owns cleanup"
-                        );
-                    } else {
-                        match self.try_send_aster_cmd(cmd, AsterCommandPriority::RiskReducing, now_ns) {
-                            ExecDispatch::Sent => {
-                                self.orders.on_cancel_sent(&market, side, now_ns);
-                                self.journal.reason(now_ns, "cancel_after_ack", Some(market.0.clone()), cancel_reason.as_str());
-                            }
-                            ExecDispatch::BudgetBlocked => {
-                                self.note_aster_budget_block(now_ns, "cancel_after_ack", AsterCommandPriority::RiskReducing);
-                                self.freeze(now_ns, "cancel_after_ack_budget_blocked");
-                                self.request_safety_sweep(now_ns, "cancel_after_ack_budget_blocked");
-                            }
-                            ExecDispatch::QueueFull | ExecDispatch::QueueClosed => {
-                                error!(
-                                    "CRITICAL: cancel-after-ack for {market} {side:?} dropped (queue/backpressure); freezing + safety sweep"
-                                );
-                                self.freeze(now_ns, "cancel_after_ack_dispatch_failed");
-                                self.request_safety_sweep(now_ns, "cancel_after_ack_dispatch_failed");
-                            }
-                        }
-                    }
+                if let Some((m, side)) = self.find_slot_by_client(&client_id) {
+                    self.orders.on_acked(&m, side, venue_order_id);
                 }
             }
-            ExecEvent::PlaceReject { client_id, reason } => {
-                warn!("place rejected (client {client_id}): {reason}");
-                let slot_info = self.find_slot_by_client(&client_id);
-                self.close_by_client_id(&client_id);
+            ExecEvent::PlaceReject { ref client_id, ref reason } | ExecEvent::AmendReject { ref client_id, ref reason } => {
+                // A refused place never rested; a refused amend rests unchanged.
+                let amend = matches!(ev, ExecEvent::AmendReject { .. });
+                warn!("{} rejected (client {client_id}): {reason}", if amend { "amend" } else { "place" });
+                let slot_info = self.find_slot_by_client(client_id);
+                if let Some((m, side)) = &slot_info {
+                    if amend { self.orders.on_amend_rejected(m, *side) } else { self.orders.on_closed(m, *side) }
+                }
                 if reason.to_ascii_lowercase().contains("insufficient") {
                     if let Some((m, side)) = slot_info {
                         if !self.margin_suppressed.contains_key(&(m.clone(), side)) {
@@ -2600,13 +2569,13 @@ impl Strategy {
                 self.request_safety_sweep(now_ns, "place_unknown");
             }
             ExecEvent::CancelAck { client_id } => {
-                self.cancel_ack_by_client_id(&client_id);
+                self.close_by_client_id(&client_id);
             }
             ExecEvent::CancelFilledOrExpired { client_id } => {
                 // Not resting any more, so no sweep. The gate stays closed until the fill (user
                 // stream) or a terminal backfill (`recover_orphans`) accounts for the order.
                 self.uncertain_makers.insert(client_id.clone(), now_ns);
-                self.cancel_ack_by_client_id(&client_id);
+                self.close_by_client_id(&client_id);
             }
             ExecEvent::MakerOrderMissing { client_id } => {
                 // The uncertainty began after the order was signed, so once its nonce has
@@ -2728,29 +2697,6 @@ impl Strategy {
         self.freeze_and_sweep(now_ns, "execution_rejected");
     }
 
-    /// Ack a placed order by client id. Returns `(market, side, venue_order_id)` when this ack
-    /// belongs to a replacement that was already marked for post-fill/gate-close cancellation.
-    fn ack_by_client_id(
-        &mut self,
-        client_id: &str,
-        venue_order_id: String,
-    ) -> Option<(MarketId, Side, Option<String>, CancelAfterAckReason)> {
-        if let Some((m, side)) = self.find_slot_by_client(client_id) {
-            if let Some(cancel_after_ack_reason) = self.orders.on_acked(&m, side, venue_order_id) {
-                let venue_order_id = self
-                    .orders
-                    .slot(&m, side)
-                    .and_then(|slot| slot.venue_order_id.clone());
-                return Some((m, side, venue_order_id, cancel_after_ack_reason));
-            }
-        }
-        None
-    }
-    fn cancel_ack_by_client_id(&mut self, client_id: &str) {
-        if let Some((m, side)) = self.find_slot_by_client(client_id) {
-            self.orders.on_cancel_acked(&m, side);
-        }
-    }
     fn close_by_client_id(&mut self, client_id: &str) {
         if let Some((m, side)) = self.find_slot_by_client(client_id) {
             self.orders.on_closed(&m, side);
@@ -4285,25 +4231,24 @@ lighter_symbol = "BTC"
             Ok(ExecCommand::Place { client_id, .. }) => client_id,
             other => panic!("place must emit, got {other:?}"),
         };
-        strat.handle_exec_event(ExecEvent::PlaceAck { client_id: place_cid, venue_order_id: "oid0".into() }, t0 + 1);
+        strat.handle_exec_event(ExecEvent::PlaceAck { client_id: place_cid.clone(), venue_order_id: "oid0".into() }, t0 + 1);
         // Non-urgent replace within the interval => THROTTLED (no command emitted).
         let t_soon = t0 + (min_ms - 5) * 1_000_000;
         strat.apply_decision(&m, Side::Buy, SideDecision::Replace { desired: Box::new(desired.clone()), reason: ReplaceReason::PriceChanged }, &scale, t_soon).await;
         assert!(erx.try_recv().is_err(), "non-urgent replace within min_requote_interval must be throttled");
         // Urgent replace within the interval => BYPASSES (records last_requote_ns = t_soon).
         strat.apply_decision(&m, Side::Buy, SideDecision::Replace { desired: Box::new(desired.clone()), reason: ReplaceReason::NoLongerProfitable }, &scale, t_soon).await;
-        let (old_cid, new_cid) = match erx.try_recv() {
-            Ok(ExecCommand::Replace { old_client_id, new_client_id, .. }) => (old_client_id, new_client_id),
+        match erx.try_recv() {
+            Ok(ExecCommand::Amend { client_id, .. }) => assert_eq!(client_id, place_cid, "an amend keeps the order's id"),
             other => panic!("urgent NoLongerProfitable replace must bypass the throttle, got {other:?}"),
-        };
+        }
         // After the interval (measured from t_soon), a non-urgent replace goes through.
         let t_later = t_soon + (min_ms + 5) * 1_000_000;
         strat.apply_decision(&m, Side::Buy, SideDecision::Replace { desired: Box::new(desired.clone()), reason: ReplaceReason::QuantityChanged }, &scale, t_later).await;
-        assert!(erx.try_recv().is_err(), "must not send a second replace while the first replace is pending");
-        strat.handle_exec_event(ExecEvent::CancelAck { client_id: old_cid }, t_soon + 1);
-        strat.handle_exec_event(ExecEvent::PlaceAck { client_id: new_cid, venue_order_id: "oid1".into() }, t_soon + 2);
+        assert!(erx.try_recv().is_err(), "must not send a second amend while the first is pending");
+        strat.handle_exec_event(ExecEvent::PlaceAck { client_id: place_cid, venue_order_id: "oid0".into() }, t_soon + 1);
         strat.apply_decision(&m, Side::Buy, SideDecision::Replace { desired: Box::new(desired), reason: ReplaceReason::QuantityChanged }, &scale, t_later).await;
-        assert!(matches!(erx.try_recv(), Ok(ExecCommand::Replace { .. })), "non-urgent replace after the interval must go through");
+        assert!(matches!(erx.try_recv(), Ok(ExecCommand::Amend { .. })), "non-urgent replace after the interval must go through");
     }
 
     #[tokio::test]

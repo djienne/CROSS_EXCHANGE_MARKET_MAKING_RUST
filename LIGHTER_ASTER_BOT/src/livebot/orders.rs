@@ -21,8 +21,8 @@ pub enum OrderLifecycle {
     Open,
     /// Cancel sent, not yet confirmed (still potentially fillable).
     PendingCancel,
-    /// Cancel-then-place replace sent; the old order stays current until its cancel is confirmed.
-    PendingReplace,
+    /// Amend sent, not yet answered: the order rests at its old or its new values until then.
+    PendingAmend,
     /// No live order in this slot.
     Idle,
 }
@@ -35,7 +35,7 @@ impl OrderLifecycle {
             OrderLifecycle::PendingPlace
                 | OrderLifecycle::Open
                 | OrderLifecycle::PendingCancel
-                | OrderLifecycle::PendingReplace
+                | OrderLifecycle::PendingAmend
         )
     }
 }
@@ -54,24 +54,9 @@ pub enum CancelTarget {
     None,
 }
 
-/// Why a queued cancel-then-place replacement must be canceled immediately
-/// once its replacement order is acked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CancelAfterAckReason {
-    CancelRequestedDuringPendingReplace,
-    FillDuringPendingReplace,
-}
-
-impl CancelAfterAckReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CancelAfterAckReason::CancelRequestedDuringPendingReplace => {
-                "CANCEL_REQUESTED_DURING_PENDING_REPLACE"
-            }
-            CancelAfterAckReason::FillDuringPendingReplace => "FILL_DURING_PENDING_REPLACE",
-        }
-    }
-}
+/// Aster allows 10 000 amends per order; past this many the quote is cancelled, and the next
+/// tick places a fresh order.
+pub const MAX_AMENDS_PER_ORDER: u32 = 9_000;
 
 /// One side's current order in one market.
 #[derive(Debug, Clone)]
@@ -81,21 +66,16 @@ pub struct MakerSlot {
     pub client_id: Option<String>,
     pub venue_order_id: Option<String>,
     pub price_ticks: i64,
-    /// Original order size in lots. The live venue reports cumulative fills (`z`), so keep
-    /// this immutable per order and track `filled_lots` separately; hot-path quote/cancel
-    /// decisions use the remaining lots.
+    /// Order size in lots, which only an amend changes. The live venue reports cumulative
+    /// fills (`z`) per order, amends included, so track `filled_lots` separately; hot-path
+    /// quote/cancel decisions use the remaining lots.
     pub qty_lots: i64,
     pub filled_lots: i64,
-    /// Replacement order that should become current only after the old order's
-    /// cancel is confirmed. Until then `client_id` remains the still-fillable old
-    /// order, preserving fill/cancel attribution during cancel-then-place.
-    pending_replace_client_id: Option<String>,
-    pending_replace_price_ticks: i64,
-    pending_replace_qty_lots: i64,
-    /// A cancel request or fill arrived while a cancel+place replace was already in flight.
-    /// The old order must stay attributed until its cancel result arrives, but if the worker
-    /// subsequently places the replacement, cancel it immediately on ack.
-    cancel_after_ack_reason: Option<CancelAfterAckReason>,
+    /// While an amend is in flight, the price and qty it replaces: the order rests at either
+    /// until the venue answers. `price_ticks` and `qty_lots` hold the amended values.
+    amend_from: Option<(i64, i64)>,
+    /// Amends of this order so far.
+    pub amends: u32,
     /// Monotonic ns of the last targeted cancel successfully enqueued for this client id.
     /// Used to suppress duplicate cancel spam while a cancel is already pending.
     last_cancel_attempt_ns: i64,
@@ -115,10 +95,8 @@ impl MakerSlot {
             price_ticks: 0,
             qty_lots: 0,
             filled_lots: 0,
-            pending_replace_client_id: None,
-            pending_replace_price_ticks: 0,
-            pending_replace_qty_lots: 0,
-            cancel_after_ack_reason: None,
+            amend_from: None,
+            amends: 0,
             last_cancel_attempt_ns: i64::MIN,
             last_requote_ns: i64::MIN,
             quote_epoch: 0,
@@ -138,6 +116,15 @@ impl MakerSlot {
     pub fn throttle_ok(&self, now_ns: i64, min_interval_ms: u64) -> bool {
         now_ns.saturating_sub(self.last_requote_ns) >= (min_interval_ms as i64) * 1_000_000
     }
+
+    pub fn amending(&self) -> bool {
+        self.amend_from.is_some()
+    }
+
+    /// The most this order can still fill: during an amend, from the larger of its two sizes.
+    fn fillable_lots(&self) -> i64 {
+        self.amend_from.map_or(self.qty_lots, |(_, old)| old.max(self.qty_lots))
+    }
 }
 
 fn clear_slot(slot: &mut MakerSlot) {
@@ -148,16 +135,23 @@ fn clear_slot(slot: &mut MakerSlot) {
     slot.price_ticks = 0;
     slot.qty_lots = 0;
     slot.filled_lots = 0;
-    slot.pending_replace_client_id = None;
-    slot.pending_replace_price_ticks = 0;
-    slot.pending_replace_qty_lots = 0;
-    slot.cancel_after_ack_reason = None;
+    slot.amend_from = None;
+    slot.amends = 0;
     slot.last_cancel_attempt_ns = i64::MIN;
 }
 
-fn mark_cancel_after_ack(slot: &mut MakerSlot, reason: CancelAfterAckReason) {
-    if slot.cancel_after_ack_reason.is_none() {
-        slot.cancel_after_ack_reason = Some(reason);
+/// The venue answered an amend: an ack keeps the new values, a refusal restores the old. A
+/// fill that covered the order meanwhile closes the slot.
+fn settle_amend(slot: &mut MakerSlot, accepted: bool) {
+    let Some((price_ticks, qty_lots)) = slot.amend_from.take() else { return };
+    if !accepted {
+        (slot.price_ticks, slot.qty_lots) = (price_ticks, qty_lots);
+    }
+    if slot.state == OrderLifecycle::PendingAmend {
+        slot.state = OrderLifecycle::Open;
+    }
+    if slot.filled_lots >= slot.qty_lots {
+        clear_slot(slot);
     }
 }
 
@@ -253,7 +247,7 @@ impl OrderManager {
 
     pub fn potential_lots(&self, market: &MarketId, side: Side) -> i64 {
         self.slot(market, side).filter(|s| s.is_live()).map(|s|
-            s.remaining_lots().saturating_add(s.pending_replace_qty_lots.max(0))).unwrap_or(0)
+            s.fillable_lots().saturating_sub(s.filled_lots).max(0)).unwrap_or(0)
     }
 
     /// Allocate the next client id for a new order on (market, side), bumping the epoch.
@@ -284,96 +278,61 @@ impl OrderManager {
             slot.price_ticks = price_ticks;
             slot.qty_lots = qty_lots;
             slot.filled_lots = 0;
-            slot.pending_replace_client_id = None;
-            slot.pending_replace_price_ticks = 0;
-            slot.pending_replace_qty_lots = 0;
-            slot.cancel_after_ack_reason = None;
+            slot.amend_from = None;
+            slot.amends = 0;
             slot.last_cancel_attempt_ns = i64::MIN;
             slot.last_requote_ns = now_ns;
         }
     }
 
-    /// Record that a cancel-then-place replace was sent. The OLD order remains
-    /// the active/fillable client id until the worker confirms its cancel; the NEW
-    /// client id is only promoted to `PendingPlace` by [`on_cancel_acked`].
-    pub fn on_replace_sent(
-        &mut self,
-        market: &MarketId,
-        side: Side,
-        new_client_id: String,
-        new_price_ticks: i64,
-        new_qty_lots: i64,
-        now_ns: i64,
-    ) {
-        self.remember_maker(market, side, &new_client_id, new_qty_lots);
+    /// Record an amend of the Open order on (market, side) to new values. The order keeps its
+    /// ids; the old values stay until the venue answers, since a fill may land at either.
+    pub fn on_amend_sent(&mut self, market: &MarketId, side: Side, price_ticks: i64, qty_lots: i64, now_ns: i64) {
         self.record_replace(market, now_ns);
-        if let Some(m) = self.market_mut(market) {
-            let slot = match side {
-                Side::Buy => &mut m.bid,
-                Side::Sell => &mut m.ask,
-            };
-            if slot.state == OrderLifecycle::Open {
-                slot.state = OrderLifecycle::PendingReplace;
-                slot.pending_replace_client_id = Some(new_client_id);
-                slot.pending_replace_price_ticks = new_price_ticks;
-                slot.pending_replace_qty_lots = new_qty_lots;
-                slot.cancel_after_ack_reason = None;
-                slot.last_cancel_attempt_ns = i64::MIN;
-                slot.last_requote_ns = now_ns;
-            }
+        let Some(m) = self.market_mut(market) else { return };
+        let slot = match side {
+            Side::Buy => &mut m.bid,
+            Side::Sell => &mut m.ask,
+        };
+        if slot.state != OrderLifecycle::Open {
+            return;
+        }
+        slot.amend_from = Some((slot.price_ticks, slot.qty_lots));
+        (slot.price_ticks, slot.qty_lots) = (price_ticks, qty_lots);
+        slot.state = OrderLifecycle::PendingAmend;
+        slot.amends += 1;
+        slot.last_requote_ns = now_ns;
+        // The reconciler judges a filled order by its size: keep the larger one.
+        let client_id = slot.client_id.clone();
+        if let Some(query) = self.recent_makers.iter_mut().find(|q| Some(&q.client_id) == client_id.as_ref()) {
+            query.qty_lots = query.qty_lots.max(qty_lots);
         }
     }
 
-    /// Record a cancel ack for the CURRENT client id. For a normal cancel this
-    /// empties the slot. For a pending replace it atomically promotes the queued
-    /// replacement to `PendingPlace`, because the worker sends `CancelAck(old)`
-    /// immediately before submitting/acking `Place(new)`.
-    pub fn on_cancel_acked(&mut self, market: &MarketId, side: Side) {
+    /// The venue refused the amend: the order rests at its old values.
+    pub fn on_amend_rejected(&mut self, market: &MarketId, side: Side) {
         if let Some(m) = self.market_mut(market) {
-            let slot = match side {
-                Side::Buy => &mut m.bid,
-                Side::Sell => &mut m.ask,
-            };
-            if slot.state == OrderLifecycle::PendingReplace {
-                if let Some(new_id) = slot.pending_replace_client_id.take() {
-                    let cancel_after_ack_reason = slot.cancel_after_ack_reason;
-                    slot.state = OrderLifecycle::PendingPlace;
-                    slot.client_id = Some(new_id);
-                    slot.venue_order_id = None;
-                    slot.price_ticks = slot.pending_replace_price_ticks;
-                    slot.qty_lots = slot.pending_replace_qty_lots;
-                    slot.filled_lots = 0;
-                    slot.pending_replace_price_ticks = 0;
-                    slot.pending_replace_qty_lots = 0;
-                    slot.cancel_after_ack_reason = cancel_after_ack_reason;
-                    return;
-                }
-            }
-            clear_slot(slot);
+            settle_amend(match side { Side::Buy => &mut m.bid, Side::Sell => &mut m.ask }, false);
         }
     }
 
     /// Record a venue ack (order is now Open / known by `venue_order_id`).
-    pub fn on_acked(&mut self, market: &MarketId, side: Side, venue_order_id: String) -> Option<CancelAfterAckReason> {
+    pub fn on_acked(&mut self, market: &MarketId, side: Side, venue_order_id: String) {
         if let Some(m) = self.market_mut(market) {
             let slot = match side {
                 Side::Buy => &mut m.bid,
                 Side::Sell => &mut m.ask,
             };
-            let cancel_after_ack_reason = slot.cancel_after_ack_reason;
             slot.venue_order_id = Some(venue_order_id);
-            if slot.state == OrderLifecycle::PendingPlace || slot.state == OrderLifecycle::PendingReplace {
+            if slot.state == OrderLifecycle::PendingPlace {
                 slot.state = OrderLifecycle::Open;
             }
-            return cancel_after_ack_reason;
+            settle_amend(slot, true);
         }
-        None
     }
 
     /// Return the targeted cancel to send for this slot, suppressing duplicates while a cancel is
-    /// already pending. A `PendingReplace` is already being cancel-then-placed by the worker; in that
-    /// state we only mark the queued replacement for immediate cancellation after its ack, and do not
-    /// enqueue another cancel for the old client id on every book wake.
+    /// already pending. An order being amended is cancelled by its own id like any other.
     pub fn cancel_target(
         &mut self,
         market: &MarketId,
@@ -389,13 +348,6 @@ impl OrderManager {
         };
         if !slot.is_live() {
             return CancelTarget::None;
-        }
-        if slot.state == OrderLifecycle::PendingReplace {
-            mark_cancel_after_ack(
-                slot,
-                CancelAfterAckReason::CancelRequestedDuringPendingReplace,
-            );
-            return CancelTarget::Suppressed;
         }
         // A place whose admission was cancelled never left: the worker's `PlaceReject` closes
         // the slot. A cancel would cost a request and hold up the next place behind it.
@@ -421,25 +373,15 @@ impl OrderManager {
             };
             if slot.is_live() {
                 slot.last_cancel_attempt_ns = now_ns;
-                if slot.state == OrderLifecycle::PendingReplace {
-                    // A replace worker may still place the queued replacement after
-                    // the old cancel succeeds. Remember to cancel that replacement
-                    // immediately when its PlaceAck arrives.
-                    mark_cancel_after_ack(
-                        slot,
-                        CancelAfterAckReason::CancelRequestedDuringPendingReplace,
-                    );
-                } else {
-                    slot.state = OrderLifecycle::PendingCancel;
-                    slot.cancel_after_ack_reason = None;
-                }
+                slot.state = OrderLifecycle::PendingCancel;
             }
         }
     }
 
     /// Record maker-fill progress for the current client id. A partial fill keeps the slot
     /// live because the residual can still be canceled; a fully-filled order is no longer
-    /// cancelable/resting, so clear the slot immediately and drop any queued replacement.
+    /// cancelable/resting, so clear the slot immediately. During an amend the order may hold
+    /// either size, so the amend's answer settles it.
     ///
     /// `cum_filled_lots` is cumulative for the venue order, not the last-fill increment.
     /// We store it separately from the original `qty_lots`, so duplicate/out-of-order partial
@@ -463,17 +405,9 @@ impl OrderManager {
                 // Venue/user-stream updates carry cumulative filled quantity for the order. Accept
                 // duplicate/out-of-order partials without moving backwards, and expose the residual
                 // size to exact quote decisions.
-                slot.filled_lots = slot.filled_lots.max(cum_filled_lots).min(slot.qty_lots);
-                if slot.filled_lots >= slot.qty_lots {
-                    if slot.state == OrderLifecycle::PendingReplace && slot.pending_replace_client_id.is_some() {
-                        // A fill arrived while the replace worker is already canceling the old order.
-                        // Do not drop the queued replacement id: the worker may still place it after
-                        // the old cancel succeeds. Keep attribution on the old order and cancel the
-                        // replacement as soon as it is acked.
-                        mark_cancel_after_ack(slot, CancelAfterAckReason::FillDuringPendingReplace);
-                    } else {
-                        clear_slot(slot);
-                    }
+                slot.filled_lots = slot.filled_lots.max(cum_filled_lots).min(slot.fillable_lots());
+                if !slot.amending() && slot.filled_lots >= slot.qty_lots {
+                    clear_slot(slot);
                 }
             }
         }
@@ -531,9 +465,6 @@ impl OrderManager {
         for m in &self.slots {
             for slot in [&m.bid, &m.ask] {
                 if let Some(id) = &slot.client_id {
-                    out.insert(id.clone());
-                }
-                if let Some(id) = &slot.pending_replace_client_id {
                     out.insert(id.clone());
                 }
             }
@@ -637,61 +568,56 @@ mod tests {
     }
 
     #[test]
-    fn replace_keeps_old_client_until_cancel_ack_then_promotes_new() {
-        let mut m = mgr();
-        let old = m.next_client_id(&"BTC".into(), Side::Buy).unwrap();
-        m.on_place_sent(&"BTC".into(), Side::Buy, old.clone(), 1000, 5, 0);
-        m.on_acked(&"BTC".into(), Side::Buy, "oid1".into());
-        let new_id = m.next_client_id(&"BTC".into(), Side::Buy).unwrap();
-        m.on_replace_sent(&"BTC".into(), Side::Buy, new_id.clone(), 1001, 6, 10);
-
-        let slot = m.slot(&"BTC".into(), Side::Buy).unwrap();
-        assert_eq!(slot.state, OrderLifecycle::PendingReplace);
-        assert_eq!(slot.client_id.as_deref(), Some(old.as_str()));
-        assert!(m.known_client_ids().contains(&old));
-        assert!(m.known_client_ids().contains(&new_id));
-
-        m.on_cancel_acked(&"BTC".into(), Side::Buy);
-        let slot = m.slot(&"BTC".into(), Side::Buy).unwrap();
-        assert_eq!(slot.state, OrderLifecycle::PendingPlace);
-        assert_eq!(slot.client_id.as_deref(), Some(new_id.as_str()));
-        assert_eq!(slot.price_ticks, 1001);
-        assert_eq!(slot.qty_lots, 6);
+    fn an_amend_keeps_the_order_and_a_refusal_restores_its_values() {
+        let (mut m, market): (_, MarketId) = (mgr(), "BTC".into());
+        let id = m.next_client_id(&market, Side::Buy).unwrap();
+        m.on_place_sent(&market, Side::Buy, id.clone(), 1000, 5, 0);
+        m.on_acked(&market, Side::Buy, "oid1".into());
+        m.on_amend_sent(&market, Side::Buy, 1001, 6, 10);
+        let slot = m.slot(&market, Side::Buy).unwrap();
+        assert_eq!((slot.state, slot.client_id.as_deref(), slot.price_ticks, slot.qty_lots, slot.amends),
+            (OrderLifecycle::PendingAmend, Some(id.as_str()), 1001, 6, 1));
+        m.on_amend_rejected(&market, Side::Buy);
+        let slot = m.slot(&market, Side::Buy).unwrap();
+        assert_eq!((slot.state, slot.price_ticks, slot.qty_lots), (OrderLifecycle::Open, 1000, 5));
+        m.on_amend_sent(&market, Side::Buy, 999, 7, 20);
+        m.on_acked(&market, Side::Buy, "oid1".into());
+        let slot = m.slot(&market, Side::Buy).unwrap();
+        assert_eq!((slot.state, slot.price_ticks, slot.qty_lots, slot.amends), (OrderLifecycle::Open, 999, 7, 2));
+        // A cancel during an amend goes out by the order's own id.
+        m.on_amend_sent(&market, Side::Buy, 998, 7, 30);
+        assert!(matches!(m.cancel_target(&market, Side::Buy, 31, 1000), CancelTarget::Send { ref client_id, .. } if client_id == &id));
+        m.on_cancel_sent(&market, Side::Buy, 31);
+        m.on_acked(&market, Side::Buy, "oid1".into());
+        assert_eq!(m.slot(&market, Side::Buy).unwrap().state, OrderLifecycle::PendingCancel);
     }
 
     #[test]
-    fn fill_during_pending_replace_cancels_replacement_after_ack() {
-        let mut m = mgr();
-        let old = m.next_client_id(&"BTC".into(), Side::Buy).unwrap();
-        m.on_place_sent(&"BTC".into(), Side::Buy, old.clone(), 1000, 10, 0);
-        m.on_acked(&"BTC".into(), Side::Buy, "oid-old".into());
-        let new_id = m.next_client_id(&"BTC".into(), Side::Buy).unwrap();
-        m.on_replace_sent(&"BTC".into(), Side::Buy, new_id.clone(), 1001, 10, 10);
-
-        // A maker fill during the cancel+place race triggers post-fill cancellation.
-        // The old id remains attributed, but the queued replacement is marked for
-        // immediate cancel once the worker places/acks it.
-        m.on_maker_fill_progress(&"BTC".into(), Side::Buy, &old, 10);
-        let slot = m.slot(&"BTC".into(), Side::Buy).unwrap();
-        assert_eq!(slot.state, OrderLifecycle::PendingReplace);
-        assert_eq!(slot.client_id.as_deref(), Some(old.as_str()));
-        assert_eq!(
-            slot.cancel_after_ack_reason,
-            Some(CancelAfterAckReason::FillDuringPendingReplace)
-        );
-
-        m.on_cancel_acked(&"BTC".into(), Side::Buy);
-        let slot = m.slot(&"BTC".into(), Side::Buy).unwrap();
-        assert_eq!(slot.state, OrderLifecycle::PendingPlace);
-        assert_eq!(slot.client_id.as_deref(), Some(new_id.as_str()));
-        assert_eq!(
-            slot.cancel_after_ack_reason,
-            Some(CancelAfterAckReason::FillDuringPendingReplace)
-        );
-        assert_eq!(
-            m.on_acked(&"BTC".into(), Side::Buy, "oid-new".into()),
-            Some(CancelAfterAckReason::FillDuringPendingReplace)
-        );
+    fn a_fill_during_an_amend_counts_against_either_size_until_the_answer() {
+        let (mut m, market): (_, MarketId) = (mgr(), "BTC".into());
+        let id = m.next_client_id(&market, Side::Buy).unwrap();
+        m.on_place_sent(&market, Side::Buy, id.clone(), 1000, 10, 0);
+        m.on_acked(&market, Side::Buy, "oid1".into());
+        // Shrink to 5 while 8 fill at the old size: nothing is settled before the answer.
+        m.on_amend_sent(&market, Side::Buy, 1001, 5, 10);
+        m.on_maker_fill_progress(&market, Side::Buy, &id, 8);
+        let slot = m.slot(&market, Side::Buy).unwrap();
+        assert_eq!((slot.state, slot.filled_lots), (OrderLifecycle::PendingAmend, 8));
+        assert_eq!(m.potential_lots(&market, Side::Buy), 2);
+        // Refused: the order still rests 2 of its old 10.
+        m.on_amend_rejected(&market, Side::Buy);
+        let slot = m.slot(&market, Side::Buy).unwrap();
+        assert_eq!((slot.state, slot.remaining_lots()), (OrderLifecycle::Open, 2));
+        // Grow to 12 while the old 10 fill: the amended order still rests 2.
+        m.on_amend_sent(&market, Side::Buy, 1001, 12, 20);
+        m.on_maker_fill_progress(&market, Side::Buy, &id, 10);
+        m.on_acked(&market, Side::Buy, "oid1".into());
+        assert_eq!(m.slot(&market, Side::Buy).unwrap().remaining_lots(), 2);
+        // Refused after the old size filled: nothing rests.
+        m.on_amend_sent(&market, Side::Buy, 1002, 14, 30);
+        m.on_maker_fill_progress(&market, Side::Buy, &id, 12);
+        m.on_amend_rejected(&market, Side::Buy);
+        assert_eq!(m.slot(&market, Side::Buy).unwrap().state, OrderLifecycle::Idle);
     }
 
     #[test]
@@ -761,25 +687,6 @@ mod tests {
             m.cancel_target(&"BTC".into(), Side::Buy, 2_100_000_000, 1000),
             CancelTarget::Send { ref client_id, .. } if client_id == &id
         ));
-    }
-
-    #[test]
-    fn pending_replace_cancel_is_marked_not_duplicated() {
-        let mut m = mgr();
-        let old = m.next_client_id(&"BTC".into(), Side::Buy).unwrap();
-        m.on_place_sent(&"BTC".into(), Side::Buy, old.clone(), 1000, 10, 0);
-        m.on_acked(&"BTC".into(), Side::Buy, "oid-old".into());
-        let new_id = m.next_client_id(&"BTC".into(), Side::Buy).unwrap();
-        m.on_replace_sent(&"BTC".into(), Side::Buy, new_id.clone(), 1001, 10, 10);
-
-        assert_eq!(
-            m.cancel_target(&"BTC".into(), Side::Buy, 11, 1000),
-            CancelTarget::Suppressed
-        );
-        assert_eq!(
-            m.slot(&"BTC".into(), Side::Buy).unwrap().cancel_after_ack_reason,
-            Some(CancelAfterAckReason::CancelRequestedDuringPendingReplace)
-        );
     }
 
 }
