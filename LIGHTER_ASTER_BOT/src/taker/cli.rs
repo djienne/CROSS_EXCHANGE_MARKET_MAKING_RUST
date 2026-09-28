@@ -67,11 +67,11 @@ pub enum Commands {
         #[arg(long, default_value = "HYPE")]
         market: Option<String>,
     },
-    /// Live Aster MARKET-order roundtrip using the real Aster taker code path.
+    /// Live Aster roundtrip on the real order paths, each step timed.
     ///
-    /// Requires a flat Aster starting position. Buys up to `--max-usd`, checks
-    /// balance/position, then sells the actual resulting position reduce-only and
-    /// verifies the final Aster position is flat.
+    /// Requires a flat Aster starting position. An IOC under the bid must end unfilled; then the
+    /// taker's entry IOC buys up to `--max-usd`, XEMM's user stream reports the fill, XEMM's
+    /// reduce-only MARKET flatten sells it back, and cleanup verifies the position flat.
     AsterMarketRoundtrip {
         #[arg(long, default_value = "HYPE")]
         market: Option<String>,
@@ -80,11 +80,11 @@ pub enum Commands {
         #[arg(long)]
         max_usd: Decimal,
     },
-    /// Live Lighter MARKET-order roundtrip using the real native signer path.
+    /// Live Lighter MARKET-order roundtrip on the taker's order path, each step timed.
     ///
-    /// Requires a flat Lighter starting position. Buys the minimum executable
-    /// size capped by `--max-usd`, then sells the resulting position reduce-only
-    /// and verifies the final Lighter position is flat.
+    /// Requires a flat Lighter starting position. A market order bounded under the bid must end
+    /// unfilled; then it buys the minimum executable size capped by `--max-usd`, sells the
+    /// resulting position reduce-only and verifies the final Lighter position is flat.
     LighterMarketRoundtrip {
         #[arg(long, default_value = "HYPE")]
         market: Option<String>,
@@ -289,21 +289,40 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             );
             let bal_before = aster.available_usdc().await?;
             println!("balance_before={bal_before}");
+            // XEMM's user stream watches the fills, and XEMM's reduce-only MARKET flatten closes.
+            let target = market.as_deref().unwrap_or("HYPE");
+            let (xemm, xspec) = crate::livebot::probe::xemm_aster(&cli.config, target).await?;
+            let stop = tokio_util::sync::CancellationToken::new();
+            let stream = crate::livebot::probe::spawn_fill_printer(crate::livebot::probe::xemm_aster(&cli.config, target).await?.0,
+                &xspec, Arc::default(), stop.clone());
+            tokio::time::sleep(Duration::from_secs(2)).await; // the stream subscribes before the first fill
 
             let session = diagnostic_session(&cfg, &spec, serde_json::json!({"aster_account": aster_account_id}));
             session.arm().await?;
-            let buy = aster.submit_market_order(&spec.market_id, Side::Buy, qty, false).await;
-            println!("buy_result={buy:?}");
+            let miss = timed_aster_ioc(&aster, &spec, qty, bid.px * rust_decimal_macros::dec!(0.99), "under_bid").await;
+            let buy = timed_aster_ioc(&aster, &spec, qty, ask.px * (Decimal::ONE + bps_to_rate(cfg.arb.max_aster_slippage_bps)), "buy").await;
+            let closed = std::cell::Cell::new(Decimal::ZERO);
             let operation = async {
+                let miss = crate::taker::arb::resolve_aster_evidence(&spec, &aster, &miss, Duration::from_secs(5)).await;
+                anyhow::ensure!(miss.terminal && miss.qty == Some(Decimal::ZERO), "the IOC under the bid did not end unfilled");
                 ensure_accepted("buy", &buy)?;
+                let t = std::time::Instant::now();
                 let fill = wait_aster_fill("buy", &aster, &spec.market_id, &buy, qty).await?;
-                println!("buy_fill={fill:?}");
+                println!("buy_fill={fill:?} fee_known_after={}ms", t.elapsed().as_millis());
+                let t = std::time::Instant::now();
                 let position = wait_position_after_buy(&aster, &spec.market_id, qty, spec.step).await?;
-                let balance = aster.available_usdc().await?;
-                println!("position_after_buy={position} balance_after_buy={balance}");
+                println!("position_after_buy={position} visible_after={}ms", t.elapsed().as_millis());
+                let t = std::time::Instant::now();
+                let body = xemm.flatten_result(&xspec.market_id, crate::types::Side::Sell, position,
+                    &format!("Xprb-flat-{}", chrono::Utc::now().timestamp_millis())).await?;
+                println!("xemm_flatten ({}ms): {body}", t.elapsed().as_millis());
+                closed.set(crate::taker::aster::rest::immediate_fill_from_order_response(&body)?.qty);
                 Ok(())
             };
-            run_diagnostic(&cfg,&spec,&session,operation,cleanup_aster_diagnostic(&cfg,&spec,&aster,&buy,qty)).await
+            let result = run_diagnostic(&cfg,&spec,&session,operation,cleanup_aster_diagnostic(&cfg,&spec,&aster,&buy,qty,&closed)).await;
+            stop.cancel();
+            let _ = stream.await;
+            result
         }
         Commands::LighterMarketRoundtrip {
             market,
@@ -361,9 +380,10 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 );
             }
 
-            let slippage = bps_to_rate(cfg.arb.emergency_slippage_bps);
+            // The entry's bound, as the taker prices it; cleanup closes at the emergency bound.
+            let slippage = bps_to_rate(cfg.arb.max_lighter_slippage_bps);
             let buy_bound = ask.px * (Decimal::ONE + slippage);
-            let sell_bound = bid.px * (Decimal::ONE - slippage);
+            let sell_bound = bid.px * (Decimal::ONE - bps_to_rate(cfg.arb.emergency_slippage_bps));
             println!(
                 "lighter_market_roundtrip_start market={} market_id={} qty={} bid={} ask={} buy_bound={} sell_bound={} max_usd={} min_notional={}",
                 spec.market_id,
@@ -382,9 +402,19 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let session = diagnostic_session(&cfg, &spec,
                 serde_json::json!({"lighter_account_index": lighter.account_index()}));
             session.arm().await?;
+            // First a market order bounded under the bid, which cannot fill: how the taker sees it.
+            let t = std::time::Instant::now();
+            let (miss, pending) = lighter.submit_market_order_deferred_fill(&spec.market_id, Side::Buy, qty,
+                bid.px * rust_decimal_macros::dec!(0.99), false).await;
+            println!("under_bid_market answered_after={}ms: {miss:?}", t.elapsed().as_millis());
+            let miss = crate::taker::arb::resolve_lighter_evidence(&spec, &lighter, &miss, pending, Side::Buy, qty,
+                Duration::from_secs(10)).await;
+            println!("under_bid_market resolved_after={}ms terminal={} qty={:?}", t.elapsed().as_millis(), miss.terminal, miss.qty);
+            let t = std::time::Instant::now();
             let buy = lighter.submit_market_order(&spec.market_id, Side::Buy, qty, buy_bound, false).await;
-            println!("buy_result={buy:?}");
+            println!("buy_result filled_after={}ms: {buy:?}", t.elapsed().as_millis());
             let operation = async {
+                anyhow::ensure!(miss.terminal && miss.qty == Some(Decimal::ZERO), "the market order under the bid did not end unfilled");
                 ensure_lighter_accepted("buy", &buy)?;
                 let fill = ensure_lighter_fill("buy", &buy)?;
                 println!("buy_fill={fill:?}");
@@ -546,16 +576,17 @@ struct DiagnosticCleanup {
     error: Option<String>,
 }
 
+/// `closed`: what the diagnostic itself already sold back, read once it has finished.
 async fn cleanup_aster_diagnostic(
     cfg: &Config, spec: &MarketSpec, aster: &AsterRest,
-    buy: &crate::taker::aster::rest::SubmitOutcome, quantity: Decimal,
+    buy: &crate::taker::aster::rest::SubmitOutcome, quantity: Decimal, closed: &std::cell::Cell<Decimal>,
 ) -> DiagnosticCleanup {
     let mut orders = vec![crate::taker::arb::aster_order_identity(buy, Side::Buy, quantity)];
     let mut in_flight = false;
     let result = tokio::time::timeout(Duration::from_secs(30), async {
         let buy_evidence = crate::taker::arb::resolve_aster_evidence(spec, aster, buy, Duration::from_secs(10)).await;
         anyhow::ensure!(buy_evidence.terminal, "initial Aster buy is unresolved");
-        let mut expected = buy_evidence.qty.context("Aster buy quantity unavailable")?;
+        let mut expected = buy_evidence.qty.context("Aster buy quantity unavailable")? - closed.get();
         let http = rest_book::client()?;
         let mut attempts = 0;
         loop {
@@ -673,6 +704,17 @@ async fn finish_diagnostic(cfg: &Config, spec: &MarketSpec, session: &ActiveSess
             cleanup.error.unwrap_or_else(|| "unknown".to_string()),
             operation.err().map(|error| format!("{error:#}")).unwrap_or_else(|| "none".to_string()))
     }
+}
+
+/// The taker's entry order (`submit_ioc_order`, a buy), with the wall-clock send time so its
+/// RESULT can be compared with the fill's arrival on the user stream.
+async fn timed_aster_ioc(aster: &AsterRest, spec: &MarketSpec, qty: Decimal, bound: Decimal, label: &str)
+    -> crate::taker::aster::rest::SubmitOutcome {
+    let sent_at = chrono::Utc::now().timestamp_millis();
+    let t = std::time::Instant::now();
+    let outcome = aster.submit_ioc_order(&spec.market_id, Side::Buy, qty, bound, false).await;
+    println!("{label}_ioc bound={bound} sent_at={sent_at} result_after={}ms: {outcome:?}", t.elapsed().as_millis());
+    outcome
 }
 
 fn ensure_accepted(label: &str, outcome: &crate::taker::aster::rest::SubmitOutcome) -> Result<()> {
@@ -868,7 +910,7 @@ mod tests {
         session.arm().await.unwrap();
         let result = run_diagnostic(&cfg,&spec,&session,
             async { aster.available_usdc().await?; Ok(()) },
-            cleanup_aster_diagnostic(&cfg,&spec,&aster,&buy,dec!(1))).await;
+            cleanup_aster_diagnostic(&cfg,&spec,&aster,&buy,dec!(1),&std::cell::Cell::new(Decimal::ZERO))).await;
         assert!(result.is_err());
         assert!(format!("{:#}",result.unwrap_err()).contains("cleanup nevertheless verified"));
         assert_eq!(closes.load(Ordering::SeqCst),1);

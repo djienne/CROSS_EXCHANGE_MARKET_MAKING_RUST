@@ -151,6 +151,7 @@ impl Cloid {
         format!("0x{}", hex::encode(self.0))
     }
 
+    #[cfg(test)]
     pub(crate) fn from_bytes_for_lighter(bytes: [u8; 16]) -> Self {
         Cloid(bytes)
     }

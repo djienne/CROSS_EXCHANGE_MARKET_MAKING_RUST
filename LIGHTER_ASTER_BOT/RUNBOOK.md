@@ -200,10 +200,10 @@ treat it as a bug. The reports take `--dry-run` (`python3 ../combined_pnl.py --d
 `python3 ../bot_stats.py --dry-run` summarizes these diagnostics together with the trades'
 edge kept and slippage per leg.
 
-What the dry run cannot tell: whether the fee keys are right; the bot's market impact beyond
-the liquidity it takes; how Aster's ~100 ms splits around matching, and how Lighter treats an
-IOC it cannot fill (both assumed pessimistically until live acks calibrate them); anything
-about liquidation. Lighter signatures are not verified.
+What the dry run cannot tell: whether the maker fee keys are right (the taker keys matched
+the live probes); the bot's market impact beyond the liquidity it takes; how Aster's ~100 ms
+splits around matching (assumed pessimistically); anything about liquidation. Lighter
+signatures are not verified. The venues' live timings are under [Probes](#probes).
 
 **Going live.** Live runs on a Linux host ([Deploy](#deploy)). Docker Desktop on Windows shows
 bind-mounted files as mode 777, and live refuses env files that others can read.
@@ -377,12 +377,29 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
   history without orders.
 - `probe lighter-order-dry-run` signs IOC and native market plans without submitting them.
 - These submit real orders; run them only with explicit approval, and never beside a live
-  `run`: `probe aster-place-cancel` (two post-only Aster orders 1.8 % from the book, then
-  cancelled; it needs no flag), `probe lighter-market --i-understand-live --max-usd 12`, and
-  `taker aster-market-roundtrip` / `taker lighter-market-roundtrip --i-understand-live
-  --max-usd <N>`. The roundtrips need a flat start and no open orders. They clean up
-  reduce-only (at most three closes in 30 s) and stay blocked without terminal-order and
-  flat-position evidence.
+  `run`. Each needs `--i-understand-live`, a flat start and no open orders, prints every
+  step's latency beside a ping, and ends by checking flat with no orders.
+  - `probe aster-place-cancel`: XEMM's Aster calls on post-only orders ~2 % from the book,
+    with XEMM's user stream running: place, a refresh by cancel+place, amends (one to a
+    crossing price), a post-only through the ask, cancel-all, and the 10 s dead-man. A
+    position left over is closed reduce-only.
+  - `probe lighter-market --max-usd 12`: XEMM's hedge worker sends a hedge, an IOC that
+    cannot fill, and a reduce-only close.
+  - `taker aster-market-roundtrip --max-usd 7` / `taker lighter-market-roundtrip --max-usd
+    12`: the taker's entry order, after one bounded under the bid that cannot fill. They clean
+    up reduce-only (at most three closes in 30 s) and stay blocked without terminal-order and
+    flat-position evidence.
+- Measured 2026-09-28 from Windows, ~250 ms ping to both venues; venue time = RTT - ping:
+  - Aster takes ~100 ms per order call: post-only ~360 ms, cancel ~340 ms, amend ~350 ms,
+    IOC result ~350 ms, so a refresh by cancel+place takes ~700 ms. The user stream has a
+    fill 5-11 ms after the REST result; userTrades has its fee ~1 RTT later. The 10 s
+    dead-man fired at 11.1 s.
+  - Aster rejects an amend to a crossing price (-2036) and the order rests unchanged. A
+    post-only through the book is acknowledged NEW, then EXPIRED with nothing filled.
+  - Lighter's order WS answers in one ping, and the fill is terminal ~300 ms later. An IOC
+    that cannot fill is accepted, consumes its nonce, and ends terminal with 0 filled
+    (`canceled-too-much-slippage`).
+  - Taker fees: Aster 4.0 bps, Lighter 0, as in `bot.toml`.
 - Hyperliquid reads `HYPERLIQUID_ENV_PATH` (default `hyperliquid.env`, keys as in
   `hyperliquid.env.example`: `wallet_address` = the traded subaccount, `private_key` = its agent
   key, `is_vault`). `docker compose --profile live run --rm bot probe hl-balance --market HYPE`

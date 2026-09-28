@@ -377,10 +377,24 @@ impl AsterRest {
         }
     }
 
+    /// Modify a resting LIMIT order's price and quantity in place (PUT `/fapi/v3/order`): one
+    /// round trip instead of cancel-then-place. A rejected modify leaves the original resting.
+    pub(crate) async fn amend(&self, market: &MarketId, side: Side, price_ticks: i64, qty_lots: i64, client_id: &str) -> Result<String> {
+        let w = self.wire(market)?;
+        let params = vec![
+            ("symbol".into(), w.symbol.clone()),
+            ("origClientOrderId".into(), client_id.to_string()),
+            ("side".into(), side.as_str().to_string()),
+            ("quantity".into(), trim_dec(w.scale.lots_to_qty(qty_lots))),
+            ("price".into(), trim_dec(w.scale.ticks_to_price(price_ticks))),
+        ];
+        self.signed_request(Method::PUT, ASTER_ORDER_PATH, params).await
+    }
+
     /// Reduce-only MARKET (taker) order to flatten an orphaned position (recovery path).
     /// Reduce-only orders are exempt from the min-notional filter, so a sub-min residual can
     /// still be closed. `side` = SELL to close a long, BUY to close a short.
-    async fn flatten_result(&self, market: &MarketId, side: Side, qty: Decimal, client_id: &str) -> Result<String> {
+    pub(crate) async fn flatten_result(&self, market: &MarketId, side: Side, qty: Decimal, client_id: &str) -> Result<String> {
         let w = self.wire(market)?;
         let qty_lots = w.scale.qty_to_lots(qty);
         if qty_lots <= 0 {
@@ -400,7 +414,7 @@ impl AsterRest {
     }
 
     /// Refresh the Aster dead-man countdown for a symbol (heartbeat).
-    async fn refresh_deadman(&self, market: &MarketId) -> Result<()> {
+    pub(crate) async fn refresh_deadman(&self, market: &MarketId) -> Result<()> {
         let w = self.wire(market)?;
         let params = vec![
             ("symbol".into(), w.symbol.clone()),

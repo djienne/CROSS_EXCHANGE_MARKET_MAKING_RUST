@@ -66,9 +66,10 @@ pub enum Commands {
     /// Probe one live venue primitive with the real signers and `aster.env`/`lighter.env`.
     /// Signed reads only: aster-balance, aster-positions, aster-open-orders, leverage,
     /// lighter-balance, lighter-open-orders. lighter-order-dry-run signs orders locally and
-    /// sends none. REAL orders: aster-place-cancel rests a post-only buy and sell 1.8% outside
-    /// the touch and cancels them; lighter-market buys at market then sells back reduce-only,
-    /// and needs `--i-understand-live --max-usd <N>`.
+    /// sends none. REAL orders, each needing `--i-understand-live`: aster-place-cancel times
+    /// XEMM's Aster calls (post-only place, cancel, refresh, amend, cancel-all, dead-man);
+    /// lighter-market drives XEMM's hedge worker (a hedge, an IOC that cannot fill, a reduce-only
+    /// close) and needs `--max-usd <N>`.
     Probe {
         /// Which check: aster-balance | aster-positions | aster-open-orders | aster-place-cancel |
         /// leverage | lighter-balance | lighter-open-orders | lighter-order-dry-run | lighter-market |

@@ -230,33 +230,6 @@ impl AsterRest {
         Ok(body)
     }
 
-    pub async fn submit_market_order(
-        &self,
-        market: &MarketId,
-        side: Side,
-        qty: Decimal,
-        reduce_only: bool,
-    ) -> SubmitOutcome {
-        let mut params = match self.market_params(market, side, qty, reduce_only) {
-            Ok(p) => p,
-            Err(e) => {
-                return SubmitOutcome::Rejected {
-                    reason: e.to_string(),
-                }
-            }
-        };
-        let client_order_id = match self.nonce.next() {
-            Ok(nonce) => format!("ta-{nonce}"),
-            Err(e) => return SubmitOutcome::Rejected { reason: e.to_string() },
-        };
-        params.push(("newClientOrderId".into(), client_order_id.clone()));
-        match self.signed_request(Method::POST, ASTER_ORDER_PATH, params).await {
-            Ok(body) => classify_order_response(&client_order_id, &body),
-            Err(e) if definitive_no_fill(&e) => SubmitOutcome::Rejected { reason: e.to_string() },
-            Err(e) => SubmitOutcome::Unknown { client_order_id, reason: e.to_string() },
-        }
-    }
-
     pub async fn submit_ioc_order(
         &self,
         market: &MarketId,
@@ -283,32 +256,6 @@ impl AsterRest {
             Err(e) if definitive_no_fill(&e) => SubmitOutcome::Rejected { reason: e.to_string() },
             Err(e) => SubmitOutcome::Unknown { client_order_id, reason: e.to_string() },
         }
-    }
-
-    fn market_params(
-        &self,
-        market: &MarketId,
-        side: Side,
-        qty: Decimal,
-        reduce_only: bool,
-    ) -> Result<Vec<(String, String)>> {
-        let w = self.wire(market)?;
-        let qty = floor_to_step(qty, w.step);
-        if qty <= Decimal::ZERO {
-            anyhow::bail!("Aster quantity rounds to zero");
-        }
-        let mut p = vec![
-            ("symbol".into(), w.symbol.clone()),
-            ("side".into(), side.as_str().to_string()),
-            ("type".into(), "MARKET".into()),
-            ("newOrderRespType".into(), "RESULT".into()),
-            ("quantity".into(), trim_dec(qty)),
-            ("positionSide".into(), "BOTH".into()),
-        ];
-        if reduce_only {
-            p.push(("reduceOnly".into(), "true".into()));
-        }
-        Ok(p)
     }
 
     fn limit_ioc_params(

@@ -37,7 +37,6 @@ use crate::lighter::signer::{
 };
 use crate::lighter::tx_ws::TxWebSocket;
 use crate::lighter::ws::{subscribe_loop, subscribe_loop_authed, SubscribeOptions};
-use crate::livebot::ids::Cloid;
 use crate::markets::MarketSpec;
 use crate::types::{MarketId, Side, TxSendStatus};
 
@@ -891,36 +890,9 @@ impl LighterExchange {
         }
     }
 
-    pub(crate) async fn place_raw(
-        &self,
-        market: &MarketId,
-        side: Side,
-        px: Decimal,
-        sz: Decimal,
-        tif: &str,
-        reduce_only: bool,
-        cloid_hex: Option<String>,
-    ) -> Result<String> {
-        let client_order_index = cloid_hex
-            .as_deref()
-            .and_then(client_index_from_hex)
-            .unwrap_or_else(|| random_client_order_index(market, side));
-        let plan = if tif.eq_ignore_ascii_case("market") {
-            self.build_market_plan(market, side, px, sz, client_order_index, reduce_only)?
-        } else {
-            self.build_ioc_limit_plan(market, side, px, sz, client_order_index, reduce_only)?
-        };
-        let nonce = self.nonce.next();
-        let signed = self.sign_order_plan(&plan, nonce)?;
-        let result = self.send_signed(signed).await;
-        serde_json::to_string(&serde_json::json!({
-            "status": format!("{:?}", result.status),
-            "code": result.code,
-            "message": result.message,
-            "client_order_index": client_order_index,
-            "quota_remaining": result.quota_remaining,
-        }))
-        .context("serialize Lighter tx result")
+    /// The venue's next nonce for this API key (a REST read; the probes compare it across a reject).
+    pub(crate) async fn server_next_nonce(&self) -> Result<i64> {
+        self.rest.next_nonce(self.account_index, self.api_key_index).await
     }
 
     /// Read the current Lighter market leverage from the account payload.
@@ -1688,25 +1660,6 @@ fn signed_position_from_json(v: &serde_json::Value) -> Decimal {
     }
 }
 
-fn client_index_from_hex(s: &str) -> Option<i64> {
-    let hex = s.strip_prefix("0x").unwrap_or(s);
-    if hex.len() != 32 {
-        return None;
-    }
-    let bytes = hex::decode(hex).ok()?;
-    let mut arr = [0u8; 16];
-    arr.copy_from_slice(&bytes);
-    Some(Cloid::from_bytes_for_lighter(arr).to_lighter_client_order_index())
-}
-
-fn random_client_order_index(market: &MarketId, side: Side) -> i64 {
-    let cloid = Cloid::recovery(
-        market,
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default() ^ side as i64,
-    );
-    cloid.to_lighter_client_order_index()
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1763,7 +1716,7 @@ mod tests {
     }
 
     fn test_intent() -> HedgeIntent {
-        HedgeIntent::with_qty(Cloid::from_bytes_for_lighter([0;16]), "HYPE".into(), Side::Sell, dec!(0.5), dec!(100), 0)
+        HedgeIntent::with_qty(crate::livebot::ids::Cloid::from_bytes_for_lighter([0;16]), "HYPE".into(), Side::Sell, dec!(0.5), dec!(100), 0)
     }
     fn trade(id: i64, qty: &str) -> TradePayload {
         TradePayload { trade_id: Some(id), ask_client_id: Some(1), ask_account_id: Some(9), ask_id: Some(100),
