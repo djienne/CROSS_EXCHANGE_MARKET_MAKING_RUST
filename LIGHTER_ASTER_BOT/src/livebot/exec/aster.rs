@@ -1114,7 +1114,7 @@ mod tests {
             reply_http(&mut stream, "200 OK", r#"{"orderId":1,"status":"CANCELED","clientOrderId":"A"}"#).await;
             request
         });
-        let permit = MakerPermit::for_test();
+        let permit = MakerPermit::unguarded();
         assert!(permit.cancel_queued(), "the strategy revoked it");
         let (tx, mut rx) = mpsc::channel(8);
         let amend = ExecCommand::Amend {
@@ -1154,7 +1154,7 @@ mod tests {
             side: Side::Buy,
             price_ticks: 1,
             qty_lots: 1,
-            client_id: "p".into(), permit: MakerPermit::for_test(),
+            client_id: "p".into(), permit: MakerPermit::unguarded(),
         }));
         assert!(!is_priority_cmd(&ExecCommand::RefreshDeadman { market: m }));
         assert!(!is_priority_cmd(&ExecCommand::Shutdown));
@@ -1203,7 +1203,7 @@ mod tests {
         for id in ["P0", "P1"] {
             normal_tx.send(ExecCommand::Place {
                 market: "BTC".into(), side: Side::Buy, price_ticks: 1000,
-                qty_lots: 10, client_id: id.into(), permit: MakerPermit::for_test(),
+                qty_lots: 10, client_id: id.into(), permit: MakerPermit::unguarded(),
             }).await.unwrap();
         }
         let worker = tokio::spawn(run_aster_worker(normal_rx, priority_rx, events_tx, rest));
@@ -1247,7 +1247,7 @@ mod tests {
         normal_tx.send(ExecCommand::RefreshDeadman { market: "BTC".into() }).await.unwrap();
         normal_tx.send(ExecCommand::Place {
             market: "BTC".into(), side: Side::Buy, price_ticks: 1000,
-            qty_lots: 10, client_id: "P".into(), permit: MakerPermit::for_test(),
+            qty_lots: 10, client_id: "P".into(), permit: MakerPermit::unguarded(),
         }).await.unwrap();
         let worker = tokio::spawn(run_aster_worker(normal_rx, priority_rx, events_tx, rest_at(&url)));
         let event = tokio::time::timeout(Duration::from_secs(2), events_rx.recv()).await
@@ -1273,8 +1273,8 @@ mod tests {
         let (events_tx, mut events_rx) = mpsc::channel(8);
         let (normal_tx, normal_rx) = mpsc::channel(8);
         let (_priority_tx, priority_rx) = mpsc::channel(8);
-        let queued = MakerPermit::for_test();
-        for (id, permit) in [("first", MakerPermit::for_test()), ("queued", queued.clone())] {
+        let queued = MakerPermit::unguarded();
+        for (id, permit) in [("first", MakerPermit::unguarded()), ("queued", queued.clone())] {
             normal_tx.send(ExecCommand::Place {
                 market: "BTC".into(), side: Side::Buy, price_ticks: 1000,
                 qty_lots: 10, client_id: id.into(), permit,
@@ -1296,7 +1296,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_claimed_maker_cannot_emit_a_false_unsent_rejection() {
-        let permit = MakerPermit::for_test();
+        let permit = MakerPermit::unguarded();
         assert!(permit.try_claim(crate::hotpath::clock::mono_now_ns()));
         let (tx, mut rx) = mpsc::channel(8);
         let mut limiter = RestCommandLimiter::new(100);
@@ -1328,7 +1328,7 @@ mod tests {
                     side: Side::Buy,
                     price_ticks: 1000 + i,
                     qty_lots: 10,
-                    client_id: format!("P{i}"), permit: MakerPermit::for_test(),
+                    client_id: format!("P{i}"), permit: MakerPermit::unguarded(),
                 })
                 .await
                 .unwrap();

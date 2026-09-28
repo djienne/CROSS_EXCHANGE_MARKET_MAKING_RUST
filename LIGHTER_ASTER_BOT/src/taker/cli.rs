@@ -71,7 +71,8 @@ pub enum Commands {
     ///
     /// Requires a flat Aster starting position. An IOC under the bid must end unfilled; then the
     /// taker's entry IOC buys up to `--max-usd`, XEMM's user stream reports the fill, XEMM's
-    /// reduce-only MARKET flatten sells it back, and cleanup verifies the position flat.
+    /// reduce-only MARKET flatten sells it back (one step first, under Aster's minimum notional,
+    /// as XEMM's correction of a small residual sends it), and cleanup verifies the position flat.
     AsterMarketRoundtrip {
         #[arg(long, default_value = "HYPE")]
         market: Option<String>,
@@ -313,10 +314,19 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 let position = wait_position_after_buy(&aster, &spec.market_id, qty, spec.step).await?;
                 println!("position_after_buy={position} visible_after={}ms", t.elapsed().as_millis());
                 let t = std::time::Instant::now();
-                let body = xemm.flatten_result(&xspec.market_id, crate::types::Side::Sell, position,
+                match xemm.flatten_result(&xspec.market_id, crate::types::Side::Sell, spec.step,
+                    &format!("Xprb-step-{}", chrono::Utc::now().timestamp_millis())).await {
+                    Ok(body) => {
+                        println!("xemm_flatten_under_minimum ~${:.2} ({}ms): {body}", spec.step * bid.px, t.elapsed().as_millis());
+                        closed.set(crate::taker::aster::rest::immediate_fill_from_order_response(&body)?.qty);
+                    }
+                    Err(error) => println!("xemm_flatten_under_minimum refused ({}ms): {error:#}", t.elapsed().as_millis()),
+                }
+                let t = std::time::Instant::now();
+                let body = xemm.flatten_result(&xspec.market_id, crate::types::Side::Sell, position - closed.get(),
                     &format!("Xprb-flat-{}", chrono::Utc::now().timestamp_millis())).await?;
                 println!("xemm_flatten ({}ms): {body}", t.elapsed().as_millis());
-                closed.set(crate::taker::aster::rest::immediate_fill_from_order_response(&body)?.qty);
+                closed.set(closed.get() + crate::taker::aster::rest::immediate_fill_from_order_response(&body)?.qty);
                 Ok(())
             };
             let result = run_diagnostic(&cfg,&spec,&session,operation,cleanup_aster_diagnostic(&cfg,&spec,&aster,&buy,qty,&closed)).await;

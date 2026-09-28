@@ -14,16 +14,17 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Config, MarketCfg};
-use crate::connectors::rest_specs;
+use crate::config::{Config, HedgeVenue, MarketCfg};
+use crate::connectors::{rest_book::fetch_hedge_book, rest_specs};
 use crate::livebot::scale::MarketScale;
 use crate::markets::MarketSpec;
-use crate::types::{MarketId, Side};
+use crate::types::Side;
 
-use super::exec::aster::AsterRest;
-use super::exec::command::{ExecEvent, HedgeCommand};
-use super::exec::creds::{AsterCreds, LighterCreds};
-use super::exec::lighter::{run_lighter_worker, LighterExchange};
+use super::exec::aster::{run_aster_worker, AsterRest};
+use super::exec::command::{ExecCommand, ExecEvent, HedgeCommand, MakerPermit};
+use super::exec::creds::{AsterCreds, HyperliquidCreds, LighterCreds};
+use super::exec::hyperliquid::{run_hyperliquid_worker, HyperliquidHedge};
+use super::exec::lighter::{hedge_reject_is_definitive_no_fill, run_lighter_worker, HlClearinghouse, LighterExchange};
 use super::fills::{HedgeIntent, IntentPurpose};
 use super::ids::Cloid;
 use super::journal::Journal;
@@ -82,10 +83,11 @@ pub async fn run(cfg: &Config, check: &str, target: Option<String>, i_understand
         "lighter-open-orders" => probe_lighter_open_orders(cfg, &target).await,
         "lighter-order-dry-run" => probe_lighter_order_dry_run(cfg, &target).await,
         "lighter-market" => probe_lighter_market(cfg, &target, i_understand_live, max_usd).await,
+        "hl-hedge" => probe_hl_hedge(cfg, &target, i_understand_live, max_usd).await,
         "hl-balance" | "hl-place-cancel" | "hl-market" => crate::hyperliquid::probe::run(check, &target, i_understand_live, max_usd).await,
         other => bail!(
             "unknown probe '{other}'. Available: aster-balance, aster-positions, aster-open-orders, \
-             aster-place-cancel, leverage, lighter-balance, lighter-open-orders, lighter-order-dry-run, lighter-market, hl-balance, hl-place-cancel, hl-market"
+             aster-place-cancel, leverage, lighter-balance, lighter-open-orders, lighter-order-dry-run, lighter-market, hl-hedge, hl-balance, hl-place-cancel, hl-market"
         ),
     }
 }
@@ -146,10 +148,11 @@ async fn probe_aster_open_orders(cfg: &Config, target: &str) -> Result<()> {
     Ok(())
 }
 
-/// XEMM's Aster wire calls, each timed: place, the cancel-then-place refresh, an in-place amend,
-/// an amend and a post-only that would cross, cancel-all on both sides and the dead-man firing,
-/// with the user stream up throughout. Every order rests 1.8-2.2% from the touch except the
-/// crossing ones; money is at risk only if Aster lets an amend cross.
+/// XEMM's Aster wire calls, each timed, with the user stream up throughout: place; refreshes
+/// through the bot's own worker (amends, one to the same values, one through the ask, one whose
+/// permit lapsed, one of the cancelled order); a post-only that would cross; cancel-all on both
+/// sides; the dead-man firing. Every order rests 1.8-2.2% from the touch except the crossing
+/// ones; money is at risk only if Aster lets an amend cross.
 async fn probe_aster_place_cancel(cfg: &Config, target: &str, i_understand_live: bool) -> Result<()> {
     if !i_understand_live {
         bail!("aster-place-cancel amends an order across the book: re-run with --i-understand-live");
@@ -186,36 +189,58 @@ async fn probe_aster_place_cancel(cfg: &Config, target: &str, i_understand_live:
 async fn aster_steps(cfg: &Config, aster: &AsterRest, spec: &MarketSpec) -> Result<()> {
     let market = spec.market_id.clone();
     let (bid, ask) = aster_book_ticker(cfg, &spec.aster_symbol).await?;
-    // Three refreshes each way: cancel-then-place, then the bot's amend in place.
-    let (mut cid, mut oid, lots) = place_ok(aster, spec, Side::Buy, bid * dec!(0.982)).await?;
-    for step in 1..=3 {
-        let t = Instant::now();
-        cancel_ok(aster, &market, &cid).await?;
-        (cid, oid, _) = place_ok(aster, spec, Side::Buy, bid * (dec!(0.982) - Decimal::new(step, 3))).await?;
-        println!("REFRESH cancel+place {}ms", t.elapsed().as_millis());
-    }
     let scale = MarketScale::from_spec(spec);
-    for step in 1..=3 {
-        let far = scale.price_floor_ticks(bid * (dec!(0.978) - Decimal::new(step, 3)));
+    let price_of = |order: &serde_json::Value| order["price"].as_str().and_then(|p| p.parse::<Decimal>().ok());
+    let (commands, rx) = tokio::sync::mpsc::channel(8);
+    let (_priority, prio_rx) = tokio::sync::mpsc::channel(1);
+    let (events_tx, mut events) = tokio::sync::mpsc::channel(16);
+    let worker = tokio::spawn(run_aster_worker(rx, prio_rx, events_tx, build_aster(cfg, std::slice::from_ref(spec))?));
+    let (cid, oid, lots) = place_ok(aster, spec, Side::Buy, bid * dec!(0.982)).await?;
+    let mut amend = async |label: &str, price_ticks: i64, permit: MakerPermit| -> Result<ExecEvent> {
         let t = Instant::now();
-        let body = aster.amend(&market, Side::Buy, far, lots, &cid).await?;
-        let v: serde_json::Value = serde_json::from_str(&body)?;
-        println!("AMEND  {}ms: status={} price={} timeInForce={}", t.elapsed().as_millis(), v["status"], v["price"], v["timeInForce"]);
-        if v["clientOrderId"].as_str() != Some(cid.as_str()) || v["orderId"].as_i64().map(|id| id.to_string()).as_ref() != Some(&oid)
-            || v["price"].as_str().and_then(|p| p.parse::<Decimal>().ok()) != Some(scale.ticks_to_price(far)) {
-            bail!("amend did not keep the order's identity or take the new price: {body}");
+        let cmd = ExecCommand::Amend { permit, market: market.clone(), side: Side::Buy, client_id: cid.clone(), price_ticks, qty_lots: lots };
+        commands.send(cmd).await?;
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv()).await?.context("the Aster worker stopped")?;
+        println!("AMEND  {label} ({}ms): {ev:?}", t.elapsed().as_millis());
+        Ok(ev)
+    };
+    let mut at = 0;
+    for step in 1..=3 {
+        at = scale.price_floor_ticks(bid * (dec!(0.978) - Decimal::new(step, 3)));
+        let ev = amend("far", at, MakerPermit::unguarded()).await?;
+        if !matches!(&ev, ExecEvent::PlaceAck { venue_order_id, .. } if *venue_order_id == oid) {
+            bail!("an amend must be acked on the order it moved");
         }
+    }
+    let order = aster.query_order(&market, &cid).await?;
+    if order["status"] != "NEW" || price_of(&order) != Some(scale.ticks_to_price(at)) {
+        bail!("the amended order does not rest at its new price: {order}");
+    }
+    // The same values again: whatever Aster answers, the order must stay resting and tracked.
+    let ev = amend("to the same price and qty", at, MakerPermit::unguarded()).await?;
+    if !matches!(ev, ExecEvent::PlaceAck { .. } | ExecEvent::AmendReject { .. })
+        || aster.query_order(&market, &cid).await?["status"] != "NEW" {
+        bail!("an amend to the same values must leave the order resting and tracked");
     }
     // 0.2% through a fresh ask, so a tick of drift cannot leave it resting.
     let through_ask = scale.price_ceil_ticks(aster_book_ticker(cfg, &spec.aster_symbol).await?.1 * dec!(1.002));
-    let t = Instant::now();
-    let crossed = aster.amend(&market, Side::Buy, through_ask, lots, &cid).await;
-    println!("AMEND  to the ask ({}ms): {}", t.elapsed().as_millis(), crossed.as_ref().map_or_else(|e| format!("{e:#}"), String::clone));
-    println!("CANCEL after the crossing amend: {:?}", aster.cancel_order(&market, &cid).await?);
-    let filled = aster_position(aster, spec).await?;
-    if filled != Decimal::ZERO {
-        println!("AMEND CROSSED AND FILLED {filled}: an amend is NOT post-only (closed at the end)");
+    let ev = amend("through the ask", through_ask, MakerPermit::unguarded()).await?;
+    let order = aster.query_order(&market, &cid).await?;
+    if !matches!(ev, ExecEvent::AmendReject { .. }) || order["status"] != "NEW" || price_of(&order) != Some(scale.ticks_to_price(at)) {
+        bail!("a crossing amend must be refused and leave the order as it was: {order}");
     }
+    // Rights lost before send: the worker pulls the quote instead.
+    let lapsed = MakerPermit::unguarded();
+    lapsed.cancel_queued();
+    if !matches!(amend("with a lapsed permit", at, lapsed).await?, ExecEvent::CancelAck { .. }) {
+        bail!("an amend whose permit lapsed must cancel the order");
+    }
+    // The order is gone: an amend of it must close the slot, never leave a ghost quote.
+    if !matches!(amend("of the cancelled order", at, MakerPermit::unguarded()).await?, ExecEvent::CancelFilledOrExpired { .. }) {
+        bail!("an amend of a gone order must close the slot");
+    }
+    commands.send(ExecCommand::Shutdown).await?;
+    let _ = worker.await;
 
     // A post-only through the ask may be refused outright, or acknowledged and expire at matching.
     let (t, cross_id) = (Instant::now(), format!("XprbX-{}", epoch_tag()));
@@ -273,13 +298,6 @@ async fn place_ok(aster: &AsterRest, spec: &MarketSpec, side: Side, px: Decimal)
         }
         other => bail!("PLACE {side:?} failed: {other:?}"),
     }
-}
-
-async fn cancel_ok(aster: &AsterRest, market: &MarketId, cid: &str) -> Result<()> {
-    let t0 = Instant::now();
-    let outcome = aster.cancel_order(market, cid).await?;
-    println!("CANCEL {cid} ({}ms): {outcome:?}", t0.elapsed().as_millis());
-    Ok(())
 }
 
 async fn aster_position(aster: &AsterRest, spec: &MarketSpec) -> Result<Decimal> {
@@ -405,8 +423,9 @@ async fn probe_lighter_order_dry_run(cfg: &Config, target: &str) -> Result<()> {
 
 /// Money-risking: XEMM's own Lighter hedge path, each step timed. Drives `run_lighter_worker`
 /// over the private streams as the strategy does: a hedge buy at the normal slippage, an IOC that
-/// cannot fill (does its reject consume the nonce?), and a reduce-only correction back to flat.
-/// Requires `--i-understand-live` and stays under `--max-usd`.
+/// cannot fill (does its reject consume the nonce?), the venue's minimum for reduce-only orders
+/// ([`minimum_rules`]), and a reduce-only correction back to flat. Requires `--i-understand-live`
+/// and stays under `--max-usd`.
 async fn probe_lighter_market(cfg: &Config, target: &str, i_understand_live: bool, max_usd: Decimal) -> Result<()> {
     if !i_understand_live {
         bail!("lighter-market risks real funds: re-run with --i-understand-live --max-usd <N>");
@@ -424,8 +443,9 @@ async fn probe_lighter_market(cfg: &Config, target: &str, i_understand_live: boo
     // Size to clear the Lighter min notional with 2% to spare, rounded UP to the size decimals so
     // the order builder's floor keeps it, and stay under the cap.
     let qty = round_up_size(spec.hl_min_notional * dec!(1.02) / mid, spec.lighter_size_decimals);
-    if qty * mid > max_usd {
-        bail!("smallest Lighter order ~${:.2} exceeds --max-usd {max_usd}; raise the cap", qty * mid);
+    let open = qty + spec.hl_qty_step * dec!(2);
+    if open * mid > max_usd {
+        bail!("the probe's Lighter order ~${:.2} exceeds --max-usd {max_usd}; raise the cap", open * mid);
     }
     if lighter_position(&hl, spec).await? != Decimal::ZERO || !hl.open_orders_info().await?.is_empty() {
         bail!("refusing: Lighter {} must start flat with no open orders", spec.hl_coin);
@@ -445,12 +465,12 @@ async fn probe_lighter_market(cfg: &Config, target: &str, i_understand_live: boo
     let bps = |b: Decimal| b / dec!(10000);
     let lighter = &cfg.live.lighter;
     let opened = async {
-        let bought = hedge(&cmd, &mut events, spec, Side::Buy, qty, mid * (Decimal::ONE + bps(lighter.normal_slippage_bps)), false).await?;
+        let bought = hedge(&cmd, &mut events, spec, Side::Buy, open, mid * (Decimal::ONE + bps(lighter.normal_slippage_bps)), false).await?;
         let before = hl.server_next_nonce().await?;
         let missed = hedge(&cmd, &mut events, spec, Side::Buy, qty, mid * dec!(0.99), false).await?;
         let after = hl.server_next_nonce().await?;
         println!("NONCE  venue nextNonce {before} -> {after} across the IOC that could not fill");
-        Ok::<_, anyhow::Error>(bought + missed)
+        minimum_rules(&cmd, &mut events, spec, bought + missed, qty, lighter.emergency_slippage_bps, &async || hl.mid(&spec.hl_coin).await).await
     }.await;
     let mut position = match &opened {
         Ok(position) => *position,
@@ -492,6 +512,119 @@ async fn probe_lighter_market(cfg: &Config, target: &str, i_understand_live: boo
     opened.map(|_| ())
 }
 
+/// Money-risking: XEMM's Hyperliquid hedge path, each step timed. Drives `run_hyperliquid_worker`
+/// as the strategy does: the leverage gate's read, a hedge buy at the normal slippage, an IOC that
+/// cannot fill, the venue's minimum for reduce-only orders ([`minimum_rules`]), and reduce-only
+/// corrections back to flat. Needs a market hedged on Hyperliquid (`--market HYPE-HL`),
+/// `--i-understand-live`, and stays under `--max-usd`.
+async fn probe_hl_hedge(cfg: &Config, target: &str, i_understand_live: bool, max_usd: Decimal) -> Result<()> {
+    if !i_understand_live {
+        bail!("hl-hedge risks real funds: re-run with --i-understand-live --max-usd <N>");
+    }
+    if max_usd <= Decimal::ZERO || max_usd > dec!(20) {
+        bail!("--max-usd must be in (0, 20] for the probe (got {max_usd})");
+    }
+    let (_m, specs) = resolve(cfg, target).await?;
+    let spec = &specs[0];
+    if spec.hedge != HedgeVenue::Hyperliquid {
+        bail!("hl-hedge needs a market hedged on Hyperliquid (e.g. --market HYPE-HL), not {}", spec.market_id.0);
+    }
+    let hl = HyperliquidHedge::new(&cfg.live.hyperliquid.base_url, HyperliquidCreds::from_env()?, &specs).await?;
+    let http = reqwest::Client::new();
+    let mid = async || fetch_hedge_book(&http, &cfg.live, spec, 1).await?.mid().context("Hyperliquid book without a mid");
+    let t0 = Instant::now();
+    println!("LEVERAGE {}x ({}ms; XEMM's start requires 1)", hl.leverage(&spec.market_id).await?, t0.elapsed().as_millis());
+    if position_in(&hl.clearinghouse_state().await?, &spec.hl_coin) != Decimal::ZERO || !hl.open_orders_info().await?.is_empty() {
+        bail!("refusing: Hyperliquid {} must start flat with no open orders", spec.hl_coin);
+    }
+    let px = mid().await?;
+    let decimals = spec.hl_sz_decimals as u32;
+    let qty = round_up_size(spec.hl_min_notional * dec!(1.02) / px, decimals);
+    let open = qty + spec.hl_qty_step * dec!(2);
+    if open * px > max_usd {
+        bail!("the probe's Hyperliquid order ~${:.2} exceeds --max-usd {max_usd}; raise the cap", open * px);
+    }
+
+    let (cmd, commands) = tokio::sync::mpsc::channel(8);
+    let (events_tx, mut events) = tokio::sync::mpsc::channel(64);
+    let (journal, _journal_rx) = Journal::channel();
+    let worker = tokio::spawn(run_hyperliquid_worker(commands, events_tx, hl.clone(), journal));
+    let bps = |b: Decimal| b / dec!(10000);
+    let slippage = &cfg.live.lighter;
+    let opened = async {
+        let bought = hedge(&cmd, &mut events, spec, Side::Buy, open, px * (Decimal::ONE + bps(slippage.normal_slippage_bps)), false).await?;
+        let missed = hedge(&cmd, &mut events, spec, Side::Buy, qty, px * dec!(0.99), false).await?;
+        minimum_rules(&cmd, &mut events, spec, bought + missed, qty, slippage.emergency_slippage_bps, &mid).await
+    }.await;
+    let mut position = match &opened {
+        Ok(position) => *position,
+        Err(error) => {
+            println!("FAILED {error:#}; flattening from the venue's position");
+            position_in(&hl.clearinghouse_state().await?, &spec.hl_coin)
+        }
+    };
+    // Back to flat with XEMM's reduce-only correction: sized from the fills, then from the venue.
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            position = position_in(&hl.clearinghouse_state().await?, &spec.hl_coin);
+        }
+        if position == Decimal::ZERO {
+            break;
+        }
+        let side = if position > Decimal::ZERO { Side::Sell } else { Side::Buy };
+        let px = mid().await? * match side {
+            Side::Sell => Decimal::ONE - bps(slippage.emergency_slippage_bps),
+            Side::Buy => Decimal::ONE + bps(slippage.emergency_slippage_bps),
+        };
+        match hedge(&cmd, &mut events, spec, side, position.abs(), px, true).await {
+            Ok(sold) => position -= if side == Side::Sell { sold } else { -sold },
+            Err(error) => println!("FAILED reduce-only close: {error:#}"),
+        }
+    }
+    let _ = cmd.send(HedgeCommand::Shutdown).await;
+    let _ = worker.await;
+    let position = position_in(&hl.clearinghouse_state().await?, &spec.hl_coin);
+    println!("FINAL position: {position} {}", spec.hl_coin);
+    if position != Decimal::ZERO || !hl.open_orders_info().await?.is_empty() {
+        bail!("{} ends with position {position} or open orders; manual check required", spec.hl_coin);
+    }
+    opened.map(|_| ())
+}
+
+/// Measures, from a long position of `min_qty` (the venue's minimum) plus two steps, whether the
+/// hedge venue takes a reduce-only order under its minimum, as XEMM's correction of a small residual
+/// sends one: a reduce-only step (a partial reduce), a plain sell down to one step, a reduce-only
+/// close of that step (a full close) and, if that is refused, a plain buy back over the minimum.
+/// Returns the position the fills leave, for the caller's close.
+async fn minimum_rules(cmd: &tokio::sync::mpsc::Sender<HedgeCommand>, events: &mut tokio::sync::mpsc::Receiver<ExecEvent>,
+    spec: &MarketSpec, mut position: Decimal, min_qty: Decimal, slippage_bps: Decimal,
+    mid: &impl AsyncFn() -> Result<Decimal>) -> Result<Decimal> {
+    let step = spec.hl_qty_step;
+    if position < min_qty + step * dec!(2) {
+        println!("RULES  skipped: position {position} is under the minimum plus two steps");
+        return Ok(position);
+    }
+    let px = async |side: Side| Ok::<_, anyhow::Error>(mid().await? * match side {
+        Side::Sell => Decimal::ONE - slippage_bps / dec!(10000),
+        Side::Buy => Decimal::ONE + slippage_bps / dec!(10000),
+    });
+    let verdict = |filled: Decimal| if filled > Decimal::ZERO { "accepted" } else { "refused" };
+    let sold = hedge(cmd, events, spec, Side::Sell, step, px(Side::Sell).await?, true).await?;
+    println!("RULE   reduce-only partial close under the minimum: {}", verdict(sold));
+    position -= sold;
+    position -= hedge(cmd, events, spec, Side::Sell, position - step, px(Side::Sell).await?, false).await?;
+    if position == step {
+        let sold = hedge(cmd, events, spec, Side::Sell, step, px(Side::Sell).await?, true).await?;
+        println!("RULE   reduce-only full close under the minimum: {}", verdict(sold));
+        position -= sold;
+        if position > Decimal::ZERO {
+            position += hedge(cmd, events, spec, Side::Buy, min_qty, px(Side::Buy).await?, false).await?;
+        }
+    }
+    Ok(position)
+}
+
 /// One hedge through the worker, as the strategy sends it; waits for its terminal event, prints
 /// each event's time since the command was queued, and returns the filled quantity.
 async fn hedge(cmd: &tokio::sync::mpsc::Sender<HedgeCommand>, events: &mut tokio::sync::mpsc::Receiver<ExecEvent>,
@@ -518,22 +651,33 @@ async fn hedge(cmd: &tokio::sync::mpsc::Sender<HedgeCommand>, events: &mut tokio
                 }
             }
             ExecEvent::HedgeReject { reason, .. } => {
-                println!("  rejected ({ms}ms): {reason}");
+                println!("  rejected ({ms}ms, retryable no-fill: {}): {reason}", hedge_reject_is_definitive_no_fill(&reason));
                 return Ok(Decimal::ZERO);
             }
+            // The worker resolves it (Hyperliquid: `orderStatus`, then the fills) and reports the end.
+            ExecEvent::HedgeUnknown { reason, .. } => println!("  unknown ({ms}ms), resolving: {reason}"),
             other => bail!("unexpected hedge outcome after {ms}ms: {other:?}"),
         }
     }
 }
 
+/// Lighter's position from data that originated after this call: the positions feed can trail a
+/// fill (the reconciler skips such reads by the same stamp). A cache older than
+/// `ws_account_max_age_ms` (1.5 s) gives way to REST, which bounds the wait.
 async fn lighter_position(hl: &LighterExchange, spec: &MarketSpec) -> Result<Decimal> {
-    let st = hl.clearinghouse_state().await?;
-    Ok(st
-        .asset_positions
-        .iter()
-        .find(|p| p.position.coin == spec.hl_coin)
-        .and_then(|p| p.position.szi.parse::<Decimal>().ok())
-        .unwrap_or(Decimal::ZERO))
+    let asked = crate::hotpath::clock::mono_now_ns();
+    loop {
+        let st = hl.clearinghouse_state().await?;
+        if st.data_origin_ns >= asked {
+            return Ok(position_in(&st, &spec.hl_coin));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// A hedge account's signed position in `coin`.
+fn position_in(st: &HlClearinghouse, coin: &str) -> Decimal {
+    st.asset_positions.iter().find(|p| p.position.coin == coin).and_then(|p| p.position.szi.parse().ok()).unwrap_or(Decimal::ZERO)
 }
 
 fn round_up_size(qty: Decimal, size_decimals: u32) -> Decimal {

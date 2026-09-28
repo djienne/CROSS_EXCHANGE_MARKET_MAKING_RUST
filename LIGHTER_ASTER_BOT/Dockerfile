@@ -47,6 +47,9 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+# The live Aster nonce counter's mount point: a fresh named volume takes this owner, the
+# compose file's default XEMM_UID/GID.
+RUN mkdir -m 700 /nonce && chown 1000:1000 /nonce
 
 COPY --from=builder /usr/local/bin/lighter_aster_bot /usr/local/bin/lighter_aster_bot
 # Non-secret live config baked in as a fallback; compose also bind-mounts it so the

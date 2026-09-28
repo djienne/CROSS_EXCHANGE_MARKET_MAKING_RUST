@@ -12,10 +12,10 @@ use tracing::info;
 
 use super::crypto::{address_from_priv, address_hex, keccak256, parse_address, parse_priv_key};
 
-/// The live credential files: `ASTER_ENV_PATH` and `LIGHTER_ENV_PATH`, by default `aster.env`
-/// and `lighter.env` in the working directory.
-pub fn env_files() -> [PathBuf; 2] {
-    [("ASTER_ENV_PATH", "aster.env"), ("LIGHTER_ENV_PATH", "lighter.env")]
+/// The live credential files: `ASTER_ENV_PATH`, `LIGHTER_ENV_PATH` and `HYPERLIQUID_ENV_PATH`,
+/// by default `aster.env`, `lighter.env` and `hyperliquid.env` in the working directory.
+pub fn env_files() -> [PathBuf; 3] {
+    [("ASTER_ENV_PATH", "aster.env"), ("LIGHTER_ENV_PATH", "lighter.env"), ("HYPERLIQUID_ENV_PATH", "hyperliquid.env")]
         .map(|(var, default)| std::env::var_os(var).map_or_else(|| PathBuf::from(default), PathBuf::from))
 }
 
@@ -82,7 +82,7 @@ pub struct AsterCreds {
 impl AsterCreds {
     /// The live credentials, from the Aster file of [`env_files`].
     pub fn from_env() -> Result<Self> {
-        let [aster, _] = env_files();
+        let [aster, _, _] = env_files();
         Self::load(&aster)
     }
 
@@ -130,7 +130,7 @@ impl std::fmt::Debug for LighterCreds {
 impl LighterCreds {
     /// The live credentials, from the Lighter file of [`env_files`].
     pub fn from_env() -> Result<Self> {
-        let [_, lighter] = env_files();
+        let [_, lighter, _] = env_files();
         Self::load(&lighter)
     }
 
@@ -188,7 +188,8 @@ impl std::fmt::Debug for HyperliquidCreds {
 
 impl HyperliquidCreds {
     pub fn from_env() -> Result<Self> {
-        Self::load(&std::env::var_os("HYPERLIQUID_ENV_PATH").map_or_else(|| PathBuf::from("hyperliquid.env"), PathBuf::from))
+        let [_, _, hyperliquid] = env_files();
+        Self::load(&hyperliquid)
     }
 
     /// The dry-run identity: an agent key trading the dry-run owner's account.

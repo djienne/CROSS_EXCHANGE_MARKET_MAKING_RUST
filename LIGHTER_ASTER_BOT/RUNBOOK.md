@@ -71,15 +71,15 @@ tmux new -s lighter_aster_bot
 ./target/release/lighter_aster_bot run --market HYPE --mode live 2>&1 | tee -ai runs/bot-HYPE.log
 ```
 
-Docker (see [Deploy](#deploy)):
+Docker, here or on a Linux host (see [Deploy](#deploy)):
 
 ```bash
-docker compose run --rm -T --name bot-hype bot run --market HYPE --mode live 2>&1 | tee -ai runs/bot-HYPE.log
+docker compose --profile live run -d --name bot-hype bot run --market HYPE --mode live
+docker logs -f bot-hype
 ```
 
-The bot logs to stdout only; `runs/` holds its journals, ledgers, latches and state. The `tee`
-keeps the log for reviews (`--rm` deletes the container's copy), and `-i` leaves Ctrl-C to the
-bot, so the drain is still logged.
+The bot logs to stdout only; `runs/` holds its journals, ledgers, latches and state. The
+stopped container keeps its log for review; `docker rm bot-hype` before the next start.
 
 Stop with Ctrl-C, SIGINT, SIGTERM or SIGHUP (`tmux send-keys -t lighter_aster_bot C-c`,
 `docker kill --signal=SIGINT bot-hype`). XEMM drains first, then the taker.
@@ -205,14 +205,18 @@ the live probes); the bot's market impact beyond the liquidity it takes; how Ast
 splits around matching (assumed pessimistically); anything about liquidation. Lighter
 signatures are not verified. The venues' live timings are under [Probes](#probes).
 
-**Going live.** Live runs on a Linux host ([Deploy](#deploy)). Docker Desktop on Windows shows
-bind-mounted files as mode 777, and live refuses env files that others can read.
+**Going live.** Live runs in the `bot` container, on this Windows host or a Linux host
+([Deploy](#deploy)). Live refuses credential files that group or other can read. Docker Desktop
+shows Windows bind mounts as mode 777, so the container's entrypoint copies the env files at
+0600 into a memory-only tmpfs of the bot user and points `*_ENV_PATH` there; the check still
+applies to what the bot reads.
 
 1. The dry run has run for days with no unexplained reject, halt or `no route` warning, and
    its reports agree with the simulated equity net of funding and open-position marks.
 2. The fee keys in `bot.toml` match both accounts' actual tiers.
-3. Ship the sources, the secrets and the live image with `scripts/deploy_vps.sh` ([Deploy](#deploy)).
-4. On the host, the read-only probes pass: `docker compose run --rm bot probe aster-balance`,
+3. On a VPS, ship the sources, the secrets and the live image with `scripts/deploy_vps.sh`
+   ([Deploy](#deploy)); here, `docker compose --profile live build bot`.
+4. On the host, the read-only probes pass: `docker compose --profile live run --rm bot probe aster-balance`,
    then `probe lighter-balance`, `probe lighter-open-orders`, `probe leverage` and `taker probe
    --market HYPE`. Both venues must be at 1x cross and Aster in one-way position mode, which XEMM
    checks at start.
@@ -380,13 +384,18 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
   `run`. Each needs `--i-understand-live`, a flat start and no open orders, prints every
   step's latency beside a ping, and ends by checking flat with no orders.
   - `probe aster-place-cancel`: XEMM's Aster calls on post-only orders ~2 % from the book,
-    with XEMM's user stream running: place, a refresh by cancel+place, amends (one to a
-    crossing price), a post-only through the ask, cancel-all, and the 10 s dead-man. A
-    position left over is closed reduce-only.
-  - `probe lighter-market --max-usd 12`: XEMM's hedge worker sends a hedge, an IOC that
-    cannot fill, and a reduce-only close.
+    with XEMM's user stream running: place; amends through XEMM's own Aster worker (to far
+    prices, to the same values, through the ask, with a lapsed permit, and of the cancelled
+    order, which must close the slot); a post-only through the ask; cancel-all; the 10 s
+    dead-man. A position left over is closed reduce-only.
+  - `probe lighter-market --max-usd 12` / `probe hl-hedge --market HYPE-HL --max-usd 12`:
+    XEMM's hedge worker on Lighter / Hyperliquid sends a hedge, an IOC that cannot fill
+    (printing whether its reject reads as the retryable no-fill), whether the venue takes a
+    reduce-only order under its minimum (a partial and a full close; `RULE` lines), and a
+    reduce-only close.
   - `taker aster-market-roundtrip --max-usd 7` / `taker lighter-market-roundtrip --max-usd
-    12`: the taker's entry order, after one bounded under the bid that cannot fill. They clean
+    12`: the taker's entry order, after one bounded under the bid that cannot fill. The Aster
+    one closes with XEMM's reduce-only MARKET, one step (under the $5 minimum) first. They clean
     up reduce-only (at most three closes in 30 s) and stay blocked without terminal-order and
     flat-position evidence.
 - Measured 2026-09-28 from Windows, ~250 ms ping to both venues; venue time = RTT - ping:
@@ -401,6 +410,13 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
     that cannot fill is accepted, consumes its nonce, and ends terminal with 0 filled
     (`canceled-too-much-slippage`).
   - Taker fees: Aster 4.0 bps, Lighter 0, as in `bot.toml`.
+  - Hyperliquid (`probe hl-hedge`): the IOC result ~0.9-1.2 s, the fee ~0.3-3.7 s later
+    (`userFillsByTime`), taker fee 4.5 bps. An IOC that cannot fill is refused with "could not
+    immediately match", which the bot retries as a no-fill.
+  - A reduce-only order under the venue minimum: Aster fills one ($0.88 under its $5), and so
+    does Lighter (0.01 HYPE under 0.07 and $10), partial or closing. Hyperliquid refuses a
+    partial one ("Order must have minimum value of $10") and fills one that closes the whole
+    position, so XEMM's correction there rounds up to the minimum or to the whole position.
 - Hyperliquid reads `HYPERLIQUID_ENV_PATH` (default `hyperliquid.env`, keys as in
   `hyperliquid.env.example`: `wallet_address` = the traded subaccount, `private_key` = its agent
   key, `is_vault`). `docker compose --profile live run --rm bot probe hl-balance --market HYPE`

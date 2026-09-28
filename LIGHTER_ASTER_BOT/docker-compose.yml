@@ -18,12 +18,13 @@
 #   docker compose logs -f dryrun
 #   docker compose restart dryrun     # after a halt: the restart is the review
 #
-# ---- Live, on the Linux host (RUNBOOK.md: going live, run and stop, probes) --------
-#   docker compose build bot                          # deploy_vps.sh image builds and ships it
-#   docker compose run --rm bot probe aster-balance   # signed reads, no orders
-#   # REAL MONEY; the tee keeps the log that --rm would delete:
-#   docker compose run --rm -T --name bot-hype bot run --market HYPE --mode live 2>&1 | tee -ai runs/bot-HYPE.log
+# ---- Live, here or on a Linux host (RUNBOOK.md: going live, run and stop, probes) ---
+#   docker compose --profile live build bot
+#   docker compose --profile live run --rm bot probe aster-balance   # signed reads, no orders
+#   # REAL MONEY, detached; the stopped container keeps its log (docker logs bot-hype):
+#   docker compose --profile live run -d --name bot-hype bot run --market HYPE --mode live
 #   docker kill --signal=SIGINT bot-hype              # graceful drain; paired positions stay open
+#   docker rm bot-hype                                # after reviewing its log
 # -----------------------------------------------------------------------------------
 
 services:
@@ -37,9 +38,18 @@ services:
     user: "${XEMM_UID:-1000}:${XEMM_GID:-1000}"
     environment:
       ASTER_NONCE_DIR: /nonce
+      ASTER_ENV_PATH: /run/creds/aster.env
+      LIGHTER_ENV_PATH: /run/creds/lighter.env
+      HYPERLIQUID_ENV_PATH: /run/creds/hyperliquid.env
+    # Docker Desktop shows Windows bind mounts as mode 777, which `run --mode live` refuses for
+    # credentials. The bot reads 0600 copies in a memory-only tmpfs of its own user instead;
+    # the check itself stays.
+    tmpfs:
+      - /run/creds:mode=0700,uid=${XEMM_UID:-1000},gid=${XEMM_GID:-1000}
+    entrypoint: ["sh", "-c", "for f in aster lighter hyperliquid; do [ ! -e /app/$$f.env ] || install -m 600 /app/$$f.env /run/creds/; done; exec lighter_aster_bot \"$$@\"", "lighter_aster_bot"]
     volumes:
       # Mount the WHOLE deploy dir read-only at the working dir, so bot.toml, the signer
-      # binaries and the secret env files (aster.env / lighter.env, read from CWD) are
+      # binaries and the secret env files (aster.env / lighter.env / hyperliquid.env) are
       # present — no per-file mounts to keep in sync. The binary lives in /usr/local/bin,
       # so this never shadows it; secrets are still mount-only (never in the image).
       - .:/app:ro
@@ -49,8 +59,9 @@ services:
       # The retired orchestrator's runs/ at the stack root: `run --mode live` refuses to start
       # while its lock is held or its latches exist (RUNBOOK.md, "Orchestrator leftovers").
       - ../runs:/runs:ro
-      # Shared with any host-side Aster signer (native probes) on the Linux host.
-      - ${ASTER_NONCE_DIR:-/tmp/lighter-aster-nonces}:/nonce
+      # One counter for every container signing for the Aster wallet: the live bot and the
+      # probes beside it. On a Linux host, set ASTER_NONCE_DIR to share it with native signers.
+      - ${ASTER_NONCE_DIR:-aster-nonce}:/nonce
     # SIGINT, SIGTERM and SIGHUP all start the same graceful drain. Positions stay OPEN.
     stop_signal: SIGINT
     # A status tick in progress (<= 50 s), then XEMM's and the taker's stops,
@@ -61,6 +72,17 @@ services:
     restart: "no"
     # Default = print help and exit; real runs override the command per invocation.
     command: ["--help"]
+    # As the dry run's; HELPERS\cpu_limits excludes the `bot` service, so this value stands.
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   # The same bot against simulated Aster and Lighter venues fed by live public market data
   # (RUNBOOK.md, "Dry run"). No credentials are mounted, and its dry-run identity signs for
@@ -154,3 +176,7 @@ services:
       options:
         max-size: "20m"
         max-file: "5"
+
+volumes:
+  # The live Aster nonce counter (`bot` service); it takes the image's /nonce owner.
+  aster-nonce:

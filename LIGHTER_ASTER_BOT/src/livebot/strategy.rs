@@ -21,7 +21,7 @@ use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
 use crate::book::OrderBook;
-use crate::config::Config;
+use crate::config::{Config, HedgeVenue};
 use crate::edge::EdgeConfig;
 use crate::hot_types::HotBook;
 use crate::hotpath::{VenueRegistry, VenueTag};
@@ -2108,7 +2108,7 @@ impl Strategy {
 
     fn maker_permit(&self, market: &MarketId, now_ns: i64, versions: Option<(u64, u64)>) -> MakerPermit {
         #[cfg(test)]
-        if versions.is_none() { return MakerPermit::for_test(); }
+        if versions.is_none() { return MakerPermit::unguarded(); }
         let (a_version, h_version) = versions.expect("production quotes carry book versions");
         let ctx = &self.ctx[market];
         let max_ms = self.cfg.live.max_book_staleness_ms;
@@ -2945,12 +2945,22 @@ impl Strategy {
         let a_qty = if same_sign(aster) { crate::decimal::floor_to_step(net.abs().min(aster.abs()), aster_step) } else { Decimal::ZERO };
         let h_qty = if same_sign(lighter) { crate::decimal::floor_to_step(net.abs().min(lighter.abs()), lighter_step) } else { Decimal::ZERO };
         let slip = self.cfg.live.lighter.emergency_slippage_bps;
+        // Measured live 2026-09-28: Aster and Lighter take a reduce-only order of any size;
+        // Hyperliquid refuses one under its $10 minimum unless it closes the whole position. So
+        // there it rounds up to the minimum (at 98 % of the limit price, in case the venue values
+        // it lower) or to the whole position; any excess leaves an Aster residual for the next
+        // correction.
+        let hedge_min = (ctx.spec.hedge == HedgeVenue::Hyperliquid)
+            .then(|| HedgeabilityRules { hedge_min_notional: ctx.spec.hl_min_notional, hedge_qty_step: lighter_step });
         let selected = if a_qty > Decimal::ZERO {
             self.fresh_aster_touch_book(market, now_ns).and_then(|b| b.book.mid().map(|p| (Venue::Aster, a_qty, p, b.source.as_str(), b.age_ms)))
         } else { None }.or_else(|| {
             if h_qty <= Decimal::ZERO { return None; }
             self.fresh_hl_hedge_book_hot_first(market, now_ns, side, h_qty)
-                .and_then(|b| crossing_hedge_px(&b.book, side, slip).map(|p| (Venue::Hedge, h_qty, p, b.path.as_str(b.source), b.age_ms)))
+                .and_then(|b| crossing_hedge_px(&b.book, side, slip).map(|p| {
+                    let qty = hedge_min.as_ref().map_or(h_qty, |rules| h_qty.max(inventory::hl_min_hedge_qty(rules, p * Decimal::new(98, 2))).min(lighter.abs()));
+                    (Venue::Hedge, qty, p, b.path.as_str(b.source), b.age_ms)
+                }))
         });
         let Some((venue, qty, price, source, age_ms)) = selected else { return };
         let cloid = self.orders.next_attempt_id(market);
@@ -4038,6 +4048,25 @@ lighter_symbol = "BTC"
         strat.dispatch_correction(&m,dec!(0.05),dec!(-0.95),dec!(1),crate::hotpath::clock::mono_now_ns());
         let HedgeCommand::Hedge { intent,.. }=hrx.try_recv().unwrap() else {panic!("reduce-only hedge expected")};
         assert_eq!((intent.venue,intent.purpose,intent.hedge_side,intent.qty),(Venue::Hedge,IntentPurpose::ReduceDelta,Side::Sell,dec!(0.05)));
+        assert!(erx.try_recv().is_err());
+    }
+
+    #[test]
+    fn hyperliquid_correction_rounds_up_to_its_minimum_or_the_whole_position() {
+        let account=AccountState::default(); let (etx,mut erx)=tokio::sync::mpsc::channel(16); let (htx,mut hrx)=tokio::sync::mpsc::channel(16);
+        let mut strat=live_strat(etx,htx,account); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
+        let ctx=strat.ctx.get_mut(&m).unwrap();
+        ctx.spec=Arc::new(MarketSpec { hedge:HedgeVenue::Hyperliquid, hl_min_notional:dec!(10), ..(*ctx.spec).clone() });
+        // Over-hedged by 0.05 (~$5): one reduce-only at the minimum; the excess is Aster's to correct.
+        strat.dispatch_correction(&m,dec!(0.05),dec!(-0.95),dec!(1),now);
+        let HedgeCommand::Hedge { intent,aggressive_px }=hrx.try_recv().unwrap() else {panic!("reduce-only hedge expected")};
+        assert_eq!((intent.purpose,intent.hedge_side),(IntentPurpose::ReduceDelta,Side::Sell));
+        assert!(intent.qty*aggressive_px>=dec!(10) && intent.qty<=dec!(0.11),"{} at {aggressive_px}",intent.qty);
+        strat.hedges.remove(&intent.cloid.to_hex());
+        // A hedge position under the minimum: the whole of it, which the venue takes.
+        strat.dispatch_correction(&m,dec!(0.03),dec!(0),dec!(0.03),now+1);
+        let HedgeCommand::Hedge { intent,.. }=hrx.try_recv().unwrap() else {panic!("reduce-only hedge expected")};
+        assert_eq!(intent.qty,dec!(0.03));
         assert!(erx.try_recv().is_err());
     }
 

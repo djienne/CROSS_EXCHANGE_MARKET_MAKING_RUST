@@ -69,19 +69,19 @@ pub enum Commands {
     /// sends none. REAL orders, each needing `--i-understand-live`: aster-place-cancel times
     /// XEMM's Aster calls (post-only place, cancel, refresh, amend, cancel-all, dead-man);
     /// lighter-market drives XEMM's hedge worker (a hedge, an IOC that cannot fill, a reduce-only
-    /// close) and needs `--max-usd <N>`.
+    /// close) and needs `--max-usd <N>`; hl-hedge does the same on Hyperliquid (`--market HYPE-HL`).
     Probe {
         /// Which check: aster-balance | aster-positions | aster-open-orders | aster-place-cancel |
         /// leverage | lighter-balance | lighter-open-orders | lighter-order-dry-run | lighter-market |
-        /// hl-balance | hl-place-cancel | hl-market (Hyperliquid, `HYPERLIQUID_ENV_PATH`)
+        /// hl-hedge | hl-balance | hl-place-cancel | hl-market (Hyperliquid, `HYPERLIQUID_ENV_PATH`)
         check: String,
         /// Target market id from config (e.g. HYPE). Defaults to HYPE.
         #[arg(long)]
         market: Option<String>,
-        /// Required confirmation for lighter-market, hl-place-cancel and hl-market.
+        /// Required confirmation for aster-place-cancel, lighter-market, hl-hedge, hl-place-cancel and hl-market.
         #[arg(long, default_value_t = false)]
         i_understand_live: bool,
-        /// USD cap for lighter-market, in (0, 20]; for hl-place-cancel and hl-market, in [10.5, 20].
+        /// USD cap for lighter-market and hl-hedge, in (0, 20]; for hl-place-cancel and hl-market, in [10.5, 20].
         #[arg(long, default_value = "0")]
         max_usd: rust_decimal::Decimal,
     },

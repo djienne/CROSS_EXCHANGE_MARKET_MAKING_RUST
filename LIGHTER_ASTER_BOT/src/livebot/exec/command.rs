@@ -65,8 +65,9 @@ impl MakerPermit {
     }
     pub fn is_cancelled(&self) -> bool { self.admission.is_cancelled() }
     pub fn cancel_queued(&self) -> bool { self.admission.cancel_queued() }
-    #[cfg(test)]
-    pub fn for_test() -> Self {
+    /// A permit bound to no books, epoch or hedge readiness: only its own admission can lapse.
+    /// For probes and tests.
+    pub fn unguarded() -> Self {
         Self { admission: Admission::new(i64::MAX), books: None, epoch: Arc::new(AtomicU64::new(0)), expected_epoch: 0, hedge_readiness: None }
     }
 }
