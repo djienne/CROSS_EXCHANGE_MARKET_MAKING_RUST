@@ -1,6 +1,6 @@
 //! Command-line interface: `run` (the bot: both engines, one market) and the XEMM
-//! subcommands `live-report`, `probe`, `status`, `fetch-specs`, plus `record` (the market-data
-//! tape for backtests). The taker engine has its own CLI under `taker`.
+//! subcommands `live-report`, `probe`, `status`, `fetch-specs`, plus `close` (the operator's exit)
+//! and `record` (the market-data tape for backtests). The taker engine has its own CLI under `taker`.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -86,6 +86,21 @@ pub enum Commands {
         max_usd: rust_decimal::Decimal,
     },
 
+    /// REAL orders, the operator's exit: close one coin's positions at market, reduce-only, on
+    /// Aster, Lighter and Hyperliquid at once, then check each venue flat. Refuses while a live
+    /// `run` or `taker run` trades one of those venues.
+    Close {
+        /// Market id or coin from config [[markets]] (e.g. HYPE; HYPE-HL means HYPE too).
+        #[arg(long)]
+        market: String,
+        /// Venues to close, comma-separated; all three when omitted.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        venue: Vec<crate::livebot::probe::CloseVenue>,
+        /// Required confirmation.
+        #[arg(long, default_value_t = false)]
+        i_understand_live: bool,
+    },
+
     /// Read-only account/book/quote status, as JSON: the XEMM report `run` polls every tick.
     Status {
         /// Target market id from config (e.g. HYPE). Defaults to HYPE.
@@ -142,6 +157,10 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Commands::Probe { check, market, i_understand_live, max_usd } => {
             let cfg = crate::config::Config::load(&cli.config)?;
             crate::livebot::probe::run(&cfg, &check, market, i_understand_live, max_usd).await?;
+        }
+        Commands::Close { market, venue, i_understand_live } => {
+            let cfg = crate::config::Config::load(&cli.config)?;
+            crate::livebot::probe::close(&cfg, &market, &venue, i_understand_live).await?;
         }
         Commands::Status { market } => {
             let cfg = crate::config::Config::load(&cli.config)?;

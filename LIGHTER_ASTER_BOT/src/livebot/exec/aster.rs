@@ -970,7 +970,7 @@ async fn process_cmd(
         }
 }
 
-fn order_progress(body: &str) -> Option<(Decimal, Option<Decimal>, bool, Option<String>, Option<i64>)> {
+pub(crate) fn order_progress(body: &str) -> Option<(Decimal, Option<Decimal>, bool, Option<String>, Option<i64>)> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let status = value.get("status")?.as_str()?;
     let qty = value.get("executedQty").or_else(|| value.get("cumQty"))?.as_str()?.parse::<Decimal>().ok()?;

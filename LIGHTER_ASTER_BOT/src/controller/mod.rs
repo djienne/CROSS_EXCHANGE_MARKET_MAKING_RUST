@@ -131,8 +131,12 @@ pub async fn run(config: &Path, market: &str, mode: LiveMode, ack_breaker: bool,
 /// position there, so each leg has one live writer (HYPE-LH and HYPE both trade Lighter HYPE).
 pub fn legs(market: &crate::taker::config::MarketCfg) -> [String; 2] {
     let first = if market.first_venue == FirstVenue::Aster { &market.aster_symbol } else { &market.lighter_symbol };
-    [format!("{:?}-{first}", market.first_venue), format!("{:?}-{}", market.hedge_venue, market.lighter_symbol)]
-        .map(|leg| leg.to_ascii_uppercase())
+    [leg(market.first_venue, first), leg(market.hedge_venue, &market.lighter_symbol)]
+}
+
+/// One leg's lock name, `<VENUE>-<symbol>`.
+pub fn leg(venue: impl std::fmt::Debug, symbol: &str) -> String {
+    format!("{venue:?}-{symbol}").to_ascii_uppercase()
 }
 
 /// [`run`] with the config loaded and the runs directory given.

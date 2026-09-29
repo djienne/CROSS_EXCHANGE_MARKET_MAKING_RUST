@@ -87,7 +87,7 @@ XEMM quiesces admission, cancels makers, drains fills and execution outcomes, co
 residuals, reconciles and flushes persistence; this can take up to ~190 s per engine, after
 any status poll in progress (up to 25 s). Never stop it with a shorter kill: `docker stop`
 needs `-t 460`, and compose already sets `stop_grace_period: 460s`. Paired positions stay
-open and delta-neutral. Exit 0 means a clean stop; nonzero means a halt, an unresolved engine
+open and delta-neutral ([`close`](#close-a-position) exits them). Exit 0 means a clean stop; nonzero means a halt, an unresolved engine
 stop or an unwritable event log. A panic outside XEMM's strategy thread aborts the process at
 once, with no drain, like a kill.
 
@@ -96,6 +96,25 @@ Only one live writer per market runs at a time: `run --mode live` and `taker run
 on contention. Live, they also lock each leg, `runs/bot-<VENUE>-<SYMBOL>.lock`
 (`bot-LIGHTER-HYPE.lock`), so markets sharing a leg (HYPE and HYPE-LH) never both trade it. A
 dry run locks `runs/dry-run/bot-<MARKET>.lock`, so it can run beside live.
+
+### Close a position
+
+Stop the bot, then close the coin at market on every venue:
+
+```bash
+docker compose --profile live run --rm -T bot close --market HYPE --i-understand-live
+```
+
+`close` sends REAL orders. It cancels the Aster symbol's open orders, then closes on Aster,
+Lighter and Hyperliquid at once (`--venue aster,lighter` for some) with reduce-only orders at
+market: an Aster MARKET order, and IOCs through XEMM's hedge worker at
+`emergency_slippage_bps` on Lighter and Hyperliquid. Each venue gets up to three orders, sized
+from the fills (from a fresh read after one that filled nothing), and must then read flat, or
+the command names it and exits nonzero. `--market` takes a market id or its coin: HYPE and
+HYPE-HL both close HYPE. It takes each venue's leg lock, so it refuses while a live `run` or
+`taker run` trades there ("another live writer holds runs/bot-LIGHTER-HYPE.lock"). Measured
+2026-09-29, closing Aster −0.14 and Hyperliquid +0.14 HYPE: Aster filled in 339 ms,
+Hyperliquid in 1.3 s (fee known at 1.3 s), all three venues flat within 5 s of the start.
 
 ## Dry run
 
