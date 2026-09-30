@@ -62,6 +62,8 @@ pub struct AccountSnapshot {
     /// does not look like a loss.
     pub aster_equity_usd: Decimal,
     /// Lighter collateral-style `portfolio_value`, or Hyperliquid's already-marked `accountValue`.
+    /// Lighter's does not mark open positions (frozen 41 h while the uPnL moved $8, 2026-07-04),
+    /// hence `hl_unrealized_usd`.
     pub hl_equity_usd: Decimal,
     /// Lighter position uPnL marked to fresh hedge mids and added to collateral.
     /// Zero for Hyperliquid, whose `hl_equity_usd` already includes uPnL.

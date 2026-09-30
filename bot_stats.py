@@ -9,6 +9,13 @@ combined_pnl.py says how much was made; this says why. It covers five things:
 - for a dry run, whether the simulator stayed faithful to its latency model.
 The model's targets are in bot.toml [dry_run].
 Taker fields named aster/lighter describe the first/hedge legs; the venue lists identify them.
+
+For a live/paper comparison, `--runs DIR` reads an isolated runs directory; give both reports the
+same `--since` and `--now`. `maker_fills`/`maker_sides` count deduplicated native exchange fills,
+`trades` logical obligations. `hedge_first_fill_observed_ms` is per trade, on this host's
+monotonic clock, from its first maker fill to its first hedge fill seen (retries included);
+`hedge_delay_ms` compares the venues' own clocks. An amend's round trip ends at the same client
+id's reply. Report p50 is the upper median for even counts, and with 2 samples the larger one.
 """
 from __future__ import annotations
 
@@ -102,6 +109,11 @@ def taker(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, 
     }
 
 
+def native_maker(f: Any) -> bool:
+    """A maker fill: the Aster user stream also calls a reduce-only recovery MARKET a maker_fill."""
+    return f.source.get("kind") == "maker_fill" and not f.source.get("detail", {}).get("reduce_only")
+
+
 def xemm(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, Any]:
     path = runs / f"bot-{market}-journal.jsonl"
     if not path.exists():
@@ -117,32 +129,14 @@ def xemm(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, A
         firsts = {v: min((f.timestamp for f in t["fills"] if f.venue == v and f.timestamp), default=None) for v in ("aster", "lighter")}
         if all(firsts.values()):
             stats["hedge_delay_ms"].append((firsts["lighter"] - firsts["aster"]).total_seconds() * 1000)
+        if t["hedge_first_fill_observed_ms"] is not None:
+            stats["hedge_first_fill_observed_ms"].append(t["hedge_first_fill_observed_ms"])
         for f in t["fills"]:
-            # The Aster user stream also calls a reduce-only recovery MARKET a maker_fill.
-            if f.venue == "aster" and (f.source.get("kind") != "maker_fill" or f.source.get("detail", {}).get("reduce_only")):
+            if f.venue == "aster" and not native_maker(f):
                 continue
             if f.timestamp and since <= f.timestamp <= now and f.quote and f.fee is not None:
                 stats["maker_fees_bps" if f.venue == "aster" else "hedge_fees_bps"].append(float(f.fee / f.quote * 10_000))
-    makers = [f for t in trades for f in t["fills"] if f.source.get("kind") == "maker_fill"
-              and not f.source.get("detail", {}).get("reduce_only")
-              and f.qty > 0 and f.timestamp and since <= f.timestamp <= now]
-    # Venue clocks can differ. This delay uses the host's monotonic clock, from the hedge
-    # obligation's creation to its first observed fill; later fee/backfill notices do not add samples.
-    attempts = {f.attempt_id for t in trades for f in t["fills"] if f.venue != "aster"}
-    observed = {}
-    for _, r in iter_jsonl(path):
-        d = r.get("detail", {})
-        if (not isinstance(d, dict) or r.get("market") != market or r.get("kind") != "execution_progress" or d.get("purpose") != "hedge"
-                or d.get("attempt_id") not in attempts
-                or not since.timestamp() * 1000 <= r.get("ts_ms", 0) <= now.timestamp() * 1000
-                or float(d.get("cumulative_qty") or 0) <= 0):
-            continue
-        created, seen = d.get("created_ns"), d.get("observed_ns")
-        if created and seen and seen >= created:
-            key = d["attempt_id"]
-            delay = (seen - created) / 1_000_000
-            observed[key] = min(observed.get(key, delay), delay)
-    stats["hedge_first_fill_observed_ms"] = list(observed.values())
+    makers = [f for t in trades for f in t["fills"] if native_maker(f) and f.qty > 0 and f.timestamp and since <= f.timestamp <= now]
     hours = (now - since).total_seconds() / 3600
     return {"trades": len(trades), "incomplete": sum(t["net_pnl_usdc"] is None for t in trades),
             "residual": sum(t["residual_qty"] != 0 for t in trades),

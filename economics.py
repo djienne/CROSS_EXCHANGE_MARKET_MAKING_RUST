@@ -197,7 +197,11 @@ def xemm_journal(path: Path, market: str, *, now: datetime | None = None) -> dic
     groups: dict[str, dict[str, Any]] = {}
     malformed = 0
     def group(logical: str) -> dict[str, Any]:
-        return groups.setdefault(logical, {"fills": {}, "attempts": {}, "attempt_times": {}, "unidentified": {}, "legacy": False, "timestamp": None, "raw": None})
+        return groups.setdefault(logical, {"fills": {}, "attempts": {}, "attempt_times": {}, "unidentified": {}, "legacy": False, "timestamp": None, "raw": None,
+            "maker_mono_ns": None, "hedge_seen_ns": None})
+    def earliest(g: dict[str, Any], key: str, ns: Any) -> None:
+        if isinstance(ns, int) and ns > 0 and (g[key] is None or ns < g[key]):
+            g[key] = ns
     if not path.exists():
         return {"trades": [], "malformed_rows": 0}
     with path.open(encoding="utf-8") as stream:
@@ -236,9 +240,13 @@ def xemm_journal(path: Path, market: str, *, now: datetime | None = None) -> dic
                     if old is None or qty >= optional_decimal(old["detail"]["cumulative_qty"]):
                         if old is None or qty > optional_decimal(old["detail"]["cumulative_qty"]):
                             g["attempt_times"][attempt]=at
+                            if qty > 0 and d.get("purpose") == "hedge":
+                                earliest(g, "hedge_seen_ns", d.get("observed_ns"))
                         g["attempts"][attempt] = row
                     continue
                 if kind == "maker_fill":
+                    if not d.get("reduce_only"):
+                        earliest(g, "maker_mono_ns", row.get("mono_ns"))
                     identity = f"aster:{d.get('order_id')}:{d.get('trade_id')}"
                     f = _fill(d,row,identity,venue="aster",side=str(d.get("maker_side","")),qty=d.get("qty"),
                         quote=d.get("notional_usd"),price=d.get("px"),fee=fill_fee(d,trusted=trusted),
@@ -308,6 +316,10 @@ def xemm_journal(path: Path, market: str, *, now: datetime | None = None) -> dic
                 result["economic_status"]="incomplete"
                 result["net_pnl_usdc"]=None
         first_maker = next((f for f in fills if f.venue == "aster"), None)
+        # This host's monotonic clock, from the first maker fill to the first hedge fill seen:
+        # retries and sub-minimum fills that accumulate before a hedge count.
+        born, seen = g["maker_mono_ns"], g["hedge_seen_ns"]
+        result["hedge_first_fill_observed_ms"] = (seen - born) / 1_000_000 if born and seen and seen >= born else None
         result.update(key=f"xemm:{logical}", cloid=logical, logical_id=logical, market=market,
             timestamp=max((f.timestamp for f in fills if f.timestamp is not None), default=None), raw=g["raw"], source_line=g.get("source_line"),
             hedge_side=("sell" if first_maker.side == "buy" else "buy") if first_maker else None,

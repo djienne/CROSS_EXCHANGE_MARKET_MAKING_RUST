@@ -494,7 +494,8 @@ fn compute_desired_quote_select_books<'a>(
     Ok((desired, l2, HlQuoteSource::L2, aster_source))
 }
 
-/// IOC limit beyond the observed hedge touch by `slip_bps`, rather than beyond the mid.
+/// IOC limit beyond the observed hedge touch by `slip_bps`, rather than beyond the mid: on a
+/// slow book the mid goes stale (an ETH hedge at mid ± 10 bps once failed to cross).
 /// This crosses the sampled spread but does not guarantee a fill. Returns `None` for an
 /// empty required side; callers must not invent a fallback price.
 fn crossing_hedge_px(book: &OrderBook, hedge_side: Side, slip_bps: Decimal) -> Option<Decimal> {

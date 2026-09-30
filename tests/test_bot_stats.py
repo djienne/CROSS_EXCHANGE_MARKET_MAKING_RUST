@@ -106,14 +106,16 @@ class BotStatsTests(unittest.TestCase):
         t = 1_790_000_000_000
         rec = lambda ms, kind, **detail: {"schema_version": 2, "economic_status": "confirmed",
             "ts_ms": t + ms, "kind": kind, "market": "HYPE", "detail": detail}
-        maker = rec(100, "maker_fill", logical_id="l1", maker_side="Buy", qty="1", px="100", fee_usd="0",
-                    order_id="o1", trade_id="t1", client_id="b1")
-        hedge = lambda ms, seen: rec(ms, "execution_progress", logical_id="l1", attempt_id="h1", venue="lighter",
-            side="Sell", purpose="hedge", cumulative_qty="1", cumulative_quote_usd="101", cumulative_fee_usd="0",
+        maker = {**rec(100, "maker_fill", logical_id="l1", maker_side="Buy", qty="1", px="100", fee_usd="0",
+                    order_id="o1", trade_id="t1", client_id="b1"), "mono_ns": 50_000_000}
+        hedge = lambda ms, seen, attempt="h1", qty="1": rec(ms, "execution_progress", logical_id="l1", attempt_id=attempt, venue="lighter",
+            side="Sell", purpose="hedge", cumulative_qty=qty, cumulative_quote_usd=str(101 * int(qty)), cumulative_fee_usd="0",
             fee_complete=True, terminal=True, created_ns=100_000_000, observed_ns=seen)
         with tempfile.TemporaryDirectory() as tmp:
             runs = Path(tmp)
-            write_jsonl(runs / "bot-HYPE-journal.jsonl", [maker, maker, hedge(650, 650_000_000), hedge(900, 900_000_000),
+            # A first attempt that filled nothing: the retry's delay counts from the maker fill.
+            write_jsonl(runs / "bot-HYPE-journal.jsonl", [maker, maker, hedge(300, 300_000_000, "h0", "0"),
+                hedge(650, 650_000_000), hedge(900, 900_000_000),
                 rec(1200, "maker_fill", logical_id="l2", maker_side="Sell", qty="1", px="101", fee_usd="0",
                     order_id="o2", trade_id="t2", client_id="s1"),
                 # The same private stream also reports a recovery MARKET, which is not a maker.
@@ -127,7 +129,7 @@ class BotStatsTests(unittest.TestCase):
         x = result["xemm"]
         self.assertEqual((x["maker_fills"], x["maker_sides"], x["maker_fills_per_hour"]), (2, {"buy": 1, "sell": 1}, 2))
         self.assertEqual(x["maker_fees_bps"], {"n": 2, "mean": 0, "p50": 0, "p90": 0})
-        self.assertEqual(x["hedge_first_fill_observed_ms"], {"n": 1, "mean": 550, "p50": 550, "p90": 550})
+        self.assertEqual(x["hedge_first_fill_observed_ms"], {"n": 1, "mean": 600, "p50": 600, "p90": 600})
 
 
 if __name__ == "__main__":
