@@ -3349,21 +3349,20 @@ async fn recover_if_needed(
             anyhow::ensure!(attempt < 3, "recovery residual remains after three close attempts");
             let l_bound = emergency_close_bound(l_mark, if position.net_qty() > Decimal::ZERO { Side::Sell } else { Side::Buy }, cfg.arb.emergency_slippage_bps);
             let (side, a_qty, l_qty) = residual_close_qtys(position, spec, l_bound);
-            let (a_side, l_side) = (side, side);
             in_flight = true;
             let (a_result, l_result) = tokio::join!(
                 async { if a_qty > Decimal::ZERO {
-                    Some(submit_first_ioc(aster, &spec.market_id, a_side, a_qty,
-                        emergency_close_bound(mark, a_side, cfg.arb.emergency_slippage_bps), true).await)
+                    Some(submit_first_ioc(aster, &spec.market_id, side, a_qty,
+                        emergency_close_bound(mark, side, cfg.arb.emergency_slippage_bps), true).await)
                 } else { None } },
                 async { if l_qty > Decimal::ZERO {
-                    Some(lighter.submit_market_order_deferred_fill(&spec.market_id, l_side, l_qty,
+                    Some(lighter.submit_market_order_deferred_fill(&spec.market_id, side, l_qty,
                         l_bound, true).await)
                 } else { None } },
             );
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now()).min(Duration::from_secs(5));
-            if let Some((outcome, _)) = &a_result { orders.push(first_order_identity(aster, outcome, a_side, a_qty)); }
-            if let Some((outcome, _)) = &l_result { orders.push(other_order_identity(lighter, outcome, l_side, l_qty)); }
+            if let Some((outcome, _)) = &a_result { orders.push(first_order_identity(aster, outcome, side, a_qty)); }
+            if let Some((outcome, _)) = &l_result { orders.push(other_order_identity(lighter, outcome, side, l_qty)); }
             in_flight = false;
             session.record_unresolved(serde_json::json!({"schema_version":2,"economic_status":"incomplete",
                 "execution_id":execution_id,"session_id":session.id(),"market":spec.market_id.to_string(),
@@ -3372,11 +3371,11 @@ async fn recover_if_needed(
             action_taken |= a_result.is_some() || l_result.is_some();
             let (a_evidence, l_evidence) = tokio::join!(
                 async { match a_result {
-                    Some((outcome, pending)) => resolve_first_evidence(spec, aster, &outcome, pending, a_side, a_qty, remaining, true).await,
+                    Some((outcome, pending)) => resolve_first_evidence(spec, aster, &outcome, pending, side, a_qty, remaining, true).await,
                     None => LegEvidence::not_submitted(),
                 } },
                 async { match l_result {
-                    Some((outcome, pending)) => resolve_lighter_evidence(spec, lighter, &outcome, pending, l_side, l_qty, remaining).await,
+                    Some((outcome, pending)) => resolve_lighter_evidence(spec, lighter, &outcome, pending, side, l_qty, remaining).await,
                     None => LegEvidence::not_submitted(),
                 } },
             );
@@ -4463,24 +4462,17 @@ mod tests {
 
     #[test]
     fn hyperliquid_recovery_rounds_up_and_corrects_the_excess_on_the_first_leg() {
-        let mut spec = test_spec();
-        spec.hedge = HedgeVenue::Hyperliquid;
-        spec.step = dec!(0.01);
-        spec.lighter_qty_step = dec!(0.01);
-        spec.lighter_min_notional = dec!(10);
-        for first in [FirstVenue::Aster, FirstVenue::Lighter] {
-            spec.first = first;
-            let plan = |aster_qty, lighter_qty| residual_close_qtys(
-                PositionSnapshot { aster_qty, lighter_qty }, &spec, dec!(100));
-            assert_eq!(plan(dec!(-0.95), dec!(1)), (Side::Sell, dec!(0), dec!(0.11)));
-            assert_eq!(plan(dec!(-0.95), dec!(0.89)), (Side::Buy, dec!(0.06), dec!(0)));
-            assert_eq!(plan(dec!(0.95), dec!(-1)), (Side::Buy, dec!(0), dec!(0.11)));
-            assert_eq!(plan(dec!(0.95), dec!(-0.89)), (Side::Sell, dec!(0.06), dec!(0)));
-            assert_eq!(plan(dec!(0), dec!(0.03)), (Side::Sell, dec!(0), dec!(0.03)));
-            assert_eq!(plan(dec!(0), dec!(-0.03)), (Side::Buy, dec!(0), dec!(0.03)));
-            assert_eq!(plan(dec!(-0.995), dec!(1)), (Side::Sell, dec!(0), dec!(0)));
-            assert_eq!(plan(dec!(-1), dec!(1)), (Side::Buy, dec!(0), dec!(0)));
-        }
+        // Steps 0.01, minimum $10; the plan never reads which venue is the first leg.
+        let spec = MarketSpec { hedge: HedgeVenue::Hyperliquid, ..test_spec() };
+        let plan = |aster_qty, lighter_qty| residual_close_qtys(PositionSnapshot { aster_qty, lighter_qty }, &spec, dec!(100));
+        assert_eq!(plan(dec!(-0.95), dec!(1)), (Side::Sell, dec!(0), dec!(0.11)));
+        assert_eq!(plan(dec!(-0.95), dec!(0.89)), (Side::Buy, dec!(0.06), dec!(0)));
+        assert_eq!(plan(dec!(0.95), dec!(-1)), (Side::Buy, dec!(0), dec!(0.11)));
+        assert_eq!(plan(dec!(0.95), dec!(-0.89)), (Side::Sell, dec!(0.06), dec!(0)));
+        assert_eq!(plan(dec!(0), dec!(0.03)), (Side::Sell, dec!(0), dec!(0.03)));
+        assert_eq!(plan(dec!(0), dec!(-0.03)), (Side::Buy, dec!(0), dec!(0.03)));
+        assert_eq!(plan(dec!(-0.995), dec!(1)), (Side::Sell, dec!(0), dec!(0)));
+        assert_eq!(plan(dec!(-1), dec!(1)), (Side::Buy, dec!(0), dec!(0)));
     }
 
     #[test]

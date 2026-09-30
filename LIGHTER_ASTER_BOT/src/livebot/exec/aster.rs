@@ -121,7 +121,9 @@ pub struct AsterRest {
     nonce: AsterNonce,
     markets: HashMap<MarketId, MarketWire>,
     deadman_countdown_ms: i64,
-    /// The worker sends one dead-man refresh at a time, each on its own task.
+    /// The worker sends one dead-man refresh at a time, each on its own task. Ponytail: one flag
+    /// for all markets, fine while XEMM is single-market (livebot::run refuses more); key it by
+    /// market before lifting that, or a second market's refresh is always dropped.
     deadman_in_flight: AtomicBool,
     rate_limit_backoff_ms: i64,
     max_rest_requests_per_minute: u32,
@@ -777,13 +779,13 @@ pub async fn run_aster_worker(
                         reject_unsent_maker(&tx, &permit, ExecEvent::AmendReject { client_id, reason: "worker shutdown before send".into() }).await;
                     }
                     ExecCommand::Shutdown => {}
-                    other => process_cmd(other, true, &tx, &rest, &mut limiter, &mut backoff_until).await,
+                    other => process_cmd(other, &tx, &rest, &mut limiter, &mut backoff_until).await,
                 }
             }
             break;
         }
         if backoff_until.is_some_and(|until| tokio::time::Instant::now() < until) {
-            process_cmd(cmd, from_prio, &tx, &rest, &mut limiter, &mut backoff_until).await;
+            process_cmd(cmd, &tx, &rest, &mut limiter, &mut backoff_until).await;
             continue;
         }
         if !from_prio {
@@ -794,7 +796,7 @@ pub async fn run_aster_worker(
                     priority = prio_rx.recv(), if prio_open => {
                         match priority {
                             Some(priority) => {
-                                process_cmd(priority, true, &tx, &rest, &mut limiter, &mut backoff_until).await;
+                                process_cmd(priority, &tx, &rest, &mut limiter, &mut backoff_until).await;
                             }
                             None => prio_open = false,
                         }
@@ -804,7 +806,7 @@ pub async fn run_aster_worker(
                 continue;
             }
         }
-        process_cmd(cmd, from_prio, &tx, &rest, &mut limiter, &mut backoff_until).await;
+        process_cmd(cmd, &tx, &rest, &mut limiter, &mut backoff_until).await;
     }
     info!("aster live exec worker stopped");
 }
@@ -814,7 +816,6 @@ pub async fn run_aster_worker(
 /// lane and the shutdown drain share the exact same semantics.
 async fn process_cmd(
     cmd: ExecCommand,
-    _from_prio: bool,
     tx: &Sender<ExecEvent>,
     rest: &Arc<AsterRest>,
     limiter: &mut RestCommandLimiter,
@@ -1120,7 +1121,7 @@ mod tests {
         let amend = ExecCommand::Amend {
             permit, market: "BTC".into(), side: Side::Buy, client_id: "A".into(), price_ticks: 1000, qty_lots: 10,
         };
-        process_cmd(amend, false, &tx, &Arc::new(rest_at(&url)), &mut RestCommandLimiter::new(100), &mut None).await;
+        process_cmd(amend, &tx, &Arc::new(rest_at(&url)), &mut RestCommandLimiter::new(100), &mut None).await;
         assert!(server.await.unwrap().starts_with("DELETE "), "a lapsed permit must not move the order");
         assert!(matches!(rx.try_recv(), Ok(ExecEvent::CancelAck { client_id }) if client_id == "A"));
     }
@@ -1305,7 +1306,7 @@ mod tests {
             market: "BTC".into(), side: Side::Buy, price_ticks: 1000,
             qty_lots: 10, client_id: "claimed".into(), permit: permit.clone(),
         };
-        process_cmd(cmd.clone(), false, &tx, &Arc::new(rest_at("http://127.0.0.1:9")),
+        process_cmd(cmd.clone(), &tx, &Arc::new(rest_at("http://127.0.0.1:9")),
             &mut limiter, &mut backoff).await;
         send_backoff_reject(&tx, cmd, "backoff".into(), 1).await;
         assert!(matches!(rx.try_recv(), Ok(ExecEvent::AsterRateLimited { .. })));

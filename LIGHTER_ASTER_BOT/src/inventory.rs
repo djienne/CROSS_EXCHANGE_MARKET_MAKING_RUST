@@ -66,6 +66,9 @@ pub fn hl_min_hedge_qty(rules: &HedgeabilityRules, ref_px: Decimal) -> Decimal {
 
 /// Hyperliquid accepts a sub-minimum reduce-only order only for a full close (live 2026-09-28).
 /// Size against 98% of the limit price for headroom; callers confirm positions before correcting excess.
+/// Ponytail: the excess is corrected on the first leg, so it must be a multiple of that leg's step.
+/// True for HYPE (both 0.01); a coarser first leg (Aster BTC, 0.001 ≈ $100) would leave it
+/// uncorrectable: round the excess up to that step before adding such a market.
 pub fn reduce_only_hedge_qty(venue: HedgeVenue, qty: Decimal, position: Decimal, rules: &HedgeabilityRules, limit_px: Decimal) -> Decimal {
     if venue == HedgeVenue::Hyperliquid && qty > Decimal::ZERO {
         qty.max(hl_min_hedge_qty(rules, limit_px * Decimal::new(98, 2))).min(position.abs())

@@ -446,6 +446,20 @@ pub struct VenueState {
 }
 
 impl VenueState {
+    /// The checks a place and an amend share: `spec`'s market known and warm, and within its
+    /// filters. Returns its book, filters and mark.
+    fn admit(&self, spec: &OrderSpec) -> Result<(&Replica, &Filters, Option<Decimal>), Reject> {
+        let (Some(book), Some(filters)) = (self.books.get(&spec.market), self.filters.get(&spec.market)) else {
+            return Err(Reject::UnknownMarket);
+        };
+        if !book.warm() {
+            return Err(Reject::Unavailable);
+        }
+        let mark = self.marks.get(&spec.market).copied();
+        check_filters(filters, spec, mark)?;
+        Ok((book, filters, mark))
+    }
+
     fn new(balance: Decimal) -> Self {
         Self {
             account: Account::new(balance),
@@ -1017,14 +1031,7 @@ impl Exchange {
             return Err(Reject::TickSize);
         }
         let st = &self.venues[v];
-        let (Some(book), Some(filters)) = (st.books.get(&spec.market), st.filters.get(&spec.market)) else {
-            return Err(Reject::UnknownMarket);
-        };
-        if !book.warm() {
-            return Err(Reject::Unavailable);
-        }
-        let mark = st.marks.get(&spec.market).copied();
-        check_filters(filters, spec, mark)?;
+        let (_, filters, mark) = st.admit(spec)?;
         let mut qty = spec.qty;
         if spec.reduce_only {
             let room = reducible(st.account.position(&spec.market).qty, spec.side);
@@ -1118,12 +1125,6 @@ impl Exchange {
     /// An amend's checks, against the book and the account without the order it amends.
     fn amend_allowed(&self, venue: Venue, order: &Order, qty: Decimal, price: Decimal) -> Result<(), Reject> {
         let st = &self.venues[self.ix(venue)];
-        let (Some(book), Some(filters)) = (st.books.get(&order.market), st.filters.get(&order.market)) else {
-            return Err(Reject::UnknownMarket);
-        };
-        if !book.warm() {
-            return Err(Reject::Unavailable);
-        }
         let spec = OrderSpec {
             market: order.market.clone(),
             client_id: order.client_id.clone(),
@@ -1133,7 +1134,7 @@ impl Exchange {
             tif: order.tif,
             reduce_only: order.reduce_only,
         };
-        check_filters(filters, &spec, st.marks.get(&order.market).copied())?;
+        let (book, _, _) = st.admit(&spec)?;
         if book.crosses(order.side, price) {
             return Err(Reject::WouldCross);
         }

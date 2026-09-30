@@ -419,15 +419,14 @@ impl Groups {
     fn feed(&mut self, line: &str) {
         let index = self.lines;
         self.lines += 1;
-        let malformed = &mut self.malformed;
         if line.trim().is_empty() { return; }
-        let row: Value = match serde_json::from_str(line) { Ok(row) => row, Err(_) => { *malformed += 1; return; } };
+        let row: Value = match serde_json::from_str(line) { Ok(row) => row, Err(_) => { self.malformed += 1; return; } };
         let Some(market) = row.get("market").and_then(Value::as_str) else { return; };
         if self.market.as_deref().is_some_and(|wanted| wanted != market) { return; }
         let kind = row.get("kind").and_then(Value::as_str).unwrap_or_default();
         if !matches!(kind, "maker_fill" | "execution_trade" | "execution_progress" | "maker_order_progress" | "fill" | "hedge_fill") { return; }
-        let Some(detail) = row.get("detail").filter(|detail| detail.is_object()) else { *malformed += 1; return; };
-        let Some(logical) = identifier(detail, "logical_id").or_else(|| identifier(detail, "cloid")) else { *malformed += 1; return; };
+        let Some(detail) = row.get("detail").filter(|detail| detail.is_object()) else { self.malformed += 1; return; };
+        let Some(logical) = identifier(detail, "logical_id").or_else(|| identifier(detail, "cloid")) else { self.malformed += 1; return; };
         let group = self.groups.entry((market.to_string(), logical.clone())).or_default();
         group.legacy |= row.get("schema_version").and_then(Value::as_u64).unwrap_or(1) < 2;
         if let Some(mono) = row.get("mono_ns").and_then(Value::as_i64).filter(|value| *value > 0) {
@@ -439,7 +438,7 @@ impl Groups {
             let attempt = identifier(detail, "attempt_id").or_else(|| identifier(detail, "client_id"));
             let qty = amount(detail.get("cumulative_qty")).filter(|qty| *qty >= Decimal::ZERO);
             let venue = detail.get("venue").and_then(Value::as_str).unwrap_or("aster");
-            let (Some(attempt), Some(qty), Some(venue)) = (attempt, qty, Venue::parse(venue)) else { *malformed += 1; return; };
+            let (Some(attempt), Some(qty), Some(venue)) = (attempt, qty, Venue::parse(venue)) else { self.malformed += 1; return; };
             if group.progress.get(&attempt).is_none_or(|old| qty >= old.qty) {
                 let (economic_time, economic_ordinal) = group.progress.get(&attempt)
                     .filter(|old| old.qty == qty)
@@ -469,7 +468,7 @@ impl Groups {
                     if let Some(old) = group.fills.get(&identity) { fill.ordinal = old.ordinal; }
                     group.fills.insert(identity, fill);
                 }
-                Err(_) => *malformed += 1,
+                Err(_) => self.malformed += 1,
             }
         }
     }
