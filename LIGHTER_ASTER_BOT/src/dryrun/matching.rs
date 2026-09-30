@@ -1879,29 +1879,36 @@ mod tests {
 
     #[test]
     fn hyperliquid_takes_a_reduce_only_order_under_its_minimum_only_as_a_full_close() {
-        let mut p = params(500);
-        p.venues = [Venue::Aster, Venue::Hyperliquid];
-        let mut sim = Sim::with(p);
-        let both = [Venue::Aster, Venue::Hyperliquid];
-        for venue in both {
-            sim.send(venue, limit(Side::Buy, dec!(0.1), dec!(102), Tif::Ioc));
+        for first in [Venue::Aster, Venue::Lighter] {
+            let mut p = params(500);
+            p.venues = [first, Venue::Hyperliquid];
+            let mut sim = Sim::with(p);
+            let both = [first, Venue::Hyperliquid];
+            sim.ex.venues[1].filters.get_mut(HYPE).unwrap().min_notional = dec!(10);
+            if first == Venue::Lighter {
+                let filters = sim.ex.venues[0].filters.get_mut(HYPE).unwrap();
+                filters.min_qty = dec!(0.07);
+                filters.min_notional = dec!(10);
+            }
+            for venue in both {
+                sim.send(venue, limit(Side::Buy, dec!(0.2), dec!(102), Tif::Ioc));
+            }
+            sim.at(200);
+            for venue in both {
+                sim.send(venue, limit(Side::Sell, dec!(0.16), dec!(98), Tif::Ioc));
+            }
+            sim.at(400);
+            // Aster/Lighter accept a partial below the notional floor; Lighter also below
+            // its 0.07 size floor. Hyperliquid accepts only the full close below its $10 floor.
+            let partial = both.map(|venue| sim.send(venue, reduce_only(Side::Sell, dec!(0.01), dec!(98), Tif::Ioc)));
+            sim.at(600);
+            assert!(matches!(sim.reply(partial[0]), Some(Reply::Order(_))), "{:?}", sim.reply(partial[0]));
+            assert_eq!(sim.reply(partial[1]), Some(&Reply::Reject(Reject::MinNotional)));
+            let close = sim.send(Venue::Hyperliquid, reduce_only(Side::Sell, dec!(0.04), dec!(98), Tif::Ioc));
+            sim.at(800);
+            assert!(matches!(sim.reply(close), Some(Reply::Order(_))), "{:?}", sim.reply(close));
+            assert_eq!([0, 1].map(|v| sim.ex.venues[v].account.position(HYPE).qty), [dec!(0.03), dec!(0)]);
         }
-        sim.at(200);
-        for venue in both {
-            sim.send(venue, limit(Side::Sell, dec!(0.06), dec!(98), Tif::Ioc));
-        }
-        sim.at(400);
-        // Under the $5 minimum, a size minimum (Lighter's HYPE 0.07) and Hyperliquid's 0.04
-        // position: Aster takes it, Hyperliquid not.
-        sim.ex.venues[0].filters.get_mut(HYPE).unwrap().min_qty = dec!(0.07);
-        let partial = both.map(|venue| sim.send(venue, reduce_only(Side::Sell, dec!(0.01), dec!(98), Tif::Ioc)));
-        sim.at(600);
-        assert!(matches!(sim.reply(partial[0]), Some(Reply::Order(_))), "{:?}", sim.reply(partial[0]));
-        assert_eq!(sim.reply(partial[1]), Some(&Reply::Reject(Reject::MinNotional)));
-        let close = sim.send(Venue::Hyperliquid, reduce_only(Side::Sell, dec!(0.04), dec!(98), Tif::Ioc));
-        sim.at(800);
-        assert!(matches!(sim.reply(close), Some(Reply::Order(_))), "{:?}", sim.reply(close));
-        assert_eq!([0, 1].map(|v| sim.ex.venues[v].account.position(HYPE).qty), [dec!(0.03), dec!(0)]);
     }
 
     #[test]

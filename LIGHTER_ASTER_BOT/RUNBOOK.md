@@ -435,7 +435,9 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
   - A reduce-only order under the venue minimum: Aster fills one ($0.88 under its $5), and so
     does Lighter (0.01 HYPE under 0.07 and $10), partial or closing. Hyperliquid refuses a
     partial one ("Order must have minimum value of $10") and fills one that closes the whole
-    position, so XEMM's correction there rounds up to the minimum or to the whole position.
+    position, so XEMM's correction and the taker's recovery share the rule that rounds up to
+    the minimum or to the whole position. Any excess is corrected on the other leg after
+    confirming the positions.
 - Hyperliquid reads `HYPERLIQUID_ENV_PATH` (default `hyperliquid.env`, keys as in
   `hyperliquid.env.example`: `wallet_address` = the traded subaccount, `private_key` = its agent
   key, `is_vault`). `docker compose --profile live run --rm bot probe hl-balance --market HYPE`

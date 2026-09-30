@@ -21,7 +21,7 @@ use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
 use crate::book::OrderBook;
-use crate::config::{Config, HedgeVenue};
+use crate::config::Config;
 use crate::edge::EdgeConfig;
 use crate::hot_types::HotBook;
 use crate::hotpath::{VenueRegistry, VenueTag};
@@ -2945,20 +2945,14 @@ impl Strategy {
         let a_qty = if same_sign(aster) { crate::decimal::floor_to_step(net.abs().min(aster.abs()), aster_step) } else { Decimal::ZERO };
         let h_qty = if same_sign(lighter) { crate::decimal::floor_to_step(net.abs().min(lighter.abs()), lighter_step) } else { Decimal::ZERO };
         let slip = self.cfg.live.lighter.emergency_slippage_bps;
-        // Measured live 2026-09-28: Aster and Lighter take a reduce-only order of any size;
-        // Hyperliquid refuses one under its $10 minimum unless it closes the whole position. So
-        // there it rounds up to the minimum (at 98 % of the limit price, in case the venue values
-        // it lower) or to the whole position; any excess leaves an Aster residual for the next
-        // correction.
-        let hedge_min = (ctx.spec.hedge == HedgeVenue::Hyperliquid)
-            .then(|| HedgeabilityRules { hedge_min_notional: ctx.spec.hl_min_notional, hedge_qty_step: lighter_step });
+        let hedge_rules = HedgeabilityRules { hedge_min_notional: ctx.spec.hl_min_notional, hedge_qty_step: lighter_step };
         let selected = if a_qty > Decimal::ZERO {
             self.fresh_aster_touch_book(market, now_ns).and_then(|b| b.book.mid().map(|p| (Venue::Aster, a_qty, p, b.source.as_str(), b.age_ms)))
         } else { None }.or_else(|| {
             if h_qty <= Decimal::ZERO { return None; }
             self.fresh_hl_hedge_book_hot_first(market, now_ns, side, h_qty)
                 .and_then(|b| crossing_hedge_px(&b.book, side, slip).map(|p| {
-                    let qty = hedge_min.as_ref().map_or(h_qty, |rules| h_qty.max(inventory::hl_min_hedge_qty(rules, p * Decimal::new(98, 2))).min(lighter.abs()));
+                    let qty = inventory::reduce_only_hedge_qty(ctx.spec.hedge, h_qty, lighter, &hedge_rules, p);
                     (Venue::Hedge, qty, p, b.path.as_str(b.source), b.age_ms)
                 }))
         });
@@ -3183,6 +3177,7 @@ pub async fn run_strategy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HedgeVenue;
     use crate::quote_engine::tests::{edge, ts};
     use rust_decimal_macros::dec;
 

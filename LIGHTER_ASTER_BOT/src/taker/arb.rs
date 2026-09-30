@@ -3347,7 +3347,8 @@ async fn recover_if_needed(
                     aster_open_orders: 0, lighter_open_orders: 0 });
             }
             anyhow::ensure!(attempt < 3, "recovery residual remains after three close attempts");
-            let (side, a_qty, l_qty) = residual_close_qtys(position, spec.step, spec.lighter_qty_step);
+            let l_bound = emergency_close_bound(l_mark, if position.net_qty() > Decimal::ZERO { Side::Sell } else { Side::Buy }, cfg.arb.emergency_slippage_bps);
+            let (side, a_qty, l_qty) = residual_close_qtys(position, spec, l_bound);
             let (a_side, l_side) = (side, side);
             in_flight = true;
             let (a_result, l_result) = tokio::join!(
@@ -3357,7 +3358,7 @@ async fn recover_if_needed(
                 } else { None } },
                 async { if l_qty > Decimal::ZERO {
                     Some(lighter.submit_market_order_deferred_fill(&spec.market_id, l_side, l_qty,
-                        emergency_close_bound(l_mark, l_side, cfg.arb.emergency_slippage_bps), true).await)
+                        l_bound, true).await)
                 } else { None } },
             );
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now()).min(Duration::from_secs(5));
@@ -3441,21 +3442,21 @@ fn estimated_recovery_loss(before: MarginSnapshot, after: MarginSnapshot) -> Dec
     delta.max(Decimal::ZERO)
 }
 
-/// Reduce-only quantities that close a net cross-venue residual without touching the hedged
-/// inventory. Only a venue holding the residual's sign can reduce it: Aster first (as in the
-/// XEMM correction), Lighter takes any remainder; each is floored to its step, so a sub-step
-/// remainder stays as dust inside the mismatch tolerance. Temporary twin of XEMM's
-/// `dispatch_correction` sizing until the venue layers merge.
-fn residual_close_qtys(position: PositionSnapshot, aster_step: Decimal, lighter_step: Decimal) -> (Side, Decimal, Decimal) {
+/// Reduce the net residual on a leg holding its sign, first leg before hedge. Sub-step dust
+/// stays inside the mismatch tolerance. A Hyperliquid minimum can overshoot the residual;
+/// the next position-confirmed attempt reduces that excess on the first leg, as in XEMM.
+fn residual_close_qtys(position: PositionSnapshot, spec: &MarketSpec, hedge_px: Decimal) -> (Side, Decimal, Decimal) {
     let net = position.net_qty();
     let side = if net > Decimal::ZERO { Side::Sell } else { Side::Buy };
     let same_sign = |qty: Decimal| qty != Decimal::ZERO && (qty > Decimal::ZERO) == (net > Decimal::ZERO);
     let a_qty = if same_sign(position.aster_qty) {
-        floor_to_step(net.abs().min(position.aster_qty.abs()), aster_step)
+        floor_to_step(net.abs().min(position.aster_qty.abs()), spec.step)
     } else { Decimal::ZERO };
     let l_qty = if same_sign(position.lighter_qty) {
-        floor_to_step((net.abs() - a_qty).min(position.lighter_qty.abs()), lighter_step)
+        floor_to_step((net.abs() - a_qty).min(position.lighter_qty.abs()), spec.lighter_qty_step)
     } else { Decimal::ZERO };
+    let rules = crate::inventory::HedgeabilityRules { hedge_min_notional: spec.lighter_min_notional, hedge_qty_step: spec.lighter_qty_step };
+    let l_qty = crate::inventory::reduce_only_hedge_qty(spec.hedge, l_qty, position.lighter_qty, &rules, hedge_px);
     (side, a_qty, l_qty)
 }
 
@@ -4444,8 +4445,9 @@ mod tests {
 
     #[test]
     fn recovery_closes_only_the_residual_and_keeps_hedged_inventory() {
+        let spec = test_spec();
         let pos = |aster_qty, lighter_qty| PositionSnapshot { aster_qty, lighter_qty };
-        let plan = |aster, lighter| residual_close_qtys(pos(aster, lighter), dec!(0.01), dec!(0.01));
+        let plan = |aster, lighter| residual_close_qtys(pos(aster, lighter), &spec, dec!(100));
         // Hedged 4 HYPE plus a naked 0.5 Aster short: buy back 0.5 on Aster only.
         assert_eq!(plan(dec!(-4.5), dec!(4)), (Side::Buy, dec!(0.5), dec!(0)));
         // The naked leg is on Lighter: sell 0.5 there; Aster's opposite-sign short is untouched.
@@ -4455,6 +4457,30 @@ mod tests {
         // Sub-step remainders stay as dust instead of rounding up past the residual.
         assert_eq!(plan(dec!(-4.505), dec!(4)), (Side::Buy, dec!(0.5), dec!(0)));
         assert_eq!(plan(dec!(1), dec!(-1)), (Side::Buy, dec!(0), dec!(0)));
+        assert_eq!(plan(dec!(-0.95), dec!(1)), (Side::Sell, dec!(0), dec!(0.05)));
+        assert_eq!(plan(dec!(0.95), dec!(-1)), (Side::Buy, dec!(0), dec!(0.05)));
+    }
+
+    #[test]
+    fn hyperliquid_recovery_rounds_up_and_corrects_the_excess_on_the_first_leg() {
+        let mut spec = test_spec();
+        spec.hedge = HedgeVenue::Hyperliquid;
+        spec.step = dec!(0.01);
+        spec.lighter_qty_step = dec!(0.01);
+        spec.lighter_min_notional = dec!(10);
+        for first in [FirstVenue::Aster, FirstVenue::Lighter] {
+            spec.first = first;
+            let plan = |aster_qty, lighter_qty| residual_close_qtys(
+                PositionSnapshot { aster_qty, lighter_qty }, &spec, dec!(100));
+            assert_eq!(plan(dec!(-0.95), dec!(1)), (Side::Sell, dec!(0), dec!(0.11)));
+            assert_eq!(plan(dec!(-0.95), dec!(0.89)), (Side::Buy, dec!(0.06), dec!(0)));
+            assert_eq!(plan(dec!(0.95), dec!(-1)), (Side::Buy, dec!(0), dec!(0.11)));
+            assert_eq!(plan(dec!(0.95), dec!(-0.89)), (Side::Sell, dec!(0.06), dec!(0)));
+            assert_eq!(plan(dec!(0), dec!(0.03)), (Side::Sell, dec!(0), dec!(0.03)));
+            assert_eq!(plan(dec!(0), dec!(-0.03)), (Side::Buy, dec!(0), dec!(0.03)));
+            assert_eq!(plan(dec!(-0.995), dec!(1)), (Side::Sell, dec!(0), dec!(0)));
+            assert_eq!(plan(dec!(-1), dec!(1)), (Side::Buy, dec!(0), dec!(0)));
+        }
     }
 
     #[test]

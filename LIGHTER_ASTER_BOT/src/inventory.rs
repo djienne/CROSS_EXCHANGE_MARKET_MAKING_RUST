@@ -8,6 +8,7 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
+use crate::config::HedgeVenue;
 use crate::decimal::ceil_to_step;
 use crate::types::Side;
 
@@ -61,6 +62,14 @@ pub fn hl_min_hedge_qty(rules: &HedgeabilityRules, ref_px: Decimal) -> Decimal {
     }
     let by_notional = ceil_to_step(rules.hedge_min_notional / ref_px, rules.hedge_qty_step);
     by_notional.max(rules.hedge_qty_step)
+}
+
+/// Hyperliquid accepts a sub-minimum reduce-only order only for a full close (live 2026-09-28).
+/// Buffer the limit price by 2%; any excess reduction is corrected on the other leg next.
+pub fn reduce_only_hedge_qty(venue: HedgeVenue, qty: Decimal, position: Decimal, rules: &HedgeabilityRules, limit_px: Decimal) -> Decimal {
+    if venue == HedgeVenue::Hyperliquid && qty > Decimal::ZERO {
+        qty.max(hl_min_hedge_qty(rules, limit_px * Decimal::new(98, 2))).min(position.abs())
+    } else { qty }
 }
 
 #[inline]
