@@ -97,6 +97,12 @@ on contention. Live, they also lock each leg, `runs/bot-<VENUE>-<SYMBOL>.lock`
 (`bot-LIGHTER-HYPE.lock`), so markets sharing a leg (HYPE and HYPE-LH) never both trade it. A
 dry run locks `runs/dry-run/bot-<MARKET>.lock`, so it can run beside live.
 
+After a known fill, `POSITION_SNAPSHOT_PENDING` holds new quotes until account reads begin
+after that execution; an older read cannot establish a position mismatch or request a sweep.
+Hedging, cancels and the exposure limits still apply. A missing-amend reply after a full
+private fill does not reopen uncertainty; partial fills or a larger amended size still need
+terminal order evidence.
+
 ### Close a position
 
 Stop the bot, then close the coin at market on every venue:

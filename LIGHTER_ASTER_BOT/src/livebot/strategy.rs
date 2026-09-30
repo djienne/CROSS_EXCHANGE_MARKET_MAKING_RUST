@@ -34,7 +34,7 @@ use crate::quote_engine::{
 use crate::position::SignedPosition;
 use crate::types::{MarketId, RejectReason, Side};
 
-use super::account::{AccountState, Venue};
+use super::account::{AccountSnapshot, AccountState, Venue};
 use super::exec::command::{ExecCommand, ExecEvent, HedgeCommand, MakerPermit};
 use super::fills::{AsterFill, FillDedup, HedgeIntent, HedgeState, IntentPurpose};
 use super::ids::{SessionId, Cloid};
@@ -1749,6 +1749,8 @@ impl Strategy {
         if self.frozen && self.clean_start {
             return Some(MAKER_GATE_FROZEN);
         }
+        let snap = self.account.load();
+        let pending_snapshot = self.markets.iter().any(|m| self.snapshot_predates_position_action(&snap, m));
         let inputs = MakerGateInputs {
             clean_start_done: self.clean_start,
             // Per-market (NOT the global watchdog gate): only THIS market's own Aster+Lighter feed
@@ -1763,13 +1765,15 @@ impl Strategy {
                 .aster_stream
                 .as_ref()
                 .is_none_or(|s| s.age_ms(now_ns) <= self.cfg.live.max_user_stream_staleness_ms),
-            positions_reconciled: self.positions_reconciled(),
+            // A pre-execution read cannot establish a mismatch. Still check all other risk gates.
+            positions_reconciled: pending_snapshot || self.positions_reconciled(),
             no_orphan_hedge: !self.has_orphan_hedge(),
             unhedged_within_limits: self.unhedged_within_limits(now_ns),
         };
         if let Err(reason) = evaluate_maker_gate(&inputs) {
             return Some(reason.as_str());
         }
+        if pending_snapshot { return Some("POSITION_SNAPSHOT_PENDING"); }
         if self.cooldown.active(now_ns, market) {
             return Some("COOLDOWN");
         }
@@ -1821,6 +1825,7 @@ impl Strategy {
                 }
                 let user_stream_stale = r == "ASTER_USER_STREAM_STALE";
                 let should_sweep = r != "COOLDOWN"
+                    && r != "POSITION_SNAPSHOT_PENDING"
                     && r != "SAFETY_SWEEP_PENDING"
                     && r != MAKER_GATE_FROZEN
                     // The gate-closed cancel pulls quotes, and offline the deadman does: a
@@ -1865,6 +1870,14 @@ impl Strategy {
         }
     }
 
+    /// Reads begun before the latest execution cannot yet confirm the predicted positions.
+    fn snapshot_predates_position_action(&self, snap: &AccountSnapshot, market: &MarketId) -> bool {
+        let last_terminal = self.hedges.values().filter(|h| &h.market == market)
+            .filter_map(|h| h.terminal_ns).max().unwrap_or(0);
+        let last_action = self.last_hot_action_ns.get(market).copied().unwrap_or(0).max(last_terminal);
+        last_action > 0 && snap.read_start_ns <= last_action
+    }
+
     /// True when every market's predicted position agrees with the exchange-reported snapshot
     /// within `max_position_mismatch_usd`. A single mismatch ⇒ freeze (returns
     /// false).
@@ -1872,6 +1885,7 @@ impl Strategy {
         let snap = self.account.load();
         let tol = self.cfg.live.max_position_mismatch_usd;
         for m in &self.markets {
+            if self.snapshot_predates_position_action(&snap, m) { return false; }
             let mark = self.mark_cache.get(m).copied().unwrap_or(Decimal::ZERO);
             if mark <= Decimal::ZERO {
                 continue; // no mark ⇒ can't judge; don't spuriously freeze on a missing book
@@ -2363,8 +2377,8 @@ impl Strategy {
         if !self.dedup.observe(&fill) { return; }
         self.revoke_makers();
         if self.uncertain_makers.contains_key(&fill.client_id) {
-            if let (Some(ctx), Some(lots)) = (self.ctx.get(&fill.market), self.orders.expected_lots(&fill.client_id)) {
-                if ctx.scale.qty_to_lots(fill.cum_filled_qty) >= lots { self.uncertain_makers.remove(&fill.client_id); }
+            if let (Some(ctx), Some(query)) = (self.ctx.get(&fill.market), self.orders.expected_maker(&fill.client_id)) {
+                if ctx.scale.qty_to_lots(fill.cum_filled_qty) >= query.qty_lots { self.uncertain_makers.remove(&fill.client_id); }
             }
         }
         let tracked = self.hedges.values().find(|h| h.client_id.as_deref() == Some(&fill.client_id))
@@ -2572,9 +2586,14 @@ impl Strategy {
                 self.close_by_client_id(&client_id);
             }
             ExecEvent::CancelFilledOrExpired { client_id } => {
-                // Not resting any more, so no sweep. The gate stays closed until the fill (user
-                // stream) or a terminal backfill (`recover_orphans`) accounts for the order.
-                self.uncertain_makers.insert(client_id.clone(), now_ns);
+                // A full private fill already accounts for the maximum size, including an amend
+                // increase. Otherwise keep the gate closed until terminal backfill proves the rest.
+                let fully_filled = self.orders.expected_maker(&client_id).is_some_and(|q| {
+                    self.maker_coverage.get(&client_id).zip(self.ctx.get(&q.market))
+                        .is_some_and(|(c, ctx)| q.qty_lots > 0 && ctx.scale.qty_to_lots(c.qty) >= q.qty_lots)
+                });
+                if fully_filled { self.uncertain_makers.remove(&client_id); }
+                else { self.uncertain_makers.insert(client_id.clone(), now_ns); }
                 self.close_by_client_id(&client_id);
             }
             ExecEvent::MakerOrderMissing { client_id } => {
@@ -2861,10 +2880,7 @@ impl Strategy {
             // An Unknown remains a live reservation. Position snapshots cannot
             // prove that a queued/accepted transaction will never execute later.
             if self.hedges.values().any(|h| h.market == m && h.unresolved()) { continue; }
-            let last_terminal = self.hedges.values().filter(|h| h.market == m)
-                .filter_map(|h| h.terminal_ns).max().unwrap_or(0);
-            let last_action = self.last_hot_action_ns.get(&m).copied().unwrap_or(0).max(last_terminal);
-            if snap.read_start_ns <= last_action { continue; }
+            if self.snapshot_predates_position_action(&snap, &m) { continue; }
             let rep_a = snap.reported_position(Venue::Aster, &m);
             let rep_h = snap.reported_position(Venue::Hedge, &m);
             let pred_a = self.aster_pos.get(&m).map(|p| p.qty).unwrap_or_default();
@@ -4770,6 +4786,67 @@ lighter_symbol = "BTC"
         strat.handle_maker_order_progress(m.clone(),Side::Buy,client,"17".into(),dec!(0.5),Some(dec!(50)),true,1700000000000,now+5).await;
         let HedgeCommand::Hedge { intent,.. }=hrx.try_recv().unwrap() else {panic!("hedge expected")}; assert_eq!(intent.qty,dec!(0.5));
         assert!(strat.uncertain_makers.is_empty() && !strat.frozen);
+    }
+
+    #[tokio::test]
+    async fn live_fill_waits_for_a_post_execution_snapshot_without_a_sweep() {
+        let account = AccountState::default();
+        let (etx, mut erx) = tokio::sync::mpsc::channel(16);
+        let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
+        let mut strat = live_strat(etx, htx, account.clone());
+        strat.cfg.live.max_unhedged_notional_usd = dec!(15);
+        let m: MarketId = "BTC".into(); let now = crate::hotpath::clock::mono_now_ns();
+        account.publish(funded_snapshot(now, dec!(0), dec!(0)));
+        strat.mark_clean_start(); strat.refresh_mark_cache(); strat.cooldown_ns = 0;
+        let client = strat.orders.next_client_id(&m, Side::Sell).unwrap();
+        strat.orders.on_place_sent(&m, Side::Sell, client.clone(), 10000, 150, now);
+        strat.orders.on_acked(&m, Side::Sell, "17".into());
+        let fill = AsterFill { market:m.clone(), aster_side:Side::Sell, order_id:"17".into(), trade_id:"99".into(), client_id:client,
+            last_fill_qty:dec!(0.15), last_fill_px:dec!(100), cum_filled_qty:dec!(0.15), event_time_ms:1700000000000,
+            reduce_only:false, commission:Some(dec!(0)), commission_asset:Some("USDT".into()) };
+        strat.handle_maker_fill(fill, now+3).await;
+        let HedgeCommand::Hedge { intent, .. } = hrx.try_recv().unwrap() else { panic!("one hedge expected") };
+        assert_eq!(strat.maker_gate_reason(&m, now+4), Some("POSITION_SNAPSHOT_PENDING"));
+        strat.cfg.live.max_unhedged_notional_usd = dec!(14);
+        assert_eq!(strat.maker_gate_reason(&m, now+4), Some("UNHEDGED_OVER_LIMIT"));
+        strat.cfg.live.max_unhedged_notional_usd = dec!(15);
+        assert!(!strat.note_quote_gate(&m, now+4));
+        assert!(std::iter::from_fn(|| erx.try_recv().ok()).all(|cmd| !matches!(cmd, ExecCommand::CancelAllBot)));
+        assert!(!strat.frozen && strat.sweep_pending.is_none() && !strat.positions_reconciled());
+        strat.apply_execution_progress(intent.cloid, dec!(0.15), Some(dec!(15)), Some(dec!(0)), true, Some("42".into()), None, now+5);
+        // A read straddling the hedge still cannot confirm the new position, even if published later.
+        let mut straddled = funded_snapshot(now+6, dec!(-0.15), dec!(0));
+        straddled.read_start_ns = now+4; account.publish(straddled);
+        assert_eq!(strat.maker_gate_reason(&m, now+7), Some("POSITION_SNAPSHOT_PENDING"));
+        account.publish(funded_snapshot(now+8, dec!(-0.15), dec!(0.15)));
+        assert!(strat.positions_reconciled() && strat.maker_gate_reason(&m, now+9).is_none());
+        // A genuinely later mismatch must still close the gate and sweep.
+        account.publish(funded_snapshot(now+10, dec!(0), dec!(0)));
+        assert_eq!(strat.maker_gate_reason(&m, now+11), Some("POSITION_MISMATCH"));
+        assert!(!strat.note_quote_gate(&m, now+11));
+        assert!(std::iter::from_fn(|| erx.try_recv().ok()).any(|cmd| matches!(cmd, ExecCommand::CancelAllBot)));
+    }
+
+    #[tokio::test]
+    async fn live_fill_before_a_missing_amend_proves_only_the_fully_filled_size() {
+        for (filled, amended_lots, uncertain) in [(dec!(0.15), 150, false), (dec!(0.10), 150, true), (dec!(0.15), 300, true)] {
+            let account = AccountState::default();
+            let (etx, _erx) = tokio::sync::mpsc::channel(16); let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
+            let mut strat = live_strat(etx, htx, account);
+            let m: MarketId = "BTC".into(); let now = crate::hotpath::clock::mono_now_ns();
+            let client = strat.orders.next_client_id(&m, Side::Sell).unwrap();
+            strat.orders.on_place_sent(&m, Side::Sell, client.clone(), 10000, 150, now);
+            strat.orders.on_acked(&m, Side::Sell, "17".into());
+            strat.orders.on_amend_sent(&m, Side::Sell, 10010, amended_lots, now+1);
+            let fill = AsterFill { market:m.clone(), aster_side:Side::Sell, order_id:"17".into(), trade_id:"99".into(), client_id:client.clone(),
+                last_fill_qty:filled, last_fill_px:dec!(100), cum_filled_qty:filled, event_time_ms:1700000000000,
+                reduce_only:false, commission:Some(dec!(0)), commission_asset:Some("USDT".into()) };
+            strat.handle_maker_fill(fill, now+2).await;
+            assert!(matches!(hrx.try_recv(), Ok(HedgeCommand::Hedge { .. })));
+            strat.handle_exec_event(ExecEvent::CancelFilledOrExpired { client_id:client.clone() }, now+3);
+            assert_eq!(strat.uncertain_makers.contains_key(&client), uncertain, "filled={filled}, amended_lots={amended_lots}");
+            assert!(strat.orders.live_slots().is_empty() && hrx.try_recv().is_err());
+        }
     }
 
     #[test]

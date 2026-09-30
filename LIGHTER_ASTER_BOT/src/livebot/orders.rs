@@ -205,8 +205,8 @@ impl OrderManager {
     }
 
     pub fn recent_makers(&self) -> Vec<super::account::MakerQuery> { self.recent_makers.iter().cloned().collect() }
-    pub fn expected_lots(&self, client_id: &str) -> Option<i64> {
-        self.recent_makers.iter().find(|q| q.client_id == client_id).map(|q| q.qty_lots)
+    pub fn expected_maker(&self, client_id: &str) -> Option<&super::account::MakerQuery> {
+        self.recent_makers.iter().find(|q| q.client_id == client_id)
     }
 
     fn remember_maker(&mut self, market: &MarketId, side: Side, client_id: &str, qty_lots: i64) {
