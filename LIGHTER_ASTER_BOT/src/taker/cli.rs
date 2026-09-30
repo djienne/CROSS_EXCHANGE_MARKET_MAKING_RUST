@@ -71,8 +71,7 @@ pub enum Commands {
     ///
     /// Requires a flat Aster starting position. An IOC under the bid must end unfilled; then the
     /// taker's entry IOC buys up to `--max-usd`, XEMM's user stream reports the fill, XEMM's
-    /// reduce-only MARKET flatten sells it back (one step first, under Aster's minimum notional,
-    /// as XEMM's correction of a small residual sends it), and cleanup verifies the position flat.
+    /// reduce-only MARKET flatten sells it back, and cleanup verifies the position flat.
     AsterMarketRoundtrip {
         #[arg(long, default_value = "HYPE")]
         market: Option<String>,
@@ -234,6 +233,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 bail!("--max-usd must be positive");
             }
             let spec = first_spec(&cfg, market.as_deref()).await?;
+            let _leg = crate::controller::lock_leg(crate::config::FirstVenue::Aster, &spec.aster_symbol)?;
             let acreds = AsterCreds::from_env()?;
             let signer: Arc<dyn AsterSigner> =
                 Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);
@@ -291,11 +291,9 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let bal_before = aster.available_usdc().await?;
             println!("balance_before={bal_before}");
             // XEMM's user stream watches the fills, and XEMM's reduce-only MARKET flatten closes.
-            let target = market.as_deref().unwrap_or("HYPE");
-            let (xemm, xspec) = crate::livebot::probe::xemm_aster(&cli.config, target).await?;
+            let (xemm, xemm_stream, xspec) = crate::livebot::probe::xemm_aster(&cli.config, market.as_deref().unwrap_or("HYPE")).await?;
             let stop = tokio_util::sync::CancellationToken::new();
-            let stream = crate::livebot::probe::spawn_fill_printer(crate::livebot::probe::xemm_aster(&cli.config, target).await?.0,
-                &xspec, Arc::default(), stop.clone());
+            let stream = crate::livebot::probe::spawn_fill_printer(xemm_stream, &xspec, Arc::default(), stop.clone());
             tokio::time::sleep(Duration::from_secs(2)).await; // the stream subscribes before the first fill
 
             let session = diagnostic_session(&cfg, &spec, serde_json::json!({"aster_account": aster_account_id}));
@@ -314,19 +312,10 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 let position = wait_position_after_buy(&aster, &spec.market_id, qty, spec.step).await?;
                 println!("position_after_buy={position} visible_after={}ms", t.elapsed().as_millis());
                 let t = std::time::Instant::now();
-                match xemm.flatten_result(&xspec.market_id, crate::types::Side::Sell, spec.step,
-                    &format!("Xprb-step-{}", chrono::Utc::now().timestamp_millis())).await {
-                    Ok(body) => {
-                        println!("xemm_flatten_under_minimum ~${:.2} ({}ms): {body}", spec.step * bid.px, t.elapsed().as_millis());
-                        closed.set(crate::taker::aster::rest::immediate_fill_from_order_response(&body)?.qty);
-                    }
-                    Err(error) => println!("xemm_flatten_under_minimum refused ({}ms): {error:#}", t.elapsed().as_millis()),
-                }
-                let t = std::time::Instant::now();
-                let body = xemm.flatten_result(&xspec.market_id, crate::types::Side::Sell, position - closed.get(),
+                let body = xemm.flatten_result(&xspec.market_id, crate::types::Side::Sell, position,
                     &format!("Xprb-flat-{}", chrono::Utc::now().timestamp_millis())).await?;
                 println!("xemm_flatten ({}ms): {body}", t.elapsed().as_millis());
-                closed.set(closed.get() + crate::taker::aster::rest::immediate_fill_from_order_response(&body)?.qty);
+                closed.set(crate::taker::aster::rest::immediate_fill_from_order_response(&body)?.qty);
                 Ok(())
             };
             let result = run_diagnostic(&cfg,&spec,&session,operation,cleanup_aster_diagnostic(&cfg,&spec,&aster,&buy,qty,&closed)).await;
@@ -346,6 +335,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 bail!("--max-usd must be positive");
             }
             let spec = first_spec(&cfg, market.as_deref()).await?;
+            let _leg = crate::controller::lock_leg(crate::config::HedgeVenue::Lighter, &spec.lighter_symbol)?;
             let lcreds = LighterCreds::from_env()?;
             let lighter = LighterVenue::new(
                 &cfg.venues.lighter_base_url,

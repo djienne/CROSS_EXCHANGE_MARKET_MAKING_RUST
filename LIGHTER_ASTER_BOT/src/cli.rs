@@ -63,22 +63,16 @@ pub enum Commands {
         json: bool,
     },
 
-    /// Probe a live venue primitive with its real signer and venue credential file.
-    /// Signed reads only: aster-balance, aster-positions, aster-open-orders, leverage,
-    /// lighter-balance, lighter-open-orders, hl-balance. lighter-order-dry-run signs orders locally and
-    /// sends none. REAL orders, each needing `--i-understand-live`: aster-place-cancel times
-    /// XEMM's Aster calls (post-only place, cancel, refresh, amend, cancel-all, dead-man);
-    /// lighter-market drives XEMM's hedge worker (a hedge, an IOC that cannot fill, a reduce-only
-    /// close) and needs `--max-usd <N>`; hl-hedge does the same on Hyperliquid (`--market HYPE-HL`).
+    /// Probe a live venue primitive with its real signer and venue credential file: signed reads,
+    /// local signing (lighter-order-dry-run), or REAL orders behind `--i-understand-live` and the
+    /// venue's leg lock (RUNBOOK.md, "Probes").
     Probe {
-        /// Which check: aster-balance | aster-positions | aster-open-orders | aster-place-cancel |
-        /// leverage | lighter-balance | lighter-open-orders | lighter-order-dry-run | lighter-market |
-        /// hl-hedge | hl-balance | hl-place-cancel | hl-market (Hyperliquid, `HYPERLIQUID_ENV_PATH`)
+        /// Which check; an unknown one lists them all.
         check: String,
         /// Config market id; hl-balance/hl-place-cancel/hl-market take a coin (HYPE), hl-hedge a route (HYPE-HL).
         #[arg(long)]
         market: Option<String>,
-        /// Required confirmation for aster-place-cancel, lighter-market, hl-hedge, hl-place-cancel and hl-market.
+        /// Required confirmation for the checks that send real orders.
         #[arg(long, default_value_t = false)]
         i_understand_live: bool,
         /// USD cap for lighter-market and hl-hedge, in (0, 20]; for hl-place-cancel and hl-market, in [10.5, 20].

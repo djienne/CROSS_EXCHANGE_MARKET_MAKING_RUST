@@ -10,7 +10,8 @@ runs the same bot against simulated venues fed by live market data, with no cred
 real orders.
 
 This is a live trading codebase. `run --mode live`, `taker run` without `--observe-only`,
-`probe aster-place-cancel` and the `*-market`/`*-roundtrip` probes place real orders and can
+`close`, `probe aster-place-cancel`, `probe hl-hedge`, `probe hl-place-cancel` and the
+`*-market`/`*-roundtrip` probes place real orders and can
 lose money through spread, fees, slippage and execution failures. Neither the tests nor the
 dry run prove live venue acceptance, latency or profitability.
 

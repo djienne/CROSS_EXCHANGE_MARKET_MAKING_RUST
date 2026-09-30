@@ -5,8 +5,8 @@ when an arbitrage passes the taker's entry gate, XEMM pulls its quotes and hands
 rights to the taker, which trades and hands them back. `--mode live` trades real money; `--mode dry-run` runs the same bot
 against simulated venues fed by live market data ([Dry run](#dry-run)). Commands run from
 this directory (`LIGHTER_ASTER_BOT/`) and read `bot.toml`. `run --mode live`, `taker run`
-without `--observe-only`, `probe aster-place-cancel` and the `*-market`/`*-roundtrip` probes
-submit real orders. `HYPE-LH` has no Aster leg and runs the taker alone.
+without `--observe-only`, `close`, `probe aster-place-cancel`, `probe hl-hedge`, `probe hl-place-cancel`
+and the `*-market`/`*-roundtrip` probes submit real orders. `HYPE-LH` has no Aster leg and runs the taker alone.
 
 ## How `run` shares execution rights
 
@@ -424,9 +424,10 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
   history without orders. Standalone `taker probe` / `taker status` / `taker fetch-specs` cover Aster/Lighter only;
   `status` covers XEMM routes. Use `hl-balance --market HYPE` for Hyperliquid account reads.
 - `probe lighter-order-dry-run` signs IOC and native market plans without submitting them.
-- These submit real orders; run them only with explicit approval, and never beside a live
-  `run`. Each needs `--i-understand-live`, a flat start and no open orders, prints every
-  step's latency beside a ping, and ends by checking flat with no orders.
+- These submit real orders; run them only with explicit approval. Each needs
+  `--i-understand-live`, a flat start and no open orders, takes its venue's leg lock (so it
+  refuses beside a live `run`), prints each step's latency, and ends by checking flat with no
+  orders.
   - `probe aster-place-cancel`: XEMM's Aster calls on post-only orders ~2 % from the book,
     with XEMM's user stream running: place; amends through XEMM's own Aster worker (to far
     prices, to the same values, through the ask, with a lapsed permit, and of the cancelled
@@ -434,12 +435,10 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
     dead-man. A position left over is closed reduce-only.
   - `probe lighter-market --max-usd 12` / `probe hl-hedge --market HYPE-HL --max-usd 12`:
     XEMM's hedge worker on Lighter / Hyperliquid sends a hedge, an IOC that cannot fill
-    (printing whether its reject reads as the retryable no-fill), whether the venue takes a
-    reduce-only order under its minimum (a partial and a full close; `RULE` lines), and a
-    reduce-only close.
+    (printing whether its reject reads as the retryable no-fill), and reduce-only closes.
   - `taker aster-market-roundtrip --max-usd 7` / `taker lighter-market-roundtrip --max-usd
     12`: the taker's entry order, after one bounded under the bid that cannot fill. The Aster
-    one closes with XEMM's reduce-only MARKET, one step (under the $5 minimum) first. They clean
+    one closes with XEMM's reduce-only MARKET. They clean
     up reduce-only (at most three closes in 30 s) and stay blocked without terminal-order and
     flat-position evidence.
 - Measured 2026-09-28 from Windows, ~250 ms application ping to Aster/Lighter. Subtracting that

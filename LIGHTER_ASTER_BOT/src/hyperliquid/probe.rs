@@ -24,6 +24,7 @@ pub async fn run(check: &str, coin: &str, i_understand_live: bool, max_usd: Deci
     }
     ensure!(i_understand_live, "{check} trades real funds: re-run with --i-understand-live --max-usd <N>");
     ensure!((MIN_ORDER_USD..=dec!(20)).contains(&max_usd), "--max-usd must be within [10.5, 20], got {max_usd}");
+    let _leg = crate::controller::lock_leg(crate::config::HedgeVenue::Hyperliquid, coin)?;
     let (position, open) = (client.position(coin).await?, client.open_orders().await?.len());
     ensure!(position.is_zero() && open == 0, "{check} starts only flat with no open order: {coin} {position}, {open} open");
     match check {

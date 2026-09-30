@@ -139,6 +139,11 @@ pub fn leg(venue: impl std::fmt::Debug, symbol: &str) -> String {
     format!("{venue:?}-{symbol}").to_ascii_uppercase()
 }
 
+/// Holds one leg's lock for a command outside `run` that sends real orders there (probes, `close`).
+pub fn lock_leg(venue: impl std::fmt::Debug, symbol: &str) -> Result<File> {
+    lock_market(Path::new(RUNS_DIR), &leg(venue, symbol))
+}
+
 /// [`run`] with the config loaded and the runs directory given.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_with(
