@@ -1,7 +1,7 @@
 //! The lock-free latest-book cell — one per (market, venue). A single writer (the
 //! venue ingest thread) publishes the freshest [`OrderBook`] via an atomic pointer
 //! swap; many readers (the stream watchdog, the XEMM strategy) read it
-//! wait-free. A separate atomic stamps the last-message time for staleness checks.
+//! lock-free. A separate atomic stamps the last-message time for staleness checks.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -33,7 +33,7 @@ impl VenueTag {
 /// One venue's latest book for one market, plus a liveness stamp.
 ///
 /// Writer: the venue ingest thread (single writer per cell). Readers: the watchdog
-/// and the XEMM strategy (many readers, wait-free). `book` is `None` until the
+/// and the XEMM strategy (many readers, lock-free). `book` is `None` until the
 /// first snapshot arrives.
 pub struct VenueBook {
     book: ArcSwapOption<OrderBook>,
@@ -85,7 +85,7 @@ pub struct VenueBook {
     /// because a reconnect is trusted only once a full snapshot lands — both venues push
     /// one promptly on (re)connect. BBO-only publishes and `touch` never clear it.
     stream_down: AtomicBool,
-    /// Monotonically increasing book-version counter, bumped on every [`publish`]. A
+    /// Monotonically increasing book-version counter, bumped on every [`Self::publish`]. A
     /// strategy loop snapshots `generation()` per market and only recomputes when it
     /// changed — exact change detection without diffing the book or polling on a timer.
     generation: AtomicU64,
@@ -98,8 +98,7 @@ pub struct VenueBook {
     content_version: AtomicU64,
     /// Optional coalescing strategy wakeup. When a live strategy loop is attached
     /// ([`VenueBook::with_wake_and_dirty`]) every `publish` calls `notify_one`, so the loop
-    /// wakes on the next book change instead of sleep-polling. `None` for a cell built with
-    /// [`VenueBook::new`].
+    /// wakes on the next book change instead of sleep-polling. `None` for unwired test cells.
     wake: Option<Arc<Notify>>,
     /// When set, each `publish`/`publish_hot` marks this market dirty in the shared
     /// bitset so the strategy loop can reprice only changed markets on wake.
@@ -185,8 +184,7 @@ impl VenueBook {
         }
     }
 
-    /// Like [`with_wake`] but also wired to a shared dirty-market bitset: every `publish`
-    /// marks this market's index dirty so the strategy loop can reprice only changed markets.
+    /// Wire a wakeup and dirty-market bitset: publication marks this market's index dirty.
     pub fn with_wake_and_dirty(wake: Arc<Notify>, dirty: Arc<super::dirty::DirtyMarkets>, idx: crate::types::MarketIdx) -> Self {
         let mut vb = Self::build(Some(wake));
         vb.dirty = Some((dirty, idx));
@@ -431,7 +429,7 @@ impl VenueBook {
         self.bbo_hot.load_full()
     }
 
-    /// Current book version — bumped once per [`publish`], 0 before the first book.
+    /// Current book version — bumped once per [`Self::publish`], 0 before the first book.
     /// A strategy loop compares this to its last-seen value to detect a change.
     #[inline]
     pub fn generation(&self) -> u64 {
@@ -458,7 +456,7 @@ impl VenueBook {
         self.last_msg_ns.store(ns, Ordering::Release);
     }
 
-    /// Wait-free read of the latest book for the strategy loop. Cheap `Arc` clone.
+    /// Lock-free ArcSwap read of the latest book for the strategy loop.
     #[inline]
     pub fn load(&self) -> Option<Arc<OrderBook>> {
         self.book.load_full()
@@ -495,7 +493,7 @@ impl VenueBook {
     }
 
     /// Milliseconds since the last BOOK SNAPSHOT at `now_ns` — trading-data freshness,
-    /// as opposed to [`age_ms`] (any-frame connection liveness). `i64::MAX` until the
+    /// as opposed to [`Self::age_ms`] (any-frame connection liveness). `i64::MAX` until the
     /// first book arrives. The trading gate must use this so a trades-only feed with a
     /// stale book is not mistaken for fresh.
     #[inline]
@@ -675,7 +673,7 @@ mod tests {
         vb.publish(book(dec!(101)));
         let second = vb.load();
         assert_eq!(second.as_deref().unwrap().best_bid().unwrap().px, dec!(101));
-        // The earlier Arc snapshot is unaffected by the later store (wait-free read).
+        // An owned snapshot remains unchanged after a later publication.
         assert_eq!(first.as_deref().unwrap().best_bid().unwrap().px, dec!(100));
     }
 

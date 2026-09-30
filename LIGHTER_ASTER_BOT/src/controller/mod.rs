@@ -1,9 +1,9 @@
-//! The `run` command: one process running both engines for one market. XEMM quotes; when an
+//! The `run` command: one process for one market. On Aster routes, XEMM quotes; when an
 //! arbitrage passes the taker's entry gate, XEMM pulls its quotes and hands the execution
 //! rights to the taker, which trades and hands them back. It replaces the retired
-//! orchestrator.py and its child processes.
+//! orchestrator.py and its child processes. Lighter/Hyperliquid routes run only the taker.
 //!
-//! * [`risk`]: the cross-engine loss stops (equity drawdown, realized trade PnL).
+//! * [`crate::controller::risk`]: cross-engine loss stops (equity drawdown, realized trade PnL).
 //! * `supervisor`: the loop — engine tasks, loss stops, network pause, halts.
 //! * `engines`: the real engine tasks and status pollers behind the supervisor.
 

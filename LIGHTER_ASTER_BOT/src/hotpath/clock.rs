@@ -1,14 +1,6 @@
-//! Monotonic clock for hot-path staleness stamps.
-//!
-//! Connection/book liveness must be immune to wall-clock jumps (an NTP step or a
-//! leap-second smear): a *backward* `Utc::now()` jump would make `age_ms` /
-//! `book_age_ms` negative and let a dead feed read as fresh, suppressing the
-//! watchdog's reconnect and holding the trading gate open over stale data. So the
-//! staleness atomics (`VenueBook::last_msg_ns` / `last_book_ns`) and the watchdog
-//! scan are stamped from a process-start monotonic `Instant`, NOT `Utc::now()`.
-//!
-//! This is a side-channel for liveness only: `OrderBook::local_recv_ts` stays a
-//! wall-clock `Utc::now()` stamp.
+//! Process-local monotonic clock for freshness, execution ordering and permit deadlines.
+//! Wall-clock corrections cannot reverse elapsed time. `OrderBook::local_recv_ts` and
+//! journal dates remain UTC; monotonic stamps cannot be compared between processes.
 
 use std::sync::OnceLock;
 use std::time::Instant;

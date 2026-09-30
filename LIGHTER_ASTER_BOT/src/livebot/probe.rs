@@ -153,7 +153,7 @@ async fn probe_aster_open_orders(cfg: &Config, target: &str) -> Result<()> {
 /// through the bot's own worker (amends, one to the same values, one through the ask, one whose
 /// permit lapsed, one of the cancelled order); a post-only that would cross; cancel-all on both
 /// sides; the dead-man firing. Every order rests 1.8-2.2% from the touch except the crossing
-/// ones; money is at risk only if Aster lets an amend cross.
+/// ones. Resting orders can still fill if the market moves to them.
 async fn probe_aster_place_cancel(cfg: &Config, target: &str, i_understand_live: bool) -> Result<()> {
     if !i_understand_live {
         bail!("aster-place-cancel amends an order across the book: re-run with --i-understand-live");
@@ -306,7 +306,7 @@ async fn aster_position(aster: &AsterRest, spec: &MarketSpec) -> Result<Decimal>
         .and_then(|r| r.position_amt.parse().ok()).unwrap_or(Decimal::ZERO))
 }
 
-/// Minimum of five unsigned GETs on one warm connection: the network share of each latency.
+/// Minimum of five warm GET round trips: an application baseline including server processing.
 async fn min_rtt_ms(url: &str) -> Result<u128> {
     let client = reqwest::Client::new();
     client.get(url).send().await?.bytes().await?;

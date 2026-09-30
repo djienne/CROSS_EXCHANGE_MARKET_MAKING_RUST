@@ -14,7 +14,7 @@ use crate::types::{MarketId, Side};
 #[serde(rename_all = "lowercase")]
 pub enum Venue {
     Aster,
-    /// The hedge venue (Lighter).
+    /// Lighter or Hyperliquid; serialized as "lighter" for journal compatibility.
     #[serde(rename = "lighter")]
     Hedge,
 }
@@ -39,7 +39,7 @@ pub struct OpenOrderSnapshot {
     pub qty: Decimal,
     /// Bot-assigned client id, if this order is recognized as ours.
     pub client_id: Option<String>,
-    /// Venue-assigned id (Aster orderId / Lighter order index).
+    /// Venue-assigned order identity.
     pub venue_order_id: Option<String>,
 }
 
@@ -61,16 +61,13 @@ pub struct AccountSnapshot {
     /// `aster_available_usd`. Used by the circuit breaker so opening a hedge (which locks margin)
     /// does not look like a loss.
     pub aster_equity_usd: Decimal,
-    /// Lighter `portfolio_value` — collateral-style: it does NOT mark unrealized PnL of open
-    /// positions to price (observed live 2026-07-04: frozen for 41h while the position's uPnL
-    /// moved $8). The marked leg lives in `hl_unrealized_usd`; `total_equity_usd()` adds both.
+    /// Lighter collateral-style `portfolio_value`, or Hyperliquid's already-marked `accountValue`.
     pub hl_equity_usd: Decimal,
-    /// Signed unrealized PnL of the Lighter leg, marked to the reconciler's Lighter mid.
-    /// Lighter's `portfolio_value` excludes uPnL of open positions, so this is added on top of
-    /// `hl_equity_usd` in `total_equity_usd()`.
+    /// Lighter position uPnL marked to fresh hedge mids and added to collateral.
+    /// Zero for Hyperliquid, whose `hl_equity_usd` already includes uPnL.
     pub hl_unrealized_usd: Decimal,
-    /// True iff EVERY nonzero Lighter position contributed a trusted uPnL (fresh mark AND
-    /// `entry_px > 0`). The circuit breaker ignores samples where this is false.
+    /// Every nonzero hedge position has a positive entry and a mark. Lighter uses fresh mids;
+    /// Hyperliquid uses entry prices so extra uPnL stays zero. False samples cannot trip the breaker.
     pub hl_upnl_marked: bool,
     pub aster_positions: Vec<ScaledPosition>,
     pub hl_positions: Vec<ScaledPosition>,
@@ -80,10 +77,8 @@ pub struct AccountSnapshot {
     /// Monotonic-clock nanos when this snapshot finished being assembled (set AFTER the venue reads;
     /// used for the freshness check).
     pub source_ts_ns: i64,
-    /// Monotonic-clock nanos when the venue reads for this snapshot STARTED (set BEFORE the first
-    /// read). The orphan backstop only trusts a snapshot whose reads all began after its last hot
-    /// action (`read_start_ns > last_hot_action_ns`), so a snapshot that straddles a fill/hedge can't
-    /// trigger a double-hedge. Distinct from `source_ts_ns` (which is stamped after the reads).
+    /// Monotonic nanos before the first venue read. Position confirmation requires reads begun
+    /// after the latest relevant execution; `source_ts_ns` instead records completion time.
     pub read_start_ns: i64,
 }
 
@@ -110,10 +105,8 @@ impl AccountSnapshot {
         }
     }
 
-    /// Total cross-venue mark-to-market equity (USD). For a delta-neutral book this is stable; it
-    /// moves only with realized PnL, fees, funding, and residual basis — the circuit breaker's
-    /// signal. Both legs are marked: Aster via the venue's own unrealized PnL, Lighter via
-    /// `hl_unrealized_usd` (its `portfolio_value` alone is blind to open-position uPnL).
+    /// Cross-venue marked equity (USD), including fees, funding, basis changes and transfers.
+    /// Opposite position marks need not cancel exactly, especially across asynchronous reads.
     pub fn total_equity_usd(&self) -> Decimal {
         self.aster_equity_usd + self.hl_equity_usd + self.hl_unrealized_usd
     }

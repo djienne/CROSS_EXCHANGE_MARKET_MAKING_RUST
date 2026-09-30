@@ -1,4 +1,4 @@
-//! Resolved Aster/Lighter market specifications.
+//! Resolved XEMM market specs. Legacy `hl_*`/`lighter_*` fields describe either hedge venue.
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};

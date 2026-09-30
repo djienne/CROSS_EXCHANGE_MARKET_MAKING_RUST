@@ -29,7 +29,7 @@ impl Side {
     }
 }
 
-/// Logical market identifier (e.g. "BTC"). Maps to an Aster symbol + a Lighter market.
+/// Configured route identifier (e.g. "HYPE-HL"); maps to a market on each selected venue.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MarketId(pub String);
 
@@ -115,7 +115,7 @@ pub enum RejectReason {
     MissingAsterBook,
     MissingHlBook,
     MissingMid,
-    /// Lighter BBO was fresh but too small for the hedge, and the slower L2
+    /// Hedge BBO was fresh but too small for the hedge, and the slower L2
     /// depth snapshot was stale/missing, so neither quote source is safe.
     HlBboThinAndL2Stale,
     /// Aster BBO top was too thin for the candidate maker order, and fresh depth20
@@ -125,10 +125,10 @@ pub enum RejectReason {
     // --- capital / position cap ---
     /// Increasing the Aster futures position further would exceed its capital cap.
     AsterPositionCapReached,
-    /// Increasing the Lighter hedge position would exceed its capital cap.
+    /// Increasing the hedge-venue position would exceed its capital cap.
     LighterPositionCapReached,
     /// Live inventory-unwind mode is enabled and this candidate would not reduce the paired
-    /// Aster/Lighter absolute position.
+    /// maker/hedge absolute position.
     PositionReduceOnly,
     /// `clamp_to_min_lot` is on but the venue minimum lot exceeds the remaining
     /// capital headroom (or won't clear min-notional at the quoted price), so even

@@ -2,9 +2,8 @@
 //! reconciliation, and the orphan-leg invariant gate that decides whether new
 //! maker quoting is allowed.
 //!
-//! The rule that makes the bot safe: **risk-reducing actions (cancel, hedge, flatten,
-//! reconcile) are ALWAYS allowed; only NEW maker placement is gated.** So a freeze never
-//! traps an unhedged leg — it just stops us digging deeper.
+//! This gate blocks new maker quotes, not cancels or recovery. Recovery still needs fresh
+//! data, executor readiness, request budget and resolved prior attempts.
 
 use std::collections::HashMap;
 

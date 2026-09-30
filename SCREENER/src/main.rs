@@ -1,6 +1,6 @@
 //! `screener`: which Aster/Lighter/Hyperliquid pairs suit the bot's taker-taker and
 //! XEMM strategies? `collect` records the moments that matter from public feeds; `report` scores
-//! them with the bot's rules. Independent of the bot: public data only, no credentials, no orders.
+//! them with simplified bot-derived rules. Public data only, no credentials, no orders.
 
 mod collect;
 mod config;

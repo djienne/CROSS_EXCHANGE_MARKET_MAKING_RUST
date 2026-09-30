@@ -54,9 +54,9 @@ pub struct AccountStatus {
     pub aster_available_usd: Decimal,
     pub aster_equity_usd: Decimal,
     pub lighter_available_usd: Decimal,
-    /// Lighter `portfolio_value` — collateral-style, EXCLUDES open-position uPnL.
+    /// Hedge value: Lighter collateral, or Hyperliquid equity already including uPnL.
     pub lighter_equity_usd: Decimal,
-    /// Marked uPnL of the Lighter leg (see `AccountSnapshot::hl_unrealized_usd`).
+    /// Extra marked Lighter uPnL; zero on Hyperliquid (see `AccountSnapshot::hl_unrealized_usd`).
     pub lighter_unrealized_usd: Decimal,
     pub total_available_usd: Decimal,
     /// Fully marked cross-venue equity (both legs' uPnL included).

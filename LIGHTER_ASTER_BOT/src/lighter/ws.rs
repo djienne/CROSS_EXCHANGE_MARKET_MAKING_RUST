@@ -49,7 +49,7 @@ struct Envelope<'a> {
 }
 
 /// Proactive client-ping interval. Lighter closes any connection that sends NO frame for 2
-/// minutes (https://apidocs.lighter.xyz/docs/websocket-reference), so quiet streams (e.g.
+/// minutes (<https://apidocs.lighter.xyz/docs/websocket-reference>), so quiet streams (e.g.
 /// account/user_stats) must emit a keepalive frame well under that window — matches Python's
 /// `ping_interval=20`.
 const WS_PING_INTERVAL: Duration = Duration::from_secs(20);

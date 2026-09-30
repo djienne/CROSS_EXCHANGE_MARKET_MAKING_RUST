@@ -1,18 +1,18 @@
 # Operating the bot
 
-`lighter_aster_bot run` trades one market with both engines in one process. XEMM quotes;
+`lighter_aster_bot run` trades one market in one process. On Aster routes, XEMM quotes;
 when an arbitrage passes the taker's entry gate, XEMM pulls its quotes and hands the execution
 rights to the taker, which trades and hands them back. `--mode live` trades real money; `--mode dry-run` runs the same bot
 against simulated venues fed by live market data ([Dry run](#dry-run)). Commands run from
 this directory (`LIGHTER_ASTER_BOT/`) and read `bot.toml`. `run --mode live`, `taker run`
 without `--observe-only`, `probe aster-place-cancel` and the `*-market`/`*-roundtrip` probes
-submit real orders.
+submit real orders. `HYPE-LH` has no Aster leg and runs the taker alone.
 
 ## How `run` shares execution rights
 
 One regime at a time, like Hummingbot's XEMM with the taker's arbitrage in between:
 
-- **XEMM (normal)** quotes both Aster sides and hedges each fill on Lighter at once
+- **XEMM (normal)** quotes both Aster sides and hedges on Lighter or Hyperliquid
   (`[maker.live.quote] reduce_position_only = true` keeps only the side whose hedge reduces
   inventory).
 - **An arbitrage** that passes the taker's entry gate asks XEMM for the rights. XEMM cancels
@@ -25,13 +25,14 @@ One regime at a time, like Hummingbot's XEMM with the taker's arbitrage in betwe
 - **XEMM resumes** after re-reading the Lighter nonce and adopting the positions the taker left:
   only account reads started after the hand-back count, and two in a row must agree.
 
-Both engines run for the whole session; one that exits halts the bot. XEMM's journal records
+On Aster routes, both engines run for the whole session; one that exits halts the bot. XEMM's journal records
 each hand-over (`yield`, `yield_withdrawn`, `rights_returned`, `resumed`), and `bot_stats.py`
 summarizes them. The `[controller]` table of `bot.toml` holds the status poll and the
 cross-engine loss stop. The controller reads the accounts from XEMM's own snapshot, which XEMM
-refreshes every 2 s; it reads the venues only at start-up. Lighter Standard allows 60 REST
-requests a minute per IP, and the whole process sends about 46 when idle: XEMM's account read
-30, the taker's account refresh 8, and the two book checks 8.
+refreshes every 2 s with the shipped settings; it reads the venues only at start-up.
+The HYPE route's idle Lighter reads total about 46/min: XEMM accounts 30, taker accounts 8,
+book checks 8. Standard's shared REST/transaction cap is 60/min; executions and other clients
+consume the remaining allowance ([rate limits](https://apidocs.lighter.xyz/docs/rate-limits)).
 
 ## Build, secrets, configuration
 
@@ -132,15 +133,15 @@ needs no credentials: the bot signs with a fixed dry-run identity whose keys exi
 venue, so a request that escaped to mainnet could not trade. Its files live in
 `runs/dry-run/`, which live never touches.
 
-The venues respond as seen from AWS Tokyo, and pessimistically where the data cannot decide
+The venue model targets AWS Tokyo timings, with estimates where measurements are unavailable
 (`[dry_run]` in `bot.toml` cites each value's source):
 
 - **Time shift.** The simulated world is the live one `shift_ms` (1000) late, timestamps
-  included, so the bot sees books as fresh as a Tokyo host would, by its own clocks. A frame
+  included, to absorb this host's feed delay before serving books. A frame
   that reaches this host later than that is applied on arrival and counted as late. Orders,
   cancels and deadmen wait until the feed has caught up with their time, so a cancel cannot
   beat prints that were late; one that waits over 2 s is answered as unavailable.
-- **Latency.** Each request draws a lognormal round trip from the benchmarked `[p50, p99]`
+- **Latency.** Each request draws a lognormal round trip from the configured `[p50, p99]`
   and takes effect at `effect_fraction` (0.9) of it. Lighter taker orders wait a further
   `lighter_taker_delay_ms` (300, the Standard account's delay).
 - **Takers** fill against the worse of the two book states around their effect time, and
@@ -148,15 +149,16 @@ The venues respond as seen from AWS Tokyo, and pessimistically where the data ca
 - **Makers** wait behind the visible size at their price, plus `hidden_queue_multiplier` times
   it in hidden orders. Prints at their price work through the visible queue, then the hidden
   one, before filling them; the book shrinking only shortens the visible queue. A print through
-  their price, or a book that crosses them, fills them outright.
-- **Venue rules**: the live filters, reduce-only, the Aster deadman and listen-key expiry,
-  Lighter's sequential nonces, Hyperliquid's five significant figures, and the venues' rate
-  limits (Lighter Standard: 60 REST requests and 60 transactions a minute; Hyperliquid: 1200
-  weight a minute).
+  their price fills them outright in the model; a crossing book fills up to its crossing size.
+- **Venue rules**: live filters, measured reduce-only exceptions, Aster deadman and listen-key
+  expiry, Lighter sequential nonces and Hyperliquid five significant figures. Rate limits are
+  approximations: Lighter has separate 60/min read and transaction buckets in the model,
+  whereas Standard shares its 60/min allowance and also has transaction-type limits;
+  Hyperliquid models 1200 weight/min.
 - **Accounts**: one cross account per venue from the `[dry_run]` balances. Fees come from the
   bot's own fee keys, so the dry run cannot catch a wrong one. Funding follows the public
-  rates at each venue's funding times. A maintenance-margin breach is reported, not
-  liquidated.
+  rates at Aster and Lighter settlement times; Hyperliquid funding is not simulated.
+  A maintenance-margin breach is reported, not liquidated.
 
 Docker (from this directory; the fleet's `start_all.bat` also starts it):
 
@@ -176,8 +178,9 @@ measuring the reset accounts. A fresh directory also restarts the taker's entry-
 history: as after a fresh live start, the taker trades only once it has recorded
 `min_history_samples` (50) opportunities above its required edge (`[taker.arb.entry_gate]`).
 
-An unclean stop (a host reboot, `docker kill`) loses at most the venues' last second. The
-next start archives the engines' unclean-session markers, whether a kill or an unresolved
+The simulator saves venue state every second and on a clean stop. An unclean stop loses
+changes since the last successful save. The next start archives the engines' unclean-session
+markers, whether a kill or an unresolved
 engine stop left them, as `<name>.unclean.<stamp>`. Live keeps them until an operator has
 resolved the session against the venues' records; here the simulated venues' own state is
 the only record, and the engines reconcile to it at start. Docker treats `docker kill` as a
@@ -211,11 +214,11 @@ taker. Without `--dry-run` that command resets live's breaker.
 | `lag_ms` (`book`, `top`, `trade`) | Arrival minus exchange time, clock skew included. The p99 must stay under `shift_ms` − 250 (the lookahead that finds the later book state). |
 | `stale_frames`, `gaps` | Out-of-order book frames, and upstream breaks. A gap closes the bot's streams, as the venue would, and orders are rejected `Unavailable` until the next snapshot. |
 | `held` | Orders, cancels and deadmen that waited for a late feed. |
-| `lateness_ms` (whole row) | How late the simulator ran its events. Hundreds of ms mean this host starved it of CPU (a Docker build on the same host does); stalls past the shift also make late frames. |
+| `lateness_ms` (whole row) | Delayed event processing. CPU contention or host suspension can contribute; stalls past the shift also make late frames. |
 | `rtt_ms`, `private_ms` | The latencies drawn. |
-| `requests`, `orders`, `rejects` | Rejects by reason. Each needs an explanation in the bot's log; `RateLimited` means the bot outran a venue limit, which is a finding about the bot. |
+| `requests`, `orders`, `rejects` | Rejects by reason. `RateLimited` means the bot exceeded a modeled limit; compare it with the venue's actual rules. |
 | `maker_fills`, `taker_fills`, `queue_ahead`, `maker_wait_ms` | Fills, the queue ahead of each order that came to rest, and each maker fill's wait since placement. |
-| `prints`, `prints_inside_spread`, `prints_over_visible` | Trades the visible book cannot explain: hidden orders, or orders placed and taken between two book updates. Their share bounds from above the hidden liquidity `hidden_queue_multiplier` assumes. |
+| `prints`, `prints_inside_spread`, `prints_over_visible` | Trades the visible book cannot explain. Hidden orders, between-frame changes and feed delay can all contribute; these counts cannot identify `hidden_queue_multiplier`. |
 | `account` | Balance, unrealized, equity, realized, fees, funding, positions, maintenance breach. |
 
 Simulator warnings start with `dry-run`. `no route`, `no websocket` or `not simulated` means
@@ -233,11 +236,12 @@ count deduplicated exchange fills, while `trades` groups logical obligations. Th
 creation to the first observed hedge fill, once per attempt, excluding later fee/backfill
 notices. `hedge_delay_ms` retains the exchange-clock, per-obligation comparison. Amend timing
 matches the same client id's reply; a later placement never completes an unanswered amend.
+Report p50 uses the upper median for even sample counts; simulator diagnostics use nearest rank.
 
 What the dry run cannot tell: whether the maker fee keys are right (the taker keys matched
 the live probes); the bot's market impact beyond the liquidity it takes; how Aster's ~100 ms
 splits around matching (assumed pessimistically); anything about liquidation. Lighter
-signatures are not verified. The venues' live timings are under [Probes](#probes).
+signatures are not verified. Live timings are under [Probes](#probes).
 
 **Going live.** Live runs in the `bot` container, on this Windows host or a Linux host
 ([Deploy](#deploy)). Live refuses credential files that group or other can read. Docker Desktop
@@ -250,21 +254,21 @@ applies to what the bot reads.
 2. The fee keys in `bot.toml` match both accounts' actual tiers.
 3. On a VPS, ship the sources, the secrets and the live image with `scripts/deploy_vps.sh`
    ([Deploy](#deploy)); here, `docker compose --profile live build bot`.
-4. On the host, the read-only probes pass: `docker compose --profile live run --rm bot probe aster-balance`,
-   then `probe lighter-balance`, `probe lighter-open-orders`, `probe leverage` and `taker probe
-   --market HYPE`. Both venues must be at 1x cross and Aster in one-way position mode, which XEMM
-   checks at start.
+4. On the host, the route's read-only probes pass ([Probes](#probes)). For HYPE, use
+   `docker compose --profile live run --rm bot taker probe --market HYPE` and `probe leverage`.
+   Hyperliquid routes also need `probe hl-balance --market HYPE`. Both legs must be at 1x cross;
+   Aster routes require one-way position mode.
 5. Neither venue has open orders, and positions are flat or paired.
 6. `runs/` holds no latch from an earlier run (`bot-<M>.breaker.json`, `*.trip.json`,
    `circuit_breaker_<M>.json`): each engine checks its own when it starts. `run` itself refuses to start on an engine's unclean-session
    marker (`*.active.json`, `active_session_<M>.json`).
-7. Start it as in [Run and stop](#run-and-stop). Its drawdown baseline starts at the first
-   sample.
+7. Start it as in [Run and stop](#run-and-stop). The controller reuses its persisted drawdown
+   baseline; XEMM arms a new median baseline at each start ([Halts and recovery](#halts-and-recovery)).
 
 ## Market data tape
 
 The `recorder` service (container `lighter-aster-recorder`, `record --market HYPE`) records
-HYPE's raw public feeds, the dry run's input, for backtests:
+HYPE's Aster/Lighter public feeds for later replay. `record` currently supports only this venue combination:
 - **Aster:** `depth20@100ms` (20 levels), `bookTicker` and `aggTrade`.
 - **Lighter:** `order_book` (a snapshot, then deltas: the whole book), `trade` and `market_stats`.
 - **REST:** Aster `premiumIndex` every minute; `exchangeInfo` and `orderBooks` hourly.
@@ -276,9 +280,9 @@ dry run does not interrupt it; `docker compose up -d --build recorder` restarts 
 **Files.** `data/HYPE/<YYYY-MM-DD>T<HHMMSS>Z.tape.zst`, one per UTC day and per recorder start,
 named after the first line's arrival: tab-separated `<arrival µs>\t<kind>\t<payload>`, with the
 kinds listed in `src/dryrun/tape.rs`. Read a day with `zstd -dc data/HYPE/<day>T*.tape.zst | head`.
-- A kill loses at most the last 10 s.
-- `A-` and `L-` lines mark a lost connection. The feeds reconnect within 5 s of the network
-  returning, and a start without network (a reboot) waits for it.
+- The writer flushes every 10 s; an unclean stop can lose unflushed data.
+- `A-` and `L-` lines mark a lost connection. Reconnect attempts back off up to 5 s;
+  connection and subscription time add to the recovery delay.
 - Aster has no order-book history to download again, and the fleet backup skips files over
   100 MB (MAKE_BACKUP.py), so copy the tapes elsewhere if they must survive a disk loss.
 
@@ -362,14 +366,14 @@ that PnL is still at or below the limit.
 
 ## Engines
 
-**Taker.** It prices configured depth in both directions (Aster sell/Lighter buy and the
-reverse). A clip trades only when the depth-weighted edge clears both taker fees plus the
+**Taker.** It prices configured depth in both directions on the route's two venues.
+A clip trades only when the depth-weighted edge clears both taker fees plus the
 margin, both books hold `liquidity_multiple` times the clip within `max_levels` and are
 fresher than `max_book_staleness_ms`, and the edge passes the entry gate: the greater of the
 90th percentile of recent samples and the required edge plus `min_extra_bps`, blocking during
 history warmup. Its Aster book is the `depth20@100ms` snapshot with the newer `bookTicker` top
 laid over it (by update id): depth alone lags the top by up to 100 ms. Aster orders are bounded
-IOC limits; Lighter uses its native market/IOC path.
+IOC limits; Lighter uses its native market/IOC path and Hyperliquid bounded IOCs.
 
 An unknown submission outcome keeps its order and client ids: a missing order row or a flat
 position does not prove no fill. A known missing hedge gets one retry within
@@ -380,8 +384,10 @@ matched spread capture minus fees, and recovery rows are conservative equity-del
 **XEMM.** Stale books block new exposure. A timeout, a balanced position snapshot or an empty
 open-order list never proves that an order did not execute: an unresolved attempt stays
 reserved, and after 60 s new exposure freezes while late evidence is still accepted. A net
-residual is corrected with the smallest rounded-down quantity that removes it, at most twice
-per incident. The margin guard reserves margin for resting makers and hedge obligations above
+residual is corrected reduce-only, at most twice per incident. Hyperliquid partial closes
+must meet its minimum, so sizing rounds up to the buffered minimum or the whole held position;
+any excess is corrected on the other leg after a fresh position confirmation. Aster and Lighter
+accept sub-minimum reduce-only closes in the measured cases. The margin guard reserves margin for resting makers and hedge obligations above
 the per-venue buffers ($26 shipped); reductions stay possible.
 
 ## Deploy
@@ -395,13 +401,16 @@ scripts/deploy_vps.sh secrets    # aster.env + lighter.env, chmod 600 (once)
 scripts/deploy_vps.sh image      # docker build here, docker save | ssh docker load
 ```
 
+The secrets step copies Aster/Lighter only. For a Hyperliquid route, separately place
+`hyperliquid.env` in the remote working directory with mode `600`.
+
 On the VPS, match the container user to the host user, and create the output and nonce dirs:
 
 ```bash
 export XEMM_UID="$(id -u)" XEMM_GID="$(id -g)" ASTER_NONCE_DIR=/tmp/lighter-aster-nonces
 mkdir -p runs "$ASTER_NONCE_DIR" && chmod 700 "$ASTER_NONCE_DIR"
-docker compose run --rm bot probe aster-balance        # signed reads, no orders
-docker compose run --rm bot taker probe --market HYPE
+docker compose --profile live run --rm bot probe aster-balance        # signed reads, no orders
+docker compose --profile live run --rm bot taker probe --market HYPE
 ```
 
 Compose mounts this directory read-only (config, signers, env files), `runs/` read-write and
@@ -410,9 +419,10 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
 ## Probes
 
 - Read-only: `probe aster-balance | aster-positions | aster-open-orders | leverage |
-  lighter-balance | lighter-open-orders`, `taker probe`, `status` and `taker status` (JSON),
+  lighter-balance | lighter-open-orders | hl-balance`, `taker probe`, `status` and `taker status` (JSON),
   `fetch-specs`. `taker run --markets HYPE --observe-only` scans and records entry-gate
-  history without orders.
+  history without orders. Standalone `taker probe` / `taker status` / `taker fetch-specs` cover Aster/Lighter only;
+  `status` covers XEMM routes. Use `hl-balance --market HYPE` for Hyperliquid account reads.
 - `probe lighter-order-dry-run` signs IOC and native market plans without submitting them.
 - These submit real orders; run them only with explicit approval, and never beside a live
   `run`. Each needs `--i-understand-live`, a flat start and no open orders, prints every
@@ -432,7 +442,8 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
     one closes with XEMM's reduce-only MARKET, one step (under the $5 minimum) first. They clean
     up reduce-only (at most three closes in 30 s) and stay blocked without terminal-order and
     flat-position evidence.
-- Measured 2026-09-28 from Windows, ~250 ms ping to both venues; venue time = RTT - ping:
+- Measured 2026-09-28 from Windows, ~250 ms application ping to Aster/Lighter. Subtracting that
+  baseline estimates additional order-processing time; it does not isolate matching latency:
   - Aster takes ~100 ms per order call: post-only ~360 ms, cancel ~340 ms, amend ~350 ms,
     IOC result ~350 ms, so a refresh by cancel+place would take ~700 ms; the bot refreshes
     a quote by one amend. The user stream has a
@@ -511,8 +522,6 @@ HYPE-LH executed one matched 0.15 entry: expected/realized gross 4.666/2.802 bps
 opportunity; the operator close left both accounts flat, with whole-cycle cost $0.007532.
 Neither maker trial observed a taker rights handover; its entry gate remained enforced.
 These are operational checks with limited market coverage, not evidence of profitability.
-For Stage 5, choose one normal-profile route with the user; HYPE has the best directly
-observed hedge speed and zero hedge fees in these trials.
 
 ## Orchestrator leftovers
 

@@ -434,16 +434,8 @@ impl OrderManager {
         }
     }
 
-    /// Whether another place/replace on `market` is allowed under the per-minute cap. PRUNES
-    /// timestamps older than the 60s window FIRST (hence `&mut` + `now_ns`), so the limiter drains
-    /// with wall-clock time even when every dispatch is currently blocked.
-    ///
-    /// Bug history: pruning used to happen ONLY inside `record_replace` — i.e. only on a SUCCESSFUL
-    /// send — while this check just read `len()`. So once the window filled AND there was no resting
-    /// order to keep (e.g. right after a post-fill `cancel_both_sides` pulled both sides), every
-    /// `Place` was blocked → no send → no prune → the window NEVER drained → placement was locked out
-    /// forever and the bot silently stopped quoting (gate open, quote OK, no log). Pruning on the
-    /// check breaks that latch: the window expires on its own and placement resumes.
+    /// Prune the rolling 60s window before checking admission, including while dispatch is
+    /// blocked; pruning only on successful sends would leave an exhausted window latched shut.
     /// `max_per_min == 0` disables the cap here (the window is still pruned so it stays bounded);
     /// the strategy always passes the non-zero `effective_max_replaces_per_minute_per_symbol()`.
     pub fn replace_rate_ok(&mut self, market: &MarketId, max_per_min: u32, now_ns: i64) -> bool {

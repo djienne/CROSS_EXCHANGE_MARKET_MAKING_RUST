@@ -15,7 +15,7 @@
 //! - A resting order has the visible size at its price ahead of it, and h × that size of hidden
 //!   orders. A print at its price eats the visible queue, then the hidden one, then fills it; a
 //!   book update only shortens the visible queue, to what is left on the level. A print through
-//!   its price proves the level emptied (hidden orders too), so it fills it at once. A print at
+//!   its price is modeled as emptying the queue (hidden orders too), so it fills it at once. A print at
 //!   a better price is another level's business. Our resting orders share each print's size.
 //! - If the book crosses a resting order (the market moved through it, or a feed gap hid the
 //!   prints), the crossing size fills it at its price.
@@ -317,7 +317,8 @@ pub struct Diag {
     pub maker_wait_us: Vec<i64>,
     pub prints: u64,
     /// Prints the visible book cannot explain: inside the spread, or bigger than the level
-    /// they hit. Hidden orders (or a stale book); they calibrate `hidden_queue_multiplier`.
+    /// they hit. Hidden orders, between-frame changes or feed delay can contribute;
+    /// these counts do not identify `hidden_queue_multiplier`.
     pub prints_inside_spread: u64,
     pub prints_over_visible: u64,
 }
@@ -383,7 +384,8 @@ fn venue_limits(venue: Venue) -> Vec<Window> {
     match venue {
         // Aster exchangeInfo: REQUEST_WEIGHT 2400/min; ORDERS 1200/min and 300/10 s.
         Venue::Aster => vec![Window::new(60, 2_400, false), Window::new(60, 1_200, true), Window::new(10, 300, true)],
-        // Lighter docs, Standard account: 60 REST requests and 60 transactions per minute.
+        // Approximation: separate 60/min buckets. Standard shares its read/transaction
+        // allowance and has additional transaction-type limits (RUNBOOK.md, Dry run).
         Venue::Lighter => vec![Window::new(60, 60, false), Window::new(60, 60, true)],
         // Hyperliquid docs: REST weight 1200/min per IP (the per-address action budget, one
         // per USDC traded, is not modelled).

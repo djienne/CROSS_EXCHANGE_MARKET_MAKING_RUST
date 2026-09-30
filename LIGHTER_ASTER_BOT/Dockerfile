@@ -1,14 +1,14 @@
 # syntax=docker/dockerfile:1
 #
-# Aster/Lighter bot (`lighter_aster_bot run`): the taker-taker engine and the XEMM engine
-# (Aster post-only maker -> Lighter IOC hedge) in one binary and one process.
+# Aster/Lighter/Hyperliquid bot: XEMM plus taker arbitrage on Aster routes,
+# taker alone on Lighter/Hyperliquid, in one binary and process.
 # Multi-stage: a Rust builder compiles the release binary; a slim Debian runtime
 # carries ONLY the binary + the (non-secret) live config. Secrets
-# (aster.env / lighter.env), signer binaries, and the runs/ output dir are MOUNTED at runtime
+# (per-venue *.env), signer binaries, and the runs/ output dir are MOUNTED at runtime
 # by docker-compose and are NEVER baked into an image layer.
 #
 # Build locally (fast box, plenty of RAM) and ship the image to the 2 GB VPS:
-#   docker compose build bot                   # tags lighter_aster_bot:live (a bare `build` makes the dry run's image)
+#   docker compose --profile live build bot    # tags lighter_aster_bot:live
 #   docker save lighter_aster_bot:live | gzip | ssh ... 'gunzip | docker load'
 # The VPS never compiles (a Rust LTO release build would risk OOM on 1.9 GiB).
 
@@ -64,5 +64,5 @@ STOPSIGNAL SIGINT
 
 ENTRYPOINT ["lighter_aster_bot"]
 # Safe default: print help and exit. Real runs pass an explicit command via
-# `docker compose run --rm bot <args>` (see docker-compose.yml / RUNBOOK.md).
+# `docker compose --profile live run --rm bot <args>` (see docker-compose.yml / RUNBOOK.md).
 CMD ["--help"]

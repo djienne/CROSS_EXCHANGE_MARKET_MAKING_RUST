@@ -26,7 +26,10 @@ from economics import parse_timestamp, xemm_journal
 
 
 def pct(xs: list[float], q: float) -> float | None:
-    """Nearest-rank quantile, as the simulator's diagnostics compute it."""
+    """Sorted sample at min(N-1, floor(q*N)); p50 is the upper median for even N.
+
+    Simulator diagnostics instead use nearest rank (ceil(q*N)-1).
+    """
     xs = sorted(xs)
     return xs[min(len(xs) - 1, int(q * len(xs)))] if xs else None
 

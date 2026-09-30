@@ -1,5 +1,5 @@
-# Aster/Lighter bot: `run` holds the XEMM engine and the taker-taker engine for one market;
-# XEMM hands the execution rights to the taker for each arbitrage.
+# Aster/Lighter/Hyperliquid bot: on Aster routes XEMM grants execution rights to the taker;
+# Lighter/Hyperliquid routes run the taker alone.
 #
 # One Dockerfile, two tags: lighter_aster_bot:live and :dryrun. Secrets are mounted read-only,
 # never baked. The runs/ dir (journals, ledgers, latches, controller state) is a persistent

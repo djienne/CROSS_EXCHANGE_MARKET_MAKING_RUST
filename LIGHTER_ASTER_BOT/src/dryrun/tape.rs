@@ -1,4 +1,4 @@
-//! The market-data tape: one market's raw public Aster and Lighter feeds, the dry run's input,
+//! The market-data tape: one Aster/Lighter market's raw public feeds,
 //! recorded by `record` for backtests. A file per UTC day and per recorder start,
 //! `<dir>/<MARKET>/<YYYY-MM-DD>T<HHMMSS>Z.tape.zst` after its first line's arrival (UTC), of
 //! tab-separated lines `<arrival µs since the epoch>\t<kind>\t<payload>`:
@@ -16,11 +16,11 @@
 //! clock, which clock corrections step back (2026-09-26: 71 steps over 1 ms, most of a few ms, the
 //! largest 0.37, 0.50 and 0.70 s), so a reader lets no time pass across a step.
 //!
-//! A file is concatenated zstd frames, one per flush (every 10 s), so a kill loses at most the
-//! last 10 s and `zstd -dc` reads any file. A frame cut short by a power loss can only end a
+//! A file is concatenated zstd frames, flushed every 10 s; an unclean stop can lose queued or
+//! unflushed data. `zstd -dc` reads complete frames. A truncated frame can only end a
 //! file, since no later start appends to it. Recording never waits: the network tasks hand each
 //! line to a writer thread, and drop it if the writer is a whole queue behind, counted in the log
-//! only (none by 2026-09-26): a Lighter book read across a drop is wrong until the next snapshot.
+//! only: a Lighter book read across a drop is incomplete until the next snapshot.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};

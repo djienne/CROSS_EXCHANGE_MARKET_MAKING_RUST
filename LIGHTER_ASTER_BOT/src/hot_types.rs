@@ -4,7 +4,7 @@
 //! the live strategy loop and the `VenueBook` cell. They live here (outside `hotpath`
 //! and `livebot`) so both modules can import them.
 
-/// Number of book levels carried on the hot path (matches Aster `@depth20` and the 20 Lighter levels published).
+/// Hot-book capacity: 20 levels for Aster/Lighter; Hyperliquid fast L2 supplies five.
 pub const HOT_LEVELS: usize = 20;
 
 /// Source age at receipt, computed once by ingest. Missing timestamps and clocks

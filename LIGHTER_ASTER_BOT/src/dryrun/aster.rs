@@ -479,7 +479,7 @@ impl Aster {
         }
     }
 
-    /// Public streams, as a Tokyo bot receives them.
+    /// Public streams on the shifted simulation clock with configured feed latency.
     async fn market(&self, lane: u64, streams: &[String], combined: bool, mut ws: WebSocketStream<TcpStream>) {
         let mut follower = self.venues.follower(Venue::Aster, lane, combined);
         for stream in streams {

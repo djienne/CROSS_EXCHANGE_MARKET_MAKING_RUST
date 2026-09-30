@@ -1,6 +1,6 @@
-//! Aster/Lighter bot. `run` (`controller`) trades one market with the
-//! taker–taker engine (`taker`) and the XEMM engine (`livebot`: quotes on Aster, hedges
-//! fills on Lighter), which hands the execution rights to the taker for each arbitrage.
+//! Cross-venue bot for Aster, Lighter and Hyperliquid. `run` trades one market;
+//! on Aster routes, XEMM quotes and grants execution rights to the taker for arbitrage.
+//! Lighter/Hyperliquid routes run the taker alone.
 
 pub mod book;
 pub mod cli;
@@ -9,7 +9,7 @@ pub mod config;
 pub mod controller;
 pub mod connectors;
 pub mod decimal;
-/// `run --mode dry-run`: simulated Aster and Lighter venues, seen from AWS Tokyo.
+/// `run --mode dry-run`: simulated venues with live feeds and configured latency models.
 pub mod dryrun;
 pub mod edge;
 pub mod hot_types;
@@ -19,7 +19,7 @@ pub mod hotpath;
 pub mod hyperliquid;
 pub mod inventory;
 pub mod lighter;
-/// The XEMM engine (`run`'s maker) for one market, gated behind `[live] enabled`; a dry run
+/// The XEMM engine (`run`'s maker) for one market, gated behind `[maker.live] enabled`; a dry run
 /// points it at the simulated venues.
 pub mod livebot;
 pub mod markets;

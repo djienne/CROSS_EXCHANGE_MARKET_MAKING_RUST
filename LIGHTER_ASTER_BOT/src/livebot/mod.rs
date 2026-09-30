@@ -1,11 +1,11 @@
-//! The XEMM engine: Aster maker quotes, Lighter hedges.
+//! The XEMM engine: Aster maker quotes, Lighter or Hyperliquid hedges.
 //!
-//! It runs only with `[live] enabled` and one market; a dry run points it at the simulated
+//! It runs only with `[maker.live] enabled` and one market; a dry run points it at the simulated
 //! venues.
 //!
 //! Book publication and strategy ownership stay in memory; bounded queues connect
 //! venue workers, cold account reconciliation and persistent journal writing.
-//! Aster uses EIP-712 requests; Lighter uses the native signer and transaction socket.
+//! Aster uses EIP-712 requests, Lighter its native signer/socket, Hyperliquid signed HTTP actions.
 //! See `RUNBOOK.md` for uncertainty, shutdown and restart handling.
 
 pub mod account;

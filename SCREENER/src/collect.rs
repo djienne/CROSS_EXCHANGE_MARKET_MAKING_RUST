@@ -19,7 +19,7 @@
 //!
 //! | kind | fields |
 //! |---|---|
-//! | `P` | JSON: version 2, the [collect] settings, the `Recording`, and the constants below |
+//! | `P` | JSON: version 2, the `[collect]` settings, the `Recording`, and the constants below |
 //! | `U` | JSON: the pairs (`universe::Pair`) |
 //! | `B` | time, qualified pair, left bid, ask, right bid, ask (0 = unknown), `depth_flags` |
 //! | `T` | time, pair, leg `0`/`1` (legacy `A`/`L`), price, size, aggressor `B`/`S`: a trade that could fill a quote |

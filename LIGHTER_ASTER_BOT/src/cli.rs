@@ -1,4 +1,4 @@
-//! Command-line interface: `run` (the bot: both engines, one market) and the XEMM
+//! Command-line interface: `run` (the bot: one market) and the XEMM
 //! subcommands `live-report`, `probe`, `status`, `fetch-specs`, plus `close` (the operator's exit)
 //! and `record` (the market-data tape for backtests). The taker engine has its own CLI under `taker`.
 
@@ -10,14 +10,14 @@ use std::path::PathBuf;
 #[command(
     name = "lighter_aster_bot",
     version,
-    about = "Aster/Lighter bot (`run`): XEMM quoting that hands the execution rights to taker-taker arbitrage; plus probes, status and reports",
+    about = "Aster/Lighter/Hyperliquid bot: XEMM with taker arbitrage on Aster routes, taker alone on Lighter/Hyperliquid; plus probes, status and reports",
     after_help = "Taker engine on its own: `lighter_aster_bot taker --help`."
 )]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
-    /// Path to the TOML config file (bot.toml; XEMM commands read its [maker] table).
+    /// Path to the TOML config file (bot.toml; XEMM commands read its `[maker]` table).
     #[arg(long, global = true, default_value = "bot.toml")]
     pub config: PathBuf,
 }
@@ -27,11 +27,11 @@ pub enum Commands {
     /// Run the bot for one market: XEMM quotes and hands the execution rights to the taker for
     /// each arbitrage that passes its entry gate. Sends REAL orders in `--mode live`.
     Run {
-        /// Market id, listed once in both [[taker.markets]] and [[maker.markets]] (e.g. HYPE).
+        /// Market id in [[taker.markets]]; Aster routes also need [[maker.markets]] (e.g. HYPE).
         #[arg(long)]
         market: String,
         /// Required. live: real orders with the real credentials, files in runs/. dry-run: the
-        /// same bot against simulated venues fed by live market data ([dry_run] in the config),
+        /// same bot against simulated venues fed by live market data (`[dry_run]` in the config),
         /// no credentials, files in runs/dry-run/.
         #[arg(long)]
         mode: String,
@@ -63,9 +63,9 @@ pub enum Commands {
         json: bool,
     },
 
-    /// Probe one live venue primitive with the real signers and `aster.env`/`lighter.env`.
+    /// Probe a live venue primitive with its real signer and venue credential file.
     /// Signed reads only: aster-balance, aster-positions, aster-open-orders, leverage,
-    /// lighter-balance, lighter-open-orders. lighter-order-dry-run signs orders locally and
+    /// lighter-balance, lighter-open-orders, hl-balance. lighter-order-dry-run signs orders locally and
     /// sends none. REAL orders, each needing `--i-understand-live`: aster-place-cancel times
     /// XEMM's Aster calls (post-only place, cancel, refresh, amend, cancel-all, dead-man);
     /// lighter-market drives XEMM's hedge worker (a hedge, an IOC that cannot fill, a reduce-only
@@ -75,7 +75,7 @@ pub enum Commands {
         /// leverage | lighter-balance | lighter-open-orders | lighter-order-dry-run | lighter-market |
         /// hl-hedge | hl-balance | hl-place-cancel | hl-market (Hyperliquid, `HYPERLIQUID_ENV_PATH`)
         check: String,
-        /// Target market id from config (e.g. HYPE). Defaults to HYPE.
+        /// Config market id; hl-balance/hl-place-cancel/hl-market take a coin (HYPE), hl-hedge a route (HYPE-HL).
         #[arg(long)]
         market: Option<String>,
         /// Required confirmation for aster-place-cancel, lighter-market, hl-hedge, hl-place-cancel and hl-market.
@@ -90,7 +90,7 @@ pub enum Commands {
     /// Aster, Lighter and Hyperliquid at once, then check each venue flat. Refuses while a live
     /// `run` or `taker run` trades one of those venues.
     Close {
-        /// Market id or coin from config [[markets]] (e.g. HYPE; HYPE-HL means HYPE too).
+        /// Market id or coin from the configured maker/taker markets (HYPE-HL means HYPE too).
         #[arg(long)]
         market: String,
         /// Venues to close, comma-separated; all three when omitted.
@@ -101,14 +101,14 @@ pub enum Commands {
         i_understand_live: bool,
     },
 
-    /// Read-only account/book/quote status, as JSON: the XEMM report `run` polls every tick.
+    /// Read-only XEMM route account/book/quote status as JSON (Aster routes only).
     Status {
         /// Target market id from config (e.g. HYPE). Defaults to HYPE.
         #[arg(long)]
         market: Option<String>,
     },
 
-    /// Fetch and print resolved market specs (Aster exchangeInfo + Lighter orderBooks).
+    /// Fetch configured XEMM specs from Aster and the Lighter/Hyperliquid hedge venue.
     FetchSpecs {
         #[arg(long)]
         markets: Option<String>,

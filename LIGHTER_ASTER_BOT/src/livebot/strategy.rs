@@ -1,11 +1,11 @@
 //! Strategy/order hot path. A single-owner loop reprices each market
 //! side, places/cancels/replaces the Aster maker order, and reacts to fills. It REUSES the
-//! deterministic, well-tested quote math (`quote_engine::compute_desired_quote` and
+//! shared quote math (`quote_engine::compute_desired_quote` and
 //! `resting_quote_net_edge_bps`) rather than re-deriving the edge stack in integer math —
 //! the integer hot types accelerate the touch/crossed/staleness pre-checks and carry the
 //! order representation, but money math stays exact.
 //!
-//! This file holds the **pure decision table** (`evaluate_side_with_hl_sources`) — exhaustively testable —
+//! This file holds the pure decision table (`evaluate_side_with_hl_sources`)
 //! and the async driver ([`run_strategy`]) that turns decisions into [`ExecCommand`]s and
 //! folds fills into the hedge/risk state machine.
 
@@ -76,12 +76,10 @@ enum Yield {
 // (targeted cancels, CancelAllBot, dead-man refresh). Optional quote churn must
 // not be allowed to consume the entire bounded queue and then block a cancel.
 const EXEC_CANCEL_RESERVE: usize = 64;
-/// Circuit-breaker baseline = median of this many fresh marked equity samples (~10s at the
-/// 2s reconcile cadence). A single-read baseline let one bad startup sample manufacture
-/// phantom loss for a whole run (2026-07-04 incident).
+/// Startup baseline uses this many fresh marked samples; a median limits one-read outliers.
 const BREAKER_BASELINE_SAMPLES: usize = 5;
 /// Consecutive fresh marked samples that must breach the loss limit before the breaker
-/// trips (~4-6s at the 2s reconcile cadence). One anomalous snapshot must not halt the bot.
+/// trips. Elapsed detection time also depends on reconciliation and read latency.
 const BREAKER_TRIP_STREAK: u32 = 3;
 /// Rolling window of the Aster REST command budget (the per-minute cap and its safety reserve).
 const ASTER_CMD_WINDOW_NS: i64 = 60_000_000_000;
@@ -496,13 +494,9 @@ fn compute_desired_quote_select_books<'a>(
     Ok((desired, l2, HlQuoteSource::L2, aster_source))
 }
 
-/// Aggressive IOC hedge price that CROSSES the executable Lighter touch: a buy hedge crosses the best
-/// ask (+slippage), a sell hedge crosses the best bid (−slippage). Pricing off the touch (NOT mid,
-/// NOT the Aster fill price) guarantees the IOC takes liquidity unless the touch moved more than
-/// `slip_bps` since the snapshot — far more robust than `mid ± slip` on a sparse book (a live ETH
-/// failure on the earlier Hyperliquid hedge venue: `l2Book` ≈0.46 updates/s, so mid was 1–3 s
-/// stale and mid±10 bps did not cross).
-/// `None` when the relevant book side is empty — the caller must NOT hedge off a fallback price.
+/// IOC limit beyond the observed hedge touch by `slip_bps`, rather than beyond the mid.
+/// This crosses the sampled spread but does not guarantee a fill. Returns `None` for an
+/// empty required side; callers must not invent a fallback price.
 fn crossing_hedge_px(book: &OrderBook, hedge_side: Side, slip_bps: Decimal) -> Option<Decimal> {
     let f = slip_bps / Decimal::from(10_000);
     match hedge_side {
@@ -709,9 +703,8 @@ pub struct Strategy {
     /// Predicted signed positions per market on each leg (for the cap + mismatch checks).
     aster_pos: HashMap<MarketId, SignedPosition>,
     hl_pos: HashMap<MarketId, SignedPosition>,
-    /// Sub-min UNHEDGED Aster inventory per market: partial fills accumulate here and hedge on
-    /// Lighter the moment the net clears the Lighter minimum (the primary fast-hedge path — never a
-    /// per-partial taker flatten). A residual that genuinely lingers is flattened in `on_tick`.
+    /// Sub-minimum Aster fills accumulate until the net is hedgeable. Persistent residuals
+    /// enter the position-confirmed orphan recovery path on a maintenance tick.
     pending: HashMap<MarketId, PendingInventory>,
     logical_ids: HashMap<MarketId, Cloid>,
     maker_coverage: HashMap<String, MakerCoverage>,
@@ -772,9 +765,7 @@ pub struct Strategy {
     shutdown: tokio_util::sync::CancellationToken,
     /// Where to write the persistent trip latch on a trip (set with the shutdown token).
     trip_file_path: Option<std::path::PathBuf>,
-    /// Total cross-venue equity baseline: the MEDIAN of the first
-    /// [`BREAKER_BASELINE_SAMPLES`] fresh marked snapshots (a single-read baseline let one
-    /// bad startup sample manufacture phantom loss for the whole run — 2026-07-04 incident).
+    /// Median of the first [`BREAKER_BASELINE_SAMPLES`] fresh marked equity snapshots.
     breaker_baseline_equity: Option<Decimal>,
     /// Fresh marked equity samples collected while arming the baseline.
     breaker_baseline_samples: Vec<Decimal>,
@@ -792,13 +783,8 @@ pub struct Strategy {
     /// error at shutdown — otherwise the controller would restart it straight back into trading.
     trip_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     pause_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// Per-market maker-gate suppression tracking, for OBSERVABILITY: `(since_ns, reason, logged)`.
-    /// A closed maker gate (orphan hedge / unhedged-over-limit / stale snapshot / stale feed / …)
-    /// otherwise suppresses quoting with NO log and no `frozen` latch — the exact failure mode that
-    /// left a live bot dead for hours with zero signal. We record when the gate first closed; once
-    /// the closure PERSISTS past a short grace (so normal post-fill cooldowns / transient feed blips
-    /// don't spam), `logged` flips true and we emit a WARN + journal entry naming the reason. When the
-    /// gate reopens we log a RESUMED line with the duration. Pure observability — does not gate.
+    /// Maker-gate diagnostics `(since_ns, reason, logged)`: report persistent closures after
+    /// a grace period and the duration on resume. This tracking does not gate orders.
     quote_suppressed: HashMap<MarketId, (i64, &'static str, bool)>,
     /// Per-(market, side) margin-reject suppression timestamp (monotonic ns).
     /// Set when a PlaceReject contains "insufficient" (Aster -2019).
@@ -814,7 +800,7 @@ pub struct Strategy {
     gen_slots: Vec<GenSlot>,
     /// Hot-integer precheck config (built from Config at startup).
     precheck_cfg: super::precheck::HotPrecheckConfig,
-    /// Per-market Lighter mid mark cache, refreshed once per wake/tick batch to avoid O(N²)
+    /// Per-market hedge mid cache, refreshed once per wake/tick batch to avoid O(N²)
     /// book loads in `positions_reconciled` (called per-market inside `reprice_market`).
     mark_cache: HashMap<MarketId, Decimal>,
 }
@@ -1029,16 +1015,9 @@ impl Strategy {
         self.clean_start = true;
     }
 
-    /// Adopt the venue-REPORTED positions from the startup snapshot as the predicted positions.
-    /// Called once from `run.rs` after the initial reconcile published its snapshot, before the
-    /// strategy thread spawns. The predicted maps start empty and prior-session fills are never
-    /// re-attributed (client ids are session-prefixed), so after a NON-neutral restart the old
-    /// code never reached the dust-branch sync: the snapshot-predicted cross-check deferred
-    /// forever ("predicted balanced but snapshot disagrees") while `positions_reconciled` kept
-    /// the maker gate closed — quoting frozen AND the imbalance left unhedged indefinitely.
-    /// Seeding predicted from the reported snapshot lets the normal reconcile/orphan machinery
-    /// (with all its confirmation gates) take over. Requires a FRESH snapshot: if it is absent
-    /// or stale we adopt nothing, which degrades to the old freeze — never trusts stale data.
+    /// Seed predicted positions from a fresh startup snapshot before the strategy thread starts.
+    /// Prior-session fills are not replayed into prediction; adopting their reported positions
+    /// lets normal mismatch/recovery checks handle a non-neutral restart. Stale reads adopt nothing.
     pub fn adopt_reported_positions(&mut self, now_ns: i64) {
         let snap = self.account.load();
         let max_age_ns = self.cfg.live.max_account_snapshot_age_ms.saturating_mul(1_000_000);
@@ -1089,7 +1068,7 @@ impl Strategy {
         );
     }
 
-    /// Wire the Aster user-stream liveness so [`may_quote`](Self::may_quote) can freeze on a
+    /// Wire Aster user-stream liveness so the maker gate can block new quotes on a
     /// silently-dead fill stream.
     pub fn set_user_stream(&mut self, s: Arc<super::userstream::StreamLiveness>) {
         self.aster_stream = Some(s);
@@ -1176,10 +1155,7 @@ impl Strategy {
     /// Latch the hysteresis state for an empty side that just rejected on the base
     /// touch threshold. Existing orders are handled by `apply_decision` when the
     /// cancel reason is `QUOTE_TOO_CLOSE_TO_TOUCH`. The reject reason is the one the
-    /// side evaluation already computed — whenever this latch is reachable (guard not
-    /// active) that evaluation ran on the base quote config, so re-running the quote
-    /// engine here (the pre-2026-07 behavior, ~2x reprice cost in the standby state)
-    /// would produce the identical result.
+    /// side evaluation already computed on the base quote config, so no second engine call is needed.
     fn latch_empty_touch_reject_if_needed(
         &mut self,
         market: &MarketId,
@@ -1369,7 +1345,7 @@ impl Strategy {
         self.cell(market, venue).and_then(|c| c.load())
     }
 
-    /// Fresh executable Lighter quote source for immediate hedging: prefer BBO, then L2.
+    /// Fresh executable hedge quote source: prefer BBO, then L2.
     ///
     /// Uses the VenueBook monotonic stamps, not OrderBook wall-clock age, so NTP jumps
     /// cannot make stale data look fresh. The returned Arc keeps the chosen book alive
@@ -1397,7 +1373,7 @@ impl Strategy {
         None
     }
 
-    /// Fresh executable Lighter book for a known hedge quantity. BBO is trusted only when the
+    /// Fresh executable hedge book for a known quantity. BBO is trusted only when the
     /// relevant top size is materially deeper than the intended hedge; otherwise use fresh L2.
     fn fresh_hl_hedge_book(
         &self,
@@ -1439,8 +1415,7 @@ impl Strategy {
         None
     }
 
-    /// Fresh executable Lighter hot book for a known hedge quantity. This mirrors
-    /// `fresh_hl_hedge_book` but uses the prebuilt integer books and Lighter quantity lots.
+    /// Integer counterpart of `fresh_hl_hedge_book`, using the hedge venue's quantity lots.
     fn fresh_hl_hedge_hot(
         &self,
         market: &MarketId,
@@ -1644,7 +1619,7 @@ impl Strategy {
 
     /// Per-market feed freshness — the per-`(market)` analogue of the global watchdog
     /// `TradingGate`, which over-broadly halts ALL pairs when ANY single feed is stale. This
-    /// market may quote only when its Aster book is fresh and Lighter has fresh quote-touch
+    /// market may quote only when its Aster book is fresh and the hedge has fresh quote-touch
     /// data (fast BBO or L2 snapshot) AND neither side is REST-divergent,
     /// so a stale or divergent feed on one pair no longer suppresses quoting on every other
     /// pair. Connection-staleness (the watchdog's 60 s reconnect threshold) is subsumed: a
@@ -1729,7 +1704,7 @@ impl Strategy {
     /// The reason new maker quoting is currently closed for `market`, or `None` if it may quote.
     /// Builds the full [`MakerGateInputs`] and runs the canonical [`evaluate_maker_gate`] (reopen
     /// conditions and orphan-leg invariants), then the cooldown. Risk-reducing actions ignore this.
-    /// `Some(reason)` is the human-readable cause (a [`FreezeReason`] string or `"COOLDOWN"`) so a
+    /// `Some(reason)` is the human-readable cause (a [`super::risk::FreezeReason`] string or `"COOLDOWN"`) so a
     /// closure can be surfaced instead of silently stopping quotes — see
     /// [`note_quote_gate`](Self::note_quote_gate).
     fn maker_gate_reason(&self, market: &MarketId, now_ns: i64) -> Option<&'static str> {
@@ -1789,12 +1764,8 @@ impl Strategy {
         self.maker_gate_reason(market, now_ns).is_none()
     }
 
-    /// Evaluate the maker gate for `market`, LOGGING + journaling the transition so a lasting
-    /// suppression is never invisible — the failure mode where the gate closes (orphan hedge /
-    /// unhedged-over-limit / stale account snapshot / stale feed / position mismatch) and quoting
-    /// silently stops with no log and no `frozen` latch. Returns whether quoting is allowed. Logs
-    /// only on a *persistent* closure (past a short grace ≈ the normal post-trade cooldown) and on
-    /// resume, so routine cooldowns / one-tick feed blips never spam the log.
+    /// Evaluate maker admission; log/journal closures persisting past the grace period and resume.
+    /// Returns whether quoting is allowed. Routine cooldowns need not emit a closure warning.
     fn note_quote_gate(&mut self, market: &MarketId, now_ns: i64) -> bool {
         let reason = self.maker_gate_reason(market, now_ns);
         // Never log a closure shorter than this: a normal post-fill COOLDOWN (and brief feed blips)
@@ -1854,7 +1825,7 @@ impl Strategy {
         }
     }
 
-    /// Refresh the per-market Lighter mid mark cache. Called once per wake/tick batch to avoid
+    /// Refresh the per-market hedge mid cache. Called once per wake/tick batch to avoid
     /// O(N²) book loads in `positions_reconciled` (which is called per-market inside
     /// `reprice_market`, and iterates all markets internally).
     fn refresh_mark_cache(&mut self) {
@@ -1924,12 +1895,7 @@ impl Strategy {
         total_notional <= max_notional
     }
 
-    /// DIAGNOSTIC (live): log loop-liveness + the exact per-side quote decision, so a silent
-    /// no-quote state is explainable — is the maker gate closed (and why), is `compute_desired_quote`
-    /// REJECTING (and why), or is a side already resting? Called on a throttle from `run_strategy`;
-    /// read-only, never changes behaviour. If these lines stop appearing the strategy loop itself
-    /// has stalled; if they keep appearing the loop is alive and the reason field explains the
-    /// no-quote. (Added to root-cause the stuck-after-fill no-quote without a blind redeploy.)
+    /// Throttled read-only loop/quote diagnostics: gate reason, quote rejection or resting slot.
     pub fn log_quote_diag(&self, now_ns: i64) {
         for market in &self.markets {
             let decisions = self.registry.market_idx(market).map(|idx| self.gen_slots[idx.0 as usize].decisions).unwrap_or(["NOT_EVALUATED"; 2]);
@@ -2370,8 +2336,7 @@ impl Strategy {
     }
 
     /// Handle an Aster maker fill from the user stream.
-    /// Exactly-once hedging: a deduped repeat is ignored. Triggers the
-    /// post-trade cooldown and cancels the residual on that side.
+    /// Credit only previously unseen quantity, accumulate or hedge it, then apply cooldown/cancels.
     pub async fn handle_maker_fill(&mut self, fill: AsterFill, now_ns: i64) {
         if !self.orders.is_own_client_id(&fill.client_id) { return; }
         if !self.dedup.observe(&fill) { return; }
@@ -2737,19 +2702,10 @@ impl Strategy {
         self.hedges.values().any(|h| h.state.is_dangerous())
     }
 
-    /// Cumulative-loss circuit breaker. Measures TOTAL cross-venue MARKED equity
-    /// (Aster wallet+unrealized + Lighter portfolio_value + marked Lighter uPnL) against a
-    /// baseline armed from the median of the first [`BREAKER_BASELINE_SAMPLES`] fresh marked
-    /// snapshots; a drawdown beyond `live.circuit_breaker.max_cumulative_loss_usdc` must
-    /// persist for [`BREAKER_TRIP_STREAK`] consecutive fresh marked samples before tripping
-    /// (accepted trade-off: a true catastrophic drawdown trips ~4-6s later — the breaker only
-    /// cancels quotes and halts, positions stay open regardless — in exchange for immunity to
-    /// single-sample venue glitches). On trip: cancels orders via the graceful-shutdown path,
-    /// LEAVES the delta-neutral position open, writes a persistent trip latch, and stops the
-    /// XEMM engine (which then refuses to restart until reset, and returns an error so the
-    /// controller safe-halts in one step). Off the money path (cold tick), counting each
-    /// published snapshot generation at most once. NEVER trips on untrusted data (no
-    /// snapshot yet, stale snapshot, unmarked Lighter uPnL, or non-positive equity).
+    /// Compare marked cross-venue equity with the startup median baseline. A breach must persist
+    /// for [`BREAKER_TRIP_STREAK`] fresh samples; each generation counts once. Stale, unmarked
+    /// or non-positive samples are ignored. A trip initiates graceful shutdown and writes a latch;
+    /// paired positions stay open. Detection/drain time depends on the sample and worker cadence.
     fn check_circuit_breaker(&mut self, now_ns: i64) {
         if !self.cfg.live.circuit_breaker.enabled || self.breaker_tripped {
             return;

@@ -1,4 +1,4 @@
-//! Stream-staleness watchdog. A dedicated OS thread scans every [`VenueBook`]'s
+//! Stream-staleness watchdog. A dedicated OS thread scans every [`super::book_cell::VenueBook`]'s
 //! liveness stamp; when a stream goes silent (a half-open socket that never sent a
 //! Close frame) it (a) asks that reader to drop and reconnect via a lock-free
 //! [`ReconnectHandle`], and (b) closes a [`TradingGate`], which only drives the

@@ -3,7 +3,8 @@
 # XEMM edge of the sweep, the gate's percentile), so the report can be re-run on the same data
 # with anything that asks no less: the other tier, other latencies, a higher margin, percentile or
 # XEMM edge. It refuses the rest (depth, gate window, a lower percentile...) for data recorded before.
-# The [report] defaults mirror LIGHTER_ASTER_BOT/bot.toml as of 2026-09-26 (keys named per value).
+# Bot-derived values reference LIGHTER_ASTER_BOT/bot.toml as of 2026-09-26; latency values are
+# replay scenarios, and reverse-maker routes are exploratory (see README.md, Known limits).
 
 [collect]
 min_volume_usd = 200000   # 24 h quote volume required on BOTH venues (157-163 pairs on 2026-09-26)

@@ -2,13 +2,13 @@
 //! listenKey lifecycle (POST create / PUT keepalive / DELETE only on graceful shutdown, with
 //! the documented gotchas: no PUT right after POST; reuse-not-recreate on reconnect), connects
 //! the WS, parses `ORDER_TRADE_UPDATE` fills into [`AsterFill`]s, and forwards them to the
-//! strategy. The strategy's [`FillDedup`](super::fills::FillDedup) is the authoritative
-//! exactly-once guard, so a repeated/out-of-order event can never double-hedge.
+//! strategy. [`FillDedup`](super::fills::FillDedup) and the strategy's cumulative quantity
+//! coverage prevent repeated events from crediting the same maker quantity again.
 //!
 //! The position reconciler ([`super::reconcile`]) is the REST safeguard behind this stream: a
 //! fill the stream somehow misses surfaces as a reported-vs-predicted position delta, which the
 //! strategy's `recover_orphans` backstop then actively hedges/flattens (not merely freezes).
-//! This is the EXCEPTIONAL path — in normal operation every fill is hedged fast off this stream.
+//! Sub-minimum fills can accumulate before hedging; unresolved attempts remain reserved.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -317,7 +317,7 @@ enum UserFrame<'a> {
 
 /// Classify a user-stream frame with a single full parse. Frames whose fields clash with
 /// [`AsterTradeUpdate`]'s types (foreign event shapes) fall back to a bare type-tag probe so
-/// `listenKeyExpired` is never missed, whatever shape it arrives in.
+/// recognized `listenKeyExpired` frames still take the expiry path.
 fn classify_user_frame(text: &str) -> UserFrame<'_> {
     match serde_json::from_str::<AsterTradeUpdate<'_>>(text) {
         Ok(update) => match update.event_type {

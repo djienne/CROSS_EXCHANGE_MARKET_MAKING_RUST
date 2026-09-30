@@ -14,7 +14,7 @@ runs apart from the bot, with its own crate, image, container and data.
   - **XEMM:** a trade that could have filled a quote at the lowest edge scored (5 bps), with the
     second before it (what the quote was priced from);
   - each moment keeps two seconds after it (where latency-delayed orders fill).
-- **`report`** replays the bot's rules on those moments and ranks the pairs.
+- **`report`** applies a simplified model of the bot's rules and ranks the pairs.
   - **Taker-taker:** the entry gate, cooldown, inventory cap and each leg's latency.
   - **XEMM:** the quote price, a fill only when trades print through the quote (those of one ms
     add up), the hedge latency and the distance gate (skipped behind a maker top thinner than the
@@ -37,9 +37,10 @@ scales), prices within 2%, and at least $200k 24 h volume on both venues. The 10
 are excluded. Pairs refresh at UTC midnight. A venue unavailable then (or at boot) leaves the
 combination of the other two running, is retried every 5 minutes, and rejoins in a new run as soon
 as it answers. A silent connection is dropped after 30 s and its books are unknown until it
-returns, within 5 s of the network: an outage records a gap, except its first 30 s, which keep the
+returns. Reconnect backoff is capped at 5 s, with connection/subscription time added: an outage records a gap, except its first 30 s, which keep the
 last prices (a 60 s cut, 2026-09-26: 33 s down, every pair back within seconds). After a reboot
-or a crash, Docker restarts the container (`unless-stopped`); a kill loses at most the last 30 s.
+or a crash, Docker restarts the container (`unless-stopped`). The writer flushes every 30 s;
+an unclean stop can lose queued or unflushed data.
 
 Hyperliquid uses public `bbo`, `l2Book` and `trades`. BBO gives the faster touch; L2 confirms an
 unchanged book. `l2Book` is subscribed `fast` (5 levels, every ~0.54 s instead of 20 every ~5.4 s;
@@ -60,7 +61,8 @@ docker compose run --rm report --latency 2          # sensitivity: every latency
 
 `report` is its own service (profile `report`, never started by `up`): it holds every recorded
 state of the days it scores in memory, ~75 bytes a row: ~1 GB a day at the three-venue rate below
-(0.4 GB for Aster-Lighter alone), so its 8 GB cap holds about a week.
+(0.4 GB for Aster-Lighter alone). Parsing/replay buffers add to peak memory, so the history
+that fits under the 8 GB cap varies with market activity.
 
 ## Reading the report
 
@@ -76,7 +78,8 @@ state of the days it scores in memory, ~75 bytes a row: ~1 GB a day at the three
 - **Exploratory sweeps.** `sweep0` / `sweep1` choose the best required edge (`req`) on these same
   data without the distance gate. These fitted results are displayed separately from the ranking.
 - **Comparison.** Use the same complete UTC dates (`--since` / `--until`), after warmup, with at
-  least seven concurrent days before deciding whether Hyperliquid merits bot support. Compare
+  least seven concurrent days as an initial route-review window; this does not establish rank
+  stability or profitability. Hyperliquid trading is already supported. Compare
   `--latency 0.5`, `1`, and `2`, and Standard/Premium Lighter. Routes are alternatives, not additive
   portfolio profits. Day-to-day rank correlation needs at least two days.
 
@@ -96,8 +99,8 @@ or trading connector is imported.
 ## Known limits
 
 - **Top of book only.** Top of book stands in for the bot's VWAP over 10× the clip; moments with
-  less than that at the top are skipped. For a pair worth trading, record its full depth
-  (`LIGHTER_ASTER_BOT`, `record --market <X>`) and replay precisely.
+  less than that at the top are skipped. The bot's `record` command can collect full depth for
+  Aster/Lighter candidates; it does not yet record Hyperliquid routes.
 - **The gate.** The gate's samples are counted in 0.25 bps bins, from the pair's required edge at
   the cheaper Lighter tier, and it reads whole 5-minute windows: it opens within a bin of the bot's,
   a window later. At the Premium tier its samples are the Standard ones above Premium's edge. The
@@ -108,13 +111,16 @@ or trading connector is imported.
   event times. Venue/feed delays need not cancel; neither ping RTT nor an old local model
   establishes order execution latency. Measured 2026-09-27, venue timestamp to arrival (median /
   p99): Aster book 145 / 239 ms, Lighter trades 214 / 568 ms, Hyperliquid bbo 361 / 682 ms. So a
-  Hyperliquid leg is ~0.2 s staler than an Aster one, whatever the host. Two connections can also
+  Hyperliquid BBO arrived ~0.2 s later than Aster's book in that host's sample; exchange clock
+  differences also enter this comparison. Two connections can
   receive the same Hyperliquid frame up to seconds apart. Small Hyperliquid taker edges may be
   partly this lag. The fills at the latency charge for it only in part. Aster also sends each trade
   ~150 ms after the book change it made (Lighter and Hyperliquid send them together), so the
   report moves Aster prints back by `aster_print_delay_ms` before pricing and hedging XEMM fills.
   That is a median: the delay varies by print (aggTrade E − T is 186 ms at the median, 25–50 ms
   for ~13%), so some prints are moved back too far.
+- **XEMM scope.** The bot makes only on Aster. Reverse-maker and Lighter/Hyperliquid maker
+  rankings are exploratory models.
 - **XEMM fills.** XEMM ignores queue position (a fill needs a trade *through* the quote) and our
   own market impact. A held fill's correction is priced when the hedge would have filled, not 6 s
   later (the recording ends 2 s after a print), and an opposite fill that nets it meanwhile is not
@@ -129,8 +135,8 @@ or trading connector is imported.
 or when a venue missing at discovery answers).
 Each file is zstd-compressed tab-separated lines, with the formats in `src/collect.rs`.
 Version 2 uses venue-qualified keys and two-second tails. Existing Aster-Lighter files remain
-readable without migration; their one-second tails still limit their own replay settings. A kill
-loses at most the last 30 s. A new run reads the last 72 h of summaries back for its gate.
+readable without migration; their one-second tails still limit their own replay settings.
+A new run reads the last 72 h of summaries back for its gate.
 
 With Hyperliquid, files take ~60 MB a day for ~155 pairs (18:03–20:07 UTC on 2026-09-26; twice
 that in the first hours, while the new pairs' gates warmed up at their floors). Aster-Lighter

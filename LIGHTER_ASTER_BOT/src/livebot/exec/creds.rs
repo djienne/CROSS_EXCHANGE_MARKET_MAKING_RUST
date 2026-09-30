@@ -1,4 +1,4 @@
-//! Credential loading. Live trading reads the `aster.env` / `lighter.env` dotenv files of
+//! Credential loading. Live trading reads the per-venue dotenv files returned by
 //! [`env_files`]; a dry run signs with a fixed identity instead ([`venue_creds`]).
 //!
 //! These files contain real private keys in plaintext — they MUST be gitignored and never

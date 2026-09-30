@@ -1,11 +1,8 @@
-//! Aster fill detection → Lighter hedge state machine.
+//! Aster fill deduplication and hedge-attempt state machine.
 //!
-//! The single most important live-safety property: **every Aster fill is hedged exactly
-//! once, even if the fill event is delivered more than once**. Aster's user stream can repeat
-//! `ORDER_TRADE_UPDATE`s, so we dedup on `(order_id, trade_id)` — with a
-//! `(order_id, cumulative_filled_qty)` fallback when the trade id is missing — and key each
-//! hedge attempt on a deterministic cloid, so an attempt whose outcome is unknown is looked up
-//! in Lighter's order history instead of sent again.
+//! Repeated events dedup by `(order_id, trade_id)`, with cumulative quantity as fallback.
+//! The strategy also tracks credited quantity and accumulates sub-minimum fills. Each hedge
+//! attempt retains its identity; an unknown outcome needs terminal evidence before retry.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -198,8 +195,7 @@ impl HedgeState {
     }
 }
 
-/// One hedge obligation created from an Aster fill. Its cloid finds the attempt in Lighter's
-/// order history when the send's outcome is unknown.
+/// One obligation from an Aster fill; its cloid identifies the attempt on either hedge venue.
 #[derive(Debug, Clone)]
 pub struct HedgeIntent {
     pub cloid: Cloid,
@@ -218,7 +214,7 @@ pub struct HedgeIntent {
     pub event_time_ms: Option<i64>,
     pub book_source: Option<&'static str>,
     pub book_age_ms: Option<i64>,
-    /// Execution side: the Lighter hedge side (opposite the Aster fill), or the closing side
+    /// Execution side: the hedge side (opposite the Aster fill), or the closing side
     /// of an Aster flatten.
     pub hedge_side: Side,
     pub qty: Decimal,
@@ -227,7 +223,7 @@ pub struct HedgeIntent {
     pub state: HedgeState,
     pub created_ns: i64,
     pub submitted_ns: Option<i64>,
-    /// Venue order id once known (Lighter order index, or Aster orderId for a flatten).
+    /// Venue-assigned order id once known, including an Aster flatten's id.
     pub hl_oid: Option<String>,
     /// Quantity actually hedged so far (for partial handling).
     pub filled_qty: Decimal,

@@ -97,8 +97,8 @@ pub struct LighterAccountSnapshot {
 }
 
 impl LighterAccountSnapshot {
-    /// Marked equity: the collateral-style account value PLUS venue-reported uPnL (the
-    /// 733ba55 marked-equity composition); `None` when either part is unavailable.
+    /// Marked equity: collateral-style account value plus venue-reported uPnL;
+    /// `None` when either part is unavailable.
     pub fn equity_usdc(&self) -> Option<Decimal> {
         match (self.account_value_usdc, self.unrealized_pnl_usdc) {
             (Some(value), Some(upnl)) => Some(value + upnl),
@@ -1777,13 +1777,9 @@ fn raw_price(px: Decimal, decimals: u32, side: Side) -> Result<i32> {
     Ok(raw)
 }
 
-/// Layout: 40 bits wall-clock ms | 7-bit counter | side bit. Collision-free ONLY within a
-/// single process on one account (assumption: one submitting process per account at a time —
-/// under `run` the taker submits only under XEMM's lease, while XEMM has nothing resting or in
-/// flight; other live writers are refused by the market lock). Within a process, two ids collide
-/// only if the 7-bit counter wraps inside one millisecond; the wrap guard below spins to
-/// the next millisecond instead (128+ orders per ms never happens in practice — this is a
-/// correctness backstop, not a hot path).
+/// Layout: 40 wall-clock ms bits | 7-bit counter | side bit. The wrap guard waits for a new
+/// millisecond after 128 ids. Counters are process-local; this assumes one submitting process
+/// per account. Market/leg locks coordinate the same instruments, not all markets on an account.
 fn random_client_order_index(_market: &MarketId, side: Side) -> i64 {
     let now_ms = || {
         SystemTime::now()

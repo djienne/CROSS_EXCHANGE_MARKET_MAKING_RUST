@@ -1,9 +1,6 @@
-//! Account/position reconciler. Reads both venues (signed Aster REST; Lighter account
-//! and active orders from the WS account cache when fresh, else REST) and assembles an [`AccountSnapshot`] of the REAL
-//! positions. This module only READS + PUBLISHES the truth; the strategy's `recover_orphans`
-//! (on the cold tick) is what ACTS on it — actively hedging or flattening any persistent net
-//! delta a missed/dropped/rejected hedge left behind, and folding the reported positions back
-//! into the predicted state. Runs once at startup (to gate clean-start) and then on a cold loop.
+//! Account/position observations: signed Aster REST, fresh Lighter account cache with REST
+//! fallback, or Hyperliquid REST. Publishes [`AccountSnapshot`] at startup and periodically.
+//! The strategy confirms persistent residuals before recovery; this module submits no orders.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -152,11 +149,8 @@ fn fold_aster_position_rows(
     Ok((unrealized_usd, net))
 }
 
-/// Σ signed unrealized PnL over the Lighter positions, and whether EVERY nonzero position
-/// was trustworthily marked (mark present AND `entry_px > 0`). An unmarked or entry-less
-/// position contributes ZERO and flips the flag false — never an error: the breaker skips
-/// unmarked samples, while computing with a garbage entry (0 ⇒ full notional as "uPnL")
-/// could fake or mask a real loss in either direction.
+/// Additional hedge uPnL and mark validity. Missing marks or non-positive entries contribute
+/// zero and invalidate the sample; Hyperliquid entry-price marks avoid double-counting its uPnL.
 fn fold_hl_unrealized(
     positions: &[ScaledPosition],
     marks: &HashMap<MarketId, Decimal>,
@@ -198,7 +192,7 @@ pub struct Reconciler {
     hl: HedgeAccount,
     /// Aster UPPER symbol → market id.
     aster_sym_to_market: HashMap<String, MarketId>,
-    /// Lighter symbol → market id.
+    /// Hedge coin → market id.
     hl_coin_to_market: HashMap<String, MarketId>,
     /// Max age (ms) of a cached Lighter book mid used to mark the Lighter leg's uPnL —
     /// same freshness bound the strategy requires of a Lighter book before quoting.
@@ -288,18 +282,16 @@ impl Reconciler {
         );
         let (bal, pos, oo, ch, hloo, aster_available_usd) = (bal?, pos?, oo?, ch?, hloo?, available?);
 
-        // Aster available USD = the NET wallet balance across USD-pegged rows (`balance`),
-        // NOT `availableBalance` (an inflated cross-margin projection). SIGNED sum: a
-        // negative stablecoin row is real debt (see `fold_aster_balance_rows`). Junk rows
-        // are skip-with-warn (understating equity trips the breaker EARLY — fail-safe).
+        // Wallet equity uses the signed stablecoin balance sum (negative rows are debt).
+        // Free margin above comes from /fapi/v3/account's account-level availableBalance;
+        // per-asset availableBalance projections must not be summed.
         let aster_wallet_usd = fold_aster_balance_rows(&bal);
         let hl_withdrawable_usd = parse_decimal_field(&ch.withdrawable, "lighter.withdrawable")?;
 
         // TOTAL (mark-to-market) equity per venue for the circuit breaker — NOT the free-margin
         // figures above, which drop by the locked margin when a hedge is open and would false-trip.
-        // Aster: wallet balance + Σ position unrealized PnL. Lighter: portfolio value, which does
-        // NOT move with open-position uPnL; the marked uPnL is added below. For a delta-neutral
-        // book the unrealized legs cancel ⇒ stable equity.
+        // Aster: wallet + position uPnL. Lighter needs uPnL added below;
+        // Hyperliquid's accountValue already includes it.
         let (aster_unrealized_usd, aster_net) =
             fold_aster_position_rows(&pos, &self.aster_sym_to_market)?;
         let aster_equity_usd = aster_wallet_usd + aster_unrealized_usd;
@@ -329,10 +321,7 @@ impl Reconciler {
             });
         }
 
-        // Mark the Lighter leg: `portfolio_value` above is collateral-style (it does NOT
-        // move with open-position uPnL — observed frozen for 41h while the leg's uPnL
-        // moved $8), so without this the combined equity bleeds 1:1 with price on a
-        // delta-neutral book and false-trips the breaker (2026-07-04 incident).
+        // Add marked uPnL only when the hedge account value excludes it.
         let mut hl_marks: HashMap<MarketId, Decimal> = HashMap::new();
         // Hyperliquid's accountValue already moves with the uPnL: its legs count at their entry.
         let upnl_in_equity = matches!(self.hl, HedgeAccount::Hyperliquid(_));

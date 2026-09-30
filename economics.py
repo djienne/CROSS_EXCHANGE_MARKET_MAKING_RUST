@@ -24,8 +24,8 @@ def optional_decimal(raw: Any) -> Decimal | None:
         return None
 
 def parse_timestamp(value: Any) -> datetime | None:
-    """ISO-8601 text as aware UTC. Rust writes nanosecond fractions, which Python < 3.11
-    rejects, so they are trimmed to microseconds; naive times are UTC."""
+    """ISO-8601 text as aware UTC. Trim Rust's nanosecond fractions to Python's
+    microsecond precision; interpret naive times as UTC."""
     if not isinstance(value, str):
         return None
     try:

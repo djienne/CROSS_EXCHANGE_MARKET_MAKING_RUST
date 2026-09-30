@@ -1,7 +1,8 @@
 //! TOML configuration. Decimal-bearing fields are quoted strings (the
 //! `rust_decimal` `serde-str` feature parses them). The pure-config structs from
 //! `edge`/`quote_engine` are reused directly; this module adds the capital,
-//! book-check, live and market sections.
+//! book-check, live and market sections. "Default" below means the serde fallback when
+//! a key is absent; shipped bot.toml values may override it.
 
 use anyhow::{bail, Context, Result};
 use rust_decimal::Decimal;
@@ -62,7 +63,7 @@ impl CapitalCfg {
     pub fn aster_cap_notional(&self) -> Decimal {
         self.aster_capital_usd * self.leverage
     }
-    /// Max position notional allowed on the Lighter hedge leg.
+    /// Max position notional allowed on the hedge leg.
     pub fn lighter_cap_notional(&self) -> Decimal {
         self.lighter_capital_usd * self.leverage
     }
@@ -137,7 +138,7 @@ impl Default for BookCheckCfg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LiveMode {
-    /// Real signed orders on Aster + Lighter. Real funds. Hard-gated.
+    /// Real signed orders on the selected route's two venues.
     Live,
     /// The simulated venues of `dryrun`, fed by live market data, and a dry-run identity no
     /// venue knows: nothing can reach a real account.
@@ -161,12 +162,11 @@ impl LiveMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PartialPolicy {
-    /// Only trade markets where the smallest possible Aster fill is itself Lighter-hedgeable;
+    /// Only trade markets where the smallest possible Aster fill is itself hedgeable;
     /// reject every other pair. The safe first-live default.
     #[default]
     StrictEveryFillMustBeHedgeable,
-    /// Accumulate sub-min fills into pending inventory and hedge once it clears the Lighter
-    /// minimum. More permissive; only after strict mode is proven.
+    /// Accumulate sub-min fills until net inventory clears the hedge venue's minimum.
     AccumulateSubMin,
 }
 
@@ -256,7 +256,7 @@ pub struct LiveQuoteCfg {
     /// Use scaled-integer tick/lot math on the quote hot path. Default true.
     #[serde(default = "default_true")]
     pub use_hot_integer_math: bool,
-    /// Only place maker quotes whose paired Aster fill + Lighter hedge reduces absolute
+    /// Only place maker quotes whose paired Aster fill + hedge reduces absolute
     /// cross-venue inventory. Default true for live inventory unwind mode.
     #[serde(default = "default_true")]
     pub reduce_position_only: bool,
@@ -306,7 +306,7 @@ pub struct LivePartialsCfg {
     /// Accumulation age cap (ms). Default 0 (strict).
     #[serde(default)]
     pub max_pending_age_ms: i64,
-    /// Lighter's minimum order notional (USD): the smallest hedge the pair can send. Default "10".
+    /// Hedge venue's minimum opening notional (USD). Default "10"; reduce-only exceptions differ.
     #[serde(default = "default_lighter_min_notional")]
     pub lighter_min_notional: Decimal,
 }
@@ -445,7 +445,7 @@ impl Default for LiveLighterCfg {
 }
 
 /// Cumulative-loss circuit breaker. When enabled, the strategy tracks total
-/// cross-venue marked equity (Aster wallet + unrealized, Lighter portfolio value + marked uPnL)
+/// cross-venue marked equity (Aster wallet + uPnL, hedge equity including uPnL once)
 /// against a baseline = the median of the first 5 fresh samples. A drawdown beyond
 /// `max_cumulative_loss_usdc` on 3 consecutive fresh samples cancels orders, leaves the
 /// (delta-neutral) position open, writes a persistent trip-latch file, and halts. The bot then

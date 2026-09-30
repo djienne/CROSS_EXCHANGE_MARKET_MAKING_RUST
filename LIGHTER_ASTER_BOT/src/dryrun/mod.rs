@@ -1,9 +1,8 @@
-//! Dry-run mode: the unchanged live bot trades against an in-process simulation of Aster and
-//! its hedge venue (Lighter, or Hyperliquid) as a bot in AWS Tokyo would see them.
+//! Dry-run mode: the bot trades its selected route against two in-process simulated venues.
 //!
 //! The simulated world is the real one delayed by a constant shift D: real feed events are
-//! replayed D late, so this host's own feed lag (Europe) is hidden and the latency a Tokyo bot
-//! would pay is modelled explicitly. `matching` is the venues' deterministic core; `book` holds
+//! replayed D late to absorb host feed lag; configured request/feed delays model a Tokyo scenario.
+//! `matching` is the venues' deterministic core; `book` holds
 //! the replica each market trades against; `account` settles the money; `clock` draws the
 //! latencies; `feed` brings the real market in; `server` speaks HTTP and WebSocket on
 //! loopback, and `aster`, `lighter` and `hyperliquid` speak each venue's protocol on top of
@@ -297,10 +296,10 @@ pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::
     Ok(venues)
 }
 
-/// How often the simulated venues' state is saved, and the diagnostics reported.
-/// A kill loses at most this much of the venues' history (the state is written only when it
-/// changed, and it is small).
+/// Save cadence for changed venue state. An unclean stop loses changes since the last
+/// successful save; scheduling and storage latency can lengthen that interval.
 const SAVE_EVERY: Duration = Duration::from_secs(1);
+/// Diagnostic reporting cadence.
 const REPORT_EVERY: Duration = Duration::from_secs(60);
 
 /// A dry run's own files in its runs directory: the simulated venues' state, which the next

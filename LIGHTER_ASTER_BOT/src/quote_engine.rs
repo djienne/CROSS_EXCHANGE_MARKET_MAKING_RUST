@@ -1,5 +1,5 @@
 //! Compute the desired Aster maker quote for one side, priced backward from the
-//! Lighter hedge, with an unconditional post-only cap that is re-asserted after tick
+//! configured hedge venue, with an unconditional post-only cap re-asserted after tick
 //! rounding, plus staleness / crossed / min-qty / min-notional gates.
 
 use chrono::{DateTime, Utc};
@@ -20,7 +20,7 @@ pub struct QuoteEngineConfig {
     pub desired_notional: Decimal,
     pub max_quote_distance_bps: Decimal,
     /// Minimum distance from Aster's own touch. Prevents quote placement right next to
-    /// a thin/fake Aster BBO even when the cross-venue edge math says the quote is profitable.
+    /// a thin Aster BBO even when the cross-venue edge math says the quote is profitable.
     #[serde(default)]
     pub min_aster_touch_distance_bps: Decimal,
     /// Extra clearance required only after the live strategy has tripped the Aster touch
@@ -34,7 +34,7 @@ pub struct QuoteEngineConfig {
     #[serde(default = "default_max_aster_touch_hysteresis_ms")]
     pub max_aster_touch_hysteresis_ms: i64,
     /// Visible depth multiple required when pricing quote safety. Example: 10.0 means
-    /// a 0.20 HYPE quote prices the Lighter hedge and Aster effective touch using
+    /// a 0.20 HYPE quote prices the hedge and Aster effective touch using
     /// at least 2.0 HYPE of visible book depth.
     #[serde(default = "default_depth_liquidity_multiple")]
     #[serde(alias = "min_hl_bbo_depth_multiple")]
@@ -119,12 +119,12 @@ pub struct DesiredQuote {
 pub struct PositionContext {
     /// Signed Aster maker-leg position (+ long, − short).
     pub aster_pos_qty: Decimal,
-    /// Signed Lighter hedge-leg position (+ long, − short).
+    /// Signed hedge-leg position (+ long, − short).
     pub hl_pos_qty: Decimal,
     pub aster_cap_notional: Decimal,
     pub hl_cap_notional: Decimal,
     pub enforce: bool,
-    /// When true, reject any candidate whose paired Aster fill + Lighter hedge would not reduce
+    /// When true, reject any candidate whose paired Aster fill + hedge would not reduce
     /// absolute cross-venue inventory.
     pub reduce_position_only: bool,
 }

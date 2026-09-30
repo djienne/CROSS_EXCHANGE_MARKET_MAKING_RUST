@@ -1,23 +1,16 @@
-//! Deterministic client IDs: every order carries an id we can recompute and query by, so
-//! an attempt whose outcome is unknown can ask the venue "did this fill?".
+//! Deterministic client ids for querying an attempt whose outcome is unknown.
 //!
-//! - **Aster maker client id**: `X{session}-{market}-{B|S}-{epoch}` — unique per quote,
-//!   kept inside Aster's `newClientOrderId` charset/length budget (Binance-style
-//!   `^[A-Za-z0-9_:/.\-]{1,36}$`). Maker ids need not survive a restart (startup cancels
-//!   all Aster orders), only be unique within a session.
-//! - **Lighter hedge cloid** (a Hyperliquid-era name): a 128-bit id per hedge attempt, from
-//!   `(session, market, attempt epoch)`, whose `client_order_index` finds the order in
-//!   Lighter's history. It does not survive a restart, and needs not: live refuses to start
-//!   after an unclean session until it is reviewed, and within a session the fill ledger
-//!   keeps a fill from being hedged twice.
-//!
-//! Hashing is a tiny inline FNV-1a (no new dependency, and stable across toolchains —
-//! `std`'s `DefaultHasher` is explicitly NOT stable, so it must not be used here).
+//! - Aster maker id: `X{session}-{market}-{B|S}-{epoch}`, clamped to the venue's 36-character
+//!   budget. Session, side and epoch distinguish normal quote attempts.
+//! - Hedge cloid: a 128-bit hash of `(session, market, attempt epoch)`, submitted directly
+//!   to Hyperliquid or mapped to Lighter's 48-bit `client_order_index`.
+//! Prior-session identities remain in journals; live restart blocks on unresolved sessions.
+//! FNV-1a is stable across toolchains, unlike `std::hash::DefaultHasher`.
 
 use crate::types::{MarketId, Side};
 
-/// 64-bit FNV-1a over bytes with a caller-chosen offset basis (varying the basis gives an
-/// independent hash for packing >64 bits). Stable forever by construction.
+/// Stable 64-bit FNV-1a. A second offset basis supplies the high half of the hedge id;
+/// the two halves are not statistically independent hashes.
 fn fnv1a64(bytes: &[u8], mut hash: u64) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     for &b in bytes {
@@ -31,13 +24,12 @@ const FNV_BASIS_A: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_BASIS_B: u64 = 0x1099_5163_2d4b_c7e1; // a distinct basis for the high 64 bits
 pub const LIGHTER_MAX_CLIENT_ORDER_INDEX: i64 = 281_474_976_710_655; // 2^48 - 1
 
-/// A short per-process session tag for maker order ids. Derived from a UUID so it is
-/// unique per run; truncated to keep order ids short.
+/// Per-process maker tag from a UUID's low 64 bits, encoded in base36.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionId(String);
 
 impl SessionId {
-    /// A fresh 6-char base36 session tag from a v4 UUID's low bits.
+    /// Fresh base36 tag from a v4 UUID's low bits, padded to at least 6 chars (up to 13).
     pub fn random() -> Self {
         let u = uuid::Uuid::new_v4();
         let n = u128::from_le_bytes(*u.as_bytes()) as u64;
@@ -85,7 +77,7 @@ pub fn aster_flatten_client_id(session: &SessionId, market: &MarketId, epoch: u6
 }
 
 /// Aster maker `newClientOrderId`. `quote_epoch` is a per-(market,side) monotonic counter
-/// the order-state layer increments on each new quote, guaranteeing uniqueness. Form:
+/// the order-state layer increments on each new quote. Form:
 /// `X{session}-{MARKET}-{B|S}-{epoch36}` — always within the 36-char / charset budget.
 pub fn aster_client_id(session: &SessionId, market: &MarketId, side: Side, quote_epoch: u64) -> String {
     let s = format!(

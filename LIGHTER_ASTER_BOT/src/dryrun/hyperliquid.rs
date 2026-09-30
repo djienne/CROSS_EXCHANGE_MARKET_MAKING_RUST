@@ -227,7 +227,7 @@ impl Handler for Hyperliquid {
         }
     }
 
-    /// Public streams, as a Tokyo bot receives them.
+    /// Public streams on the shifted simulation clock with configured feed latency.
     async fn websocket(&self, lane: u64, _request: server::Request, mut ws: WebSocketStream<TcpStream>) {
         let mut follower = self.venues.follower(Venue::Hyperliquid, lane, false);
         loop {

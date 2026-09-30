@@ -1,8 +1,8 @@
-# One Lighter/Aster bot for one market: the Aster-maker / Lighter-hedge engine ([maker],
+# One bot for one market: on Aster routes, the maker / hedge engine ([maker],
 # "XEMM") quotes, and when an arbitrage passes the taker-taker engine's entry gate ([taker]),
 # XEMM pulls its quotes and the taker trades, then XEMM quotes again. [controller] holds the
 # cross-engine loss stop. Every key is checked at startup; an unknown or misplaced key fails
-# the load.
+# the load. Lighter/Hyperliquid routes run [taker] alone.
 #
 # Run with (the mode is a command-line choice only):
 #   lighter_aster_bot run --config bot.toml --market HYPE --mode live
@@ -141,7 +141,7 @@ max_quote_distance_bps       = "50"
 min_aster_touch_distance_bps = "18.0"
 min_aster_touch_hysteresis_bps = "1.0" # re-arm at 19 bps
 max_aster_touch_hysteresis_ms = 300000 # after 5m, fall back to the 18 bps base guard
-depth_liquidity_multiple           = "10.0" # require 10x quote qty in visible depth for Lighter hedge VWAP and Aster effective touch
+depth_liquidity_multiple           = "10.0" # require 10x quote qty for hedge VWAP and Aster effective touch
 max_hedge_slippage_bps       = "5.0"
 price_change_ticks_to_requote = 2
 clamp_to_min_lot             = true
@@ -182,7 +182,7 @@ cancel_all_on_user_stream_stale = true
 [maker.live.quote]
 use_hot_integer_math               = true
 # false: quote both sides, each fill hedged at once (Hummingbot's XEMM), within [maker.capital].
-# true: once cross-venue inventory exists, only post the side whose Lighter hedge reduces it.
+# true: once cross-venue inventory exists, only post the side whose hedge reduces it.
 reduce_position_only               = false
 replace_immediately_if_unprofitable = true
 min_requote_interval_ms            = 150
@@ -192,7 +192,8 @@ max_replaces_per_minute_per_symbol = 100
 
 [maker.live.partials]
 # Accumulate sub-minimum maker fills until hedgeable. Expired/oversized residuals
-# enter tracked, rounded-down reduce-only correction (at most two attempts).
+# enter tracked reduce-only correction (at most two attempts). Hyperliquid sizing may round
+# up to its minimum or full position; position-confirmed excess is reduced on the other leg.
 # Quantization remainders and ambiguous orders remain reserved and explicit.
 policy                  = "accumulate_sub_min"
 max_pending_notional_usd = "15"
@@ -227,8 +228,8 @@ aster_safety_buffer_usd = "26"
 lighter_safety_buffer_usd = "26"
 
 [maker.live.circuit_breaker]
-# Unattended-run safety stop. Measures TOTAL cross-venue marked equity (Aster wallet+unrealized + Lighter
-# portfolio value + marked uPnL) vs a baseline = median of the first 5 fresh samples; if the drawdown
+# Unattended-run safety stop. Measures cross-venue equity with each leg's uPnL included once
+# vs a baseline = median of the first 5 fresh samples; if the drawdown
 # exceeds the limit on 3 consecutive fresh samples the bot cancels orders, LEAVES the delta-neutral
 # position open, writes runs/bot-<MARKET>.trip.json, and halts. It then REFUSES to restart until the
 # latch is cleared:  python scripts/reset_breaker.py --coin <MARKET> --archive
@@ -255,8 +256,8 @@ aster_symbol = "ETHUSDT"
 lighter_symbol      = "ETH"
 
 # `--mode dry-run`: the same bot, signing with a dry-run identity no venue knows, against its
-# market's two venues simulated on loopback. Live market data feeds them as a bot in AWS
-# Tokyo (ap-northeast-1) would see it; files go to runs/dry-run/. Latencies are [p50, p99] ms,
+# market's two venues simulated on loopback. Live feeds and configured latency assumptions
+# model a Tokyo scenario; files go to runs/dry-run/. Latencies are [p50, p99] ms,
 # drawn lognormal. Fees and leverage are the engines' own keys above.
 [dry_run]
 # The simulated world is the real one delayed by shift_ms. Every frame must reach this host in

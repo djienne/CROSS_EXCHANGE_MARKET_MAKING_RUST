@@ -184,9 +184,8 @@ fn confirmation(client_order_index: i64, fills: &[Value]) -> LighterFillConfirma
     LighterFillConfirmation { fee_evidence, fill, terminal_order: Some(order), filled_qty: qty }
 }
 
-/// The latest `l2Book` snapshot (~5 s apart) under the newer `bbo` top (pushed on change), as
-/// the Aster feed lays its bookTicker over depth20. The levels behind the top are as old as the
-/// snapshot, so the depth guard may count liquidity up to ~5 s old; the IOC's bound caps the price.
+/// Fast five-level `l2Book` snapshots under a newer `bbo` top. HYPE snapshots were ~0.54 s
+/// apart on 2026-09-28; deeper levels retain their snapshot age. The IOC bound caps fill price.
 #[derive(Default)]
 struct Book {
     /// The last snapshot and the newer top, if any.

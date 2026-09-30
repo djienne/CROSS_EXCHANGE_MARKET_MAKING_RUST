@@ -323,7 +323,7 @@ impl AsterRest {
             .ok_or_else(|| anyhow!("no listenKey in response: {body}"))
     }
 
-    /// Keep the listenKey alive (`PUT /fapi/v3/listenKey`, no params). ~30-min cadence.
+    /// Keep the listenKey alive (`PUT /fapi/v3/listenKey`, no params); userstream calls every 25 min.
     pub async fn keepalive_listen_key(&self) -> Result<()> {
         self.signed_request(Method::PUT, ASTER_LISTEN_KEY_PATH, vec![])
             .await
@@ -558,7 +558,7 @@ fn classify_amend(client_id: String, outcome: Result<String>) -> ExecEvent {
 }
 
 /// Classify a `/fapi/v3/order` POST response body into a place lifecycle event. A GTX order that
-/// would cross rests as `EXPIRED` (treat as a reject → re-quote, not an error). Only a clean
+/// would cross ends as `EXPIRED` (treat as a reject → re-quote, not an error). Only a clean
 /// `NEW` response is a safe resting-order ack. `FILLED`/`PARTIALLY_FILLED`, malformed success
 /// bodies, and missing `orderId` are ambiguous: an order may have existed and moved inventory
 /// before the user stream reported it, so freeze+sweep via `PlaceUnknown` instead of silently

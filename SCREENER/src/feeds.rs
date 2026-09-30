@@ -1,5 +1,5 @@
 //! The venues' public websockets, followed until stopped: connect and write timeouts, a silence
-//! watchdog, keepalive pings, reconnects within 5 s of the network returning, and subscriptions
+//! watchdog, keepalive pings, reconnect backoff capped at 5 s, and subscriptions
 //! paced under Lighter's limit of 200 sent messages a minute.
 
 use std::time::{Duration, Instant};

@@ -1,9 +1,6 @@
-//! Hyperliquid market-data connector, for a market hedged there. `l2Book` with `fast` is a full
-//! snapshot of 5 levels a side pushed every ~0.54 s whether or not the book moved (without it, 20
-//! levels every ~5.4 s; the thinner side's 5 levels held >= 10.9 HYPE, median 147, over 100 s on
-//! 2026-09-28); `bbo` is pushed on each change of the top (~3.7/s on HYPE, 2026-09-27). Each fills
-//! its own slot of the hedge cell: quoting and hedging already take a fresh BBO deep enough for the
-//! order, and refuse a thin one over a stale L2 (`HlBboThinAndL2Stale`).
+//! Hyperliquid public books: fast `l2Book` supplies five levels, `bbo` supplies changed tops.
+//! Each occupies its own hedge cell slot; a thin BBO requires fresh L2 depth.
+//! Shared subscriptions are also used by the taker and dry run; cadence measurements are in the screener README.
 
 use std::time::{Duration, Instant};
 

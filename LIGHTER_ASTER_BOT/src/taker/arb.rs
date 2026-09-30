@@ -3460,8 +3460,8 @@ fn residual_close_qtys(position: PositionSnapshot, spec: &MarketSpec, hedge_px: 
     (side, a_qty, l_qty)
 }
 
-/// Marketable IOC price bound for an emergency reduce-only close: cross the spread by
-/// `bps` past the venue's mark so the order executes, while capping the worst fill.
+/// Emergency reduce-only IOC bound `bps` past the venue mark. This caps fill price;
+/// a moved/thin book can still leave the order unfilled or partially filled.
 fn emergency_close_bound(mark: Decimal, side: Side, bps: Decimal) -> Decimal {
     match side {
         Side::Buy => mark * (Decimal::ONE + bps_to_rate(bps)),

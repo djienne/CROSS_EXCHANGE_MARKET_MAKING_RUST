@@ -1,4 +1,6 @@
-//! `report`: replays the bot's rules on the recorded moments of each pair and ranks the pairs.
+//! `report`: ranks pairs using a simplified replay model derived from the bot's rules.
+//! Top-of-book depth, queue-free fills, inventory reduction and reverse-maker routes are model
+//! assumptions, not identical bot execution paths (see README.md, Known limits).
 //!
 //! - **Taker-taker**, as `taker/arb.rs` and `entry_gate.rs` decide: the better direction's edge at
 //!   the top of book (skipped where a side holds less than the bot's depth); the percentile gate

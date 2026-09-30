@@ -1,18 +1,6 @@
-//! Scaled-integer market scale + the live hot-path order book builder.
-//!
-//! The deterministic cold path uses `rust_decimal::Decimal` everywhere (exact, but
-//! heap-ish and slow). The live quote loop instead works in **scaled integers**:
-//! prices as integer multiples of the venue tick (`px_ticks`) and quantities as
-//! integer multiples of the venue lot/step (`qty_lots`). Comparisons, requote-threshold
-//! checks, and crossed/touch tests are then branch-light `i64` math with no allocation.
-//!
-//! `Decimal` is kept for config, edge/PnL math, and cold reconciliation — we convert at
-//! the boundary when building a [`MarketScale`] from a [`MarketSpec`] and when emitting an
-//! order. We deliberately do NOT reimplement the edge/VWAP stack in integer math: that is
-//! the exact, well-tested money math, and re-deriving it in `i64` for a few microseconds
-//! would be a real-funds correctness hazard. The integers carry the *hot, hot* part
-//! (touch/crossed/staleness/price-move detection + order representation); the proven
-//! `Decimal` quote engine prices the actual quote.
+//! Tick/lot integer scales and hot order-book projections. Integer prechecks handle touch,
+//! crossing, staleness and order representation; Decimal still prices quotes and accounting.
+//! Decimal is fixed-width, not heap-backed. Conversions happen at the book/order boundaries.
 
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -112,7 +100,7 @@ impl MarketScale {
 
     /// Parse an exchange decimal price string directly into integer ticks, without
     /// constructing a `Decimal` on the websocket hot path. Prices are rounded to the
-    /// nearest tick to mirror [`price_to_ticks`].
+    /// nearest tick to mirror [`Self::price_to_ticks`].
     #[inline]
     pub fn price_str_to_ticks(&self, px: &str) -> Option<i64> {
         decimal_str_to_units(px, self.tick, UnitRound::Nearest)
@@ -120,7 +108,7 @@ impl MarketScale {
 
     /// Parse an exchange decimal quantity string directly into integer lots, without
     /// constructing a `Decimal` on the websocket hot path. Quantities are rounded down
-    /// to mirror [`qty_to_lots`] and avoid overstating visible size.
+    /// to mirror [`Self::qty_to_lots`] and avoid overstating visible size.
     #[inline]
     pub fn qty_str_to_lots(&self, qty: &str) -> Option<i64> {
         decimal_str_to_units(qty, self.step, UnitRound::Floor)
@@ -139,22 +127,22 @@ impl MarketScale {
     }
 
     /// Exact ticks for an already-rounded Decimal price (nearest tick) — the numeric
-    /// twin of [`price_str_to_ticks`]: it feeds the Decimal's own (mantissa, scale)
+    /// twin of [`Self::price_str_to_ticks`]: it feeds the Decimal's own (mantissa, scale)
     /// into the SAME i128 rational core, so ticks are bit-identical to the string
-    /// path. Deliberately NOT [`price_to_ticks`], whose Decimal division can round
+    /// path. Deliberately NOT [`Self::price_to_ticks`], whose Decimal division can round
     /// differently in >28-digit quotients.
     #[inline]
     pub fn price_dec_to_ticks(&self, px: Decimal) -> Option<i64> {
         dec_units(px, self.tick, UnitRound::Nearest)
     }
 
-    /// Numeric twin of [`qty_str_to_lots`] (floor). See [`price_dec_to_ticks`].
+    /// Numeric twin of [`Self::qty_str_to_lots`] (floor). See [`Self::price_dec_to_ticks`].
     #[inline]
     pub fn qty_dec_to_lots(&self, qty: Decimal) -> Option<i64> {
         dec_units(qty, self.step, UnitRound::Floor)
     }
 
-    /// Numeric twin of [`hl_qty_str_to_lots`] (floor). See [`price_dec_to_ticks`].
+    /// Numeric twin of [`Self::hl_qty_str_to_lots`] (floor). See [`Self::price_dec_to_ticks`].
     #[inline]
     pub fn hl_qty_dec_to_lots(&self, qty: Decimal) -> Option<i64> {
         dec_units(qty, self.hl_qty_step, UnitRound::Floor)
@@ -270,7 +258,7 @@ pub fn build_hot_book_with_qty_scale(
 }
 
 /// Build a [`HotBook`] directly from exchange decimal strings. This is the websocket
-/// hot-path builder: it avoids `rust_decimal::Decimal` allocation/construction for the
+/// hot-path builder: it avoids parsing `rust_decimal::Decimal` and then converting it for the
 /// integer precheck representation while preserving canonical ordering, duplicate-price
 /// aggregation, non-positive filtering, and [`HOT_LEVELS`] truncation.
 pub fn build_hot_book_from_strs_with_qty_scale<'a, I, J>(

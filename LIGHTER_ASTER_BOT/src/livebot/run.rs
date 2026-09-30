@@ -5,9 +5,8 @@
 //!
 //! ## Hard safety gate
 //!
-//! [`run`] refuses to start unless `[live] enabled = true`, and requires a single selected
-//! market plus credentials and the Lighter signer: the real ones in `live`, the dry-run
-//! identity in a dry run.
+//! [`run`] requires `[maker.live] enabled = true`, one selected market and its venue signers:
+//! real credentials in live mode, the fixed dry-run identity in a simulation.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -504,8 +503,8 @@ async fn classify_markets(specs: &[MarketSpec], cfg: &Config) -> HashMap<MarketI
 
 /// Build + spawn ALL live planes: the venue workers, the account reconciler
 /// (initial reconcile for clean-start + a cold backstop loop), and the Aster user (fill) stream.
-/// Signing uses `aster.env`/`lighter.env` in `live` (roles derived from the keys, not the env
-/// field names; see [`super::exec::creds`]) and the dry-run identity in a dry run.
+/// Signing uses the selected venues' credential files in live mode, including validated
+/// Aster user/signer roles (see [`super::exec::creds`]), or the fixed dry-run identity.
 /// Returns the worker task, the user-stream liveness stamp and the shutdown reconciler. Clean
 /// start is then established (quoting is still gated per-market on feed freshness and position
 /// reconciliation).

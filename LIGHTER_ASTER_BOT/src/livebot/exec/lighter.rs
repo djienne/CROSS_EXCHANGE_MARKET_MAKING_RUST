@@ -47,8 +47,8 @@ use crate::types::{MarketId, Side, TxSendStatus};
 /// immediate emergency resend cannot double-hedge.
 pub(crate) const HEDGE_NOT_SENT_PREFIX: &str = "Lighter tx not sent:";
 
-/// The ONLY two reject shapes safe to auto-retry (both guaranteed no order landed):
-/// the venue-confirmed IOC no-fill, and a NotSent transport fast-fail. Everything
+/// Reject shapes permitting retry: explicit IOC no-fill or a NotSent pre-write failure.
+/// An accepted terminal no-fill is not evidence that no order was submitted. Everything
 /// else (resting order, ambiguous transport error) must freeze + reconcile instead.
 pub(crate) fn hedge_reject_is_definitive_no_fill(reason: &str) -> bool {
     reason.contains("could not immediately match") || reason.contains(HEDGE_NOT_SENT_PREFIX)
@@ -453,8 +453,8 @@ impl LighterBook {
     }
 }
 
-/// Whether the hedge venue can take an order now. Hyperliquid, reached over REST with nonces
-/// from the clock, always can.
+/// Local transaction readiness. Lighter requires a ready socket and certain nonce;
+/// Hyperliquid bypasses the socket check, which does not establish remote availability.
 #[derive(Clone, Default)]
 pub struct HedgeReadiness {
     socket: Option<Arc<TxWebSocket>>,
@@ -1665,7 +1665,7 @@ mod tests {
     #[test]
     fn hedge_retry_gate_accepts_only_guaranteed_no_fill_rejects() {
         use super::{hedge_reject_is_definitive_no_fill, HEDGE_NOT_SENT_PREFIX};
-        // The two guaranteed-nothing-landed shapes are retryable...
+        // Explicit no-fill and pre-write failure permit retry.
         assert!(hedge_reject_is_definitive_no_fill(
             "Lighter reject code=21505 order could not immediately match against any resting orders"
         ));

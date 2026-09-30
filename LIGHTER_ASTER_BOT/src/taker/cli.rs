@@ -24,13 +24,13 @@ use std::time::Duration;
     name = "lighter_aster_bot taker",
     bin_name = "lighter_aster_bot taker",
     version,
-    about = "Lighter/Aster taker-taker arbitrage engine"
+    about = "Taker arbitrage across configured Aster/Lighter/Hyperliquid routes"
 )]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
-    /// Path to the TOML config file (bot.toml; the taker reads its [taker] table).
+    /// Path to the TOML config file (bot.toml; the taker reads its `[taker]` table).
     #[arg(long, global = true, default_value = "bot.toml")]
     pub config: PathBuf,
 }
@@ -57,12 +57,12 @@ pub enum Commands {
         #[arg(long, default_value_t = 5_000)]
         reduce_cooldown_ms: u64,
     },
-    /// Fetch and print resolved market specs (Aster exchangeInfo + Lighter orderBooks).
+    /// Fetch Aster/Lighter route specs (this standalone command excludes Hyperliquid).
     FetchSpecs {
         #[arg(long)]
         markets: Option<String>,
     },
-    /// Signed read-only check: positions, available USDC and open orders on both venues.
+    /// Signed Aster/Lighter read-only diagnostics: positions, available USDC and open orders.
     Probe {
         #[arg(long, default_value = "HYPE")]
         market: Option<String>,
@@ -107,7 +107,7 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
-    /// Read-only account/book/opportunity status, as JSON: the taker report `run` polls every tick.
+    /// Standalone Aster/Lighter account/book/opportunity status as JSON.
     Status {
         #[arg(long, default_value = "HYPE")]
         market: Option<String>,

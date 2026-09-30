@@ -39,8 +39,8 @@ and probes.
     └── RUNBOOK.md
 ```
 
-Git ignores `runs/` (journals, ledgers, latches, state), `data/` (the market-data tape, and the screener's), `target/` and the credential files
-`LIGHTER_ASTER_BOT/aster.env` and `lighter.env`.
+Git ignores `runs/` (journals, ledgers, latches, state), `data/` (market-data recordings),
+`target/` and `*.env` credential files, including `hyperliquid.env`.
 
 ## Build
 
@@ -104,7 +104,7 @@ What the numbers mean:
 
 The reports' `economics.py` and the bot's own `live-report` command, which lists one XEMM
 journal's logical trades (`lighter_aster_bot live-report --journal <journal> --details`), are
-both tested against `tests/fixtures/execution_economics.json`, so they agree.
+both checked against `tests/fixtures/execution_economics.json` for agreement on its cases.
 
 Historical repair builds a separate candidate database and a before/after JSON comparison:
 

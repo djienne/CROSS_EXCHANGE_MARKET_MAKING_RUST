@@ -31,7 +31,7 @@ def main() -> int:
     print(f"{len(pairs)} routes, up to {most_days:.1f} days; lighter {report['lighter_tier']}, latency x{report['latency']}, "
           f"day-to-day rank correlation {report['day_to_day_rank_correlation']}; {len(pairs) - len(shown)} routes under {args.min_days} day hidden")
     if most_days < 7:
-        print("Under 7 days of data: the ranking is not stable yet (SCREENER/README.md, Comparison).")
+        print("Under the initial 7-day review window; rank stability is unproven (SCREENER/README.md, Comparison).")
     print(f"{'route':<18}{'days':>6}{'best':>8}{'$/day':>8}{'+days':>6}{'tk/day':>8}{'kept':>6}{'tk$/d':>8}{'xf0$/d':>8}{'xf1$/d':>8}{'spread0/1 bps':>15}{'thin%':>7}")
     for p in shown[:args.top]:
         tk, d = p["taker_gated"], max(p["days"], 1e-9)

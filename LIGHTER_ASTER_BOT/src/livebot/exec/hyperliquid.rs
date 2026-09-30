@@ -1,7 +1,7 @@
 //! The hedge on Hyperliquid: one IOC per `Hedge` command, carrying the intent's cloid
 //! (reduce-only for a correction), and the account reads the reconciler needs. An IOC's
-//! `/exchange` reply is terminal (`filled` or an error), so there is no fill stream: fees and
-//! trade ids come from `userFillsByTime`, and a lost reply is resolved through `orderStatus`.
+//! `/exchange` reply is terminal (`filled` or an error). This worker polls `userFillsByTime`
+//! for fees/trade ids and `orderStatus` for lost replies rather than subscribing to private fills.
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -20,7 +20,7 @@ pub struct HedgeabilityRules {
 
 #[derive(Debug, Clone)]
 pub struct PendingInventory {
-    /// Positive => net long Aster (hedge by selling on Lighter); negative => net short.
+    /// Positive => net long Aster (hedge by selling); negative => net short.
     pub signed_qty: Decimal,
     pub avg_aster_px: Decimal,
     pub first_fill_ts: DateTime<Utc>,
@@ -54,7 +54,7 @@ pub struct FillOutcome {
     pub hedge: Option<HedgeOrder>,
 }
 
-/// Minimum hedgeable quantity on Lighter for a given reference price (the configured min
+/// Minimum opening hedge quantity for a reference price (the configured min
 /// notional, `lighter_min_notional`, rounded up to the size step, but at least one step).
 pub fn hl_min_hedge_qty(rules: &HedgeabilityRules, ref_px: Decimal) -> Decimal {
     if ref_px <= Decimal::ZERO {
@@ -65,7 +65,7 @@ pub fn hl_min_hedge_qty(rules: &HedgeabilityRules, ref_px: Decimal) -> Decimal {
 }
 
 /// Hyperliquid accepts a sub-minimum reduce-only order only for a full close (live 2026-09-28).
-/// Buffer the limit price by 2%; any excess reduction is corrected on the other leg next.
+/// Size against 98% of the limit price for headroom; callers confirm positions before correcting excess.
 pub fn reduce_only_hedge_qty(venue: HedgeVenue, qty: Decimal, position: Decimal, rules: &HedgeabilityRules, limit_px: Decimal) -> Decimal {
     if venue == HedgeVenue::Hyperliquid && qty > Decimal::ZERO {
         qty.max(hl_min_hedge_qty(rules, limit_px * Decimal::new(98, 2))).min(position.abs())
@@ -80,7 +80,7 @@ pub fn signed_aster_qty(side: Side, qty: Decimal) -> Decimal {
     }
 }
 
-/// Hedge side for a signed inventory: long Aster -> sell Lighter; short Aster -> buy Lighter.
+/// Hedge side for signed inventory: long Aster -> sell; short Aster -> buy.
 pub fn hedge_side_for_signed(signed_qty: Decimal) -> Option<Side> {
     if signed_qty > Decimal::ZERO {
         Some(Side::Sell)
@@ -93,7 +93,7 @@ pub fn hedge_side_for_signed(signed_qty: Decimal) -> Option<Side> {
 
 /// Fold a fill into pending inventory, returning what to book / hedge / keep. A same-direction
 /// fill accumulates with a size-weighted average; an opposite fill nets down and books realized
-/// PnL; the result carries a [`HedgeOrder`] the MOMENT the net clears the Lighter minimum (primary
+/// PnL; the result carries a [`HedgeOrder`] when the net clears the hedge minimum (primary
 /// fast-hedge path), else keeps the sub-min residual pending — never per-partial flattening.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_fill_parts(

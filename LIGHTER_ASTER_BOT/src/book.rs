@@ -27,21 +27,15 @@ pub struct OrderBook {
 }
 
 impl OrderBook {
-    /// Build a normalized book from raw (px, qty) snapshot rows. Aggregates duplicate prices, drops
-    /// non-positive prices AND quantities (a corrupted/garbage exchange tick — a
-    /// zero/negative price would otherwise poison `mid`/`touch` and panic the
-    /// divide-by-zero math downstream), sorts each side canonically, and truncates
-    /// to [`MAX_BOOK_LEVELS`] (exchanges send <= 20 levels; the truncation only
-    /// fires on pathological input).
+    /// Normalize snapshot rows: aggregate duplicate prices, drop non-positive prices/quantities,
+    /// sort each side and retain the best [`MAX_BOOK_LEVELS`]. Lighter may supply a larger book.
     pub fn from_levels(
         bids: impl IntoIterator<Item = (Decimal, Decimal)>,
         asks: impl IntoIterator<Item = (Decimal, Decimal)>,
         exch_ts: DateTime<Utc>,
         local_recv_ts: DateTime<Utc>,
     ) -> Self {
-        // Hot path: exchanges send at most ~20 levels, and BBO assists send one. Avoid
-        // heap-allocating + sorting a Vec on every websocket frame; keep the best
-        // MAX_BOOK_LEVELS directly in a fixed ArrayVec via insertion sort/truncation.
+        // Keep the best levels in fixed storage without a temporary Vec.
         let bids = build_side(bids, true);
         let asks = build_side(asks, false);
 

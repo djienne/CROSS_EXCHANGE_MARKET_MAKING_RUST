@@ -1,7 +1,7 @@
 //! The upstream feed. The simulator keeps its own public connections to the real venues; each
 //! frame is applied to the matching core at its engine time + D, and re-served to every bot
 //! connection at its publish time + D + that connection's feed latency, with each exchange
-//! timestamp moved +D. The bot so sees Tokyo-fresh data by its own, unchanged clocks.
+//! timestamp moved +D. Freshness reflects the configured shift/feed-delay model, not a Tokyo measurement.
 //!
 //! The venues' own field names are parsed here (Aster `E`/`T`, Lighter `timestamp` in ms and
 //! `last_updated_at` in µs, Hyperliquid `time` in ms); everything downstream works in µs.

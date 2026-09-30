@@ -11,8 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::position::SignedPosition;
 use crate::types::Side;
 
-/// Maintenance margin rate for the breach flag. The venues tier it by notional; 2% is above
-/// both venues' first tier for HYPE-sized positions, so the flag errs early.
+/// Simplified 2% maintenance assumption for the breach flag; venue/market tiers are not modeled.
 const MAINTENANCE_RATE: Decimal = Decimal::from_parts(2, 0, 0, false, 2);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -27,9 +27,7 @@ impl VenueRegistry {
         Self::build(markets, |_| VenueBook::new())
     }
 
-    /// Like [`new`] but every cell publishes into a shared coalescing wakeup `Notify`,
-    /// so a live strategy loop parked on it wakes on the next book change of ANY cell,
-    /// and marks its market in a shared dirty-market bitset.
+    /// Build Aster/hedge cells wired to a coalescing `Notify` and shared dirty-market bitset.
     pub fn with_wake_and_dirty(markets: &[MarketId], wake: Arc<Notify>, dirty: Arc<DirtyMarkets>) -> Self {
         Self::build(markets, |idx| VenueBook::with_wake_and_dirty(wake.clone(), dirty.clone(), idx))
     }

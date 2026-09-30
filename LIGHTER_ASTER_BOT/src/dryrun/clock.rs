@@ -1,5 +1,5 @@
-//! Latency: every request, frame and private event draws its delay from a lognormal fitted
-//! to a measured median and 99th percentile (defaults in `[dry_run]` cite their source).
+//! Lognormal delays fitted to configured median/p99 values: measurements or estimates
+//! as labeled in `[dry_run]`. Public and private streams have separate draws.
 //! Draws come from a seeded splitmix64 stream, so a run's randomness is repeatable.
 //!
 //! Time itself needs no machinery here: the simulated world is the real one delayed by a

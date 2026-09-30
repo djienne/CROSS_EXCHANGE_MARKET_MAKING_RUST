@@ -1,17 +1,7 @@
-//! Periodic REST cross-check of the websocket-built books (the "are my order books
-//! correct?" reconciler). A dedicated thread wakes every `interval` (default ~30 s,
-//! deliberately slow / non-invasive) and, for each (market, venue) cell, loads the
-//! latest WS book and fetches the matching REST snapshot, comparing top-of-book mids.
-//!
-//! A book that is internally **crossed**, or whose mid stays beyond `tolerance_bps`
-//! of REST for `consecutive_breaches` scans in a row, is treated as STUCK/CORRUPT:
-//! the cell is flagged [`VenueBook::mark_divergent`] (so the [`super::watchdog`]
-//! closes the trading gate) and its reader is asked to drop and reconnect ("reset the
-//! websocket"). A passing scan clears the flag. Single transient blips don't act —
-//! only sustained disagreement does — so normal REST/WS timing skew never trips it.
-//!
-//! This is cold-path reconciliation: slow, off the quote hot loop, and the only
-//! thing it mutates is the per-cell divergence flag + reconnect nudges.
+//! Periodic REST/WS book comparison: mid, executable VWAP and crossed-book checks.
+//! Consecutive breaches mark the cell divergent and request a reconnect. Once tripped,
+//! the breach counter decays on agreeing scans; it clears only when the counter reaches zero.
+//! This cold path updates divergence flags and reconnect notifications, not orders.
 
 use std::collections::HashMap;
 use std::sync::Arc;

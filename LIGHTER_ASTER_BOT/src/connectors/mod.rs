@@ -68,7 +68,7 @@ pub struct Tap {
     /// Edge-triggered "drop and reconnect" signal from the stream watchdog.
     pub reconnect: Option<Arc<Notify>>,
     /// When set, `publish` builds a `HotBook` alongside the raw `OrderBook` and calls
-    /// `BookTap::publish_hot` for wait-free integer reads on the strategy loop.
+    /// `BookTap::publish_hot` for lock-free integer reads on the strategy loop.
     pub scale: Option<crate::livebot::scale::MarketScale>,
     pub qty_scale: crate::livebot::scale::HotQtyScale,
 }

@@ -2,7 +2,7 @@
 //!
 //! When the strategy's cumulative-loss circuit breaker fires it writes a small JSON marker named
 //! after the run's file stem (`<runs_dir>/<stem>.trip.json`, e.g. `runs/bot-HYPE.trip.json`) and
-//! halts. On every subsequent startup, [`run`]
+//! halts. On every subsequent startup, [`super::run::run`]
 //! checks for that marker BEFORE any live execution setup and refuses to start while it exists. The
 //! operator clears it (after reviewing what happened) with `scripts/reset_breaker.py`, which simply
 //! deletes the file — it works through the Docker bind mount (`./runs:/app/runs`), no `docker exec`.
