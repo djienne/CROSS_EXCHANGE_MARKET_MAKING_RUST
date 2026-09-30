@@ -66,7 +66,7 @@ services:
       - ${ASTER_NONCE_DIR:-aster-nonce}:/nonce
     # SIGINT, SIGTERM and SIGHUP all start the same graceful drain. Positions stay OPEN.
     stop_signal: SIGINT
-    # A status tick in progress (<= 50 s), then XEMM's and the taker's stops,
+    # A status read in progress (<= 25 s), then XEMM's and the taker's stops,
     # each capped at 200 s (ENGINE_STOP_TIMEOUT in src/controller/supervisor.rs); a shorter
     # grace SIGKILLs a legitimate drain and leaves fills unhedged.
     stop_grace_period: 460s

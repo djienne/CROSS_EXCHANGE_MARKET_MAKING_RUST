@@ -5,7 +5,7 @@ edition = "2021"
 # Keep the supported compiler aligned with the container and release checks.
 rust-version = "1.92"
 default-run = "lighter_aster_bot"
-description = "Aster/Lighter bot: XEMM maker/hedger and taker-taker arbitrage"
+description = "Aster/Lighter/Hyperliquid bot: XEMM maker/hedger and taker-taker arbitrage"
 
 [lib]
 name = "lighter_aster_bot"

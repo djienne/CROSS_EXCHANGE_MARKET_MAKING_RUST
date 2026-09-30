@@ -78,9 +78,7 @@ impl HotBook {
     }
 
     /// True when the top of book is crossed or locked (bid >= ask), or when either
-    /// side is missing (an incomplete book is untradeable). Callers that already
-    /// check `best_bid_ticks()`/`best_ask_ticks()` for `None` separately will see
-    /// no behavior change; for any future direct caller this is the safe default.
+    /// side is missing (an incomplete book is untradeable).
     #[inline]
     pub fn is_crossed(&self) -> bool {
         match (self.best_bid_ticks(), self.best_ask_ticks()) {

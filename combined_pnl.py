@@ -193,8 +193,8 @@ def report_roots(stack_root: Path, dry_run: bool = False) -> tuple[Path, Path]:
 
 
 def default_since(bot_runs: Path, market: str, dry_run: bool) -> str:
-    """Live reports from DEFAULT_SINCE. A dry run reports from its first start, the first row of
-    its append-only event log, so projections annualize over the time it actually ran."""
+    """Live reports from DEFAULT_SINCE; a dry run from its first recorded start.
+    Projections use elapsed wall time, including downtime."""
     if dry_run:
         try:
             with (bot_runs / f"bot-{market}.events.jsonl").open(encoding="utf-8") as f:

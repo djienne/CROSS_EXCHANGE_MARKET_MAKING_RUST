@@ -1,6 +1,4 @@
 //! Pure `Decimal` helpers: bps<->rate conversion, tick/step rounding and parsing.
-//! Kept dependency-free and exhaustively tested because every edge/PnL number
-//! flows through here.
 
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;

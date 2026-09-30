@@ -51,14 +51,10 @@ impl TradingGate {
     }
 }
 
-/// An edge-triggered, lock-free "drop your socket and reconnect now" signal from the
-/// watchdog to one reader. Backed by `Notify::notify_one`, which stores a single
-/// permit when no reader is currently parked — so a request that races a
-/// reconnect-in-progress is NOT lost: the reader's next wait on [`ReconnectHandle::notify`] consumes
-/// the permit and reconnects. One handle drives exactly one reader, so the single-permit
-/// semantics are exact; repeated requests collapse to one pending reconnect (which is
-/// all that's needed). The 250ms watchdog re-request and the reader's idle timeout
-/// remain as defense-in-depth.
+/// A reconnect signal from the watchdog to one reader. `Notify::notify_one` retains one
+/// permit between waits, so a request during a reconnect is consumed by the reader's next
+/// [`ReconnectHandle::notify`]. Repeated requests coalesce. The watchdog retries after
+/// 250 ms, and the reader also has an idle timeout.
 #[derive(Clone, Default)]
 pub struct ReconnectHandle {
     notify: Arc<Notify>,

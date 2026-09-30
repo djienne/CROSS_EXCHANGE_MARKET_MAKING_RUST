@@ -4,7 +4,7 @@
 It runs SCREENER's report in Docker (`docker compose run --rm report --json`; ~1 GB of memory per
 recorded day, 8 GB cap) and prints the best routes by the report's own `best` fixed strategy.
 Report options (--since, --until, --lighter premium, --latency 2) pass through; SCREENER/README.md
-explains them and the columns. $/day are at one $13 clip.
+explains them and the columns. $/day use the configured clip ($13 by default).
 """
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-# Aster/Lighter Cross-Exchange Market Making and Arbitrage
+# Aster/Lighter/Hyperliquid Market Making and Arbitrage
 
 One Rust binary, `lighter_aster_bot` in `LIGHTER_ASTER_BOT/`, trades one market across Aster
 and Lighter (or Hyperliquid) with two engines: a taker–taker arbitrage engine and an XEMM
@@ -12,12 +12,12 @@ real orders.
 This is a live trading codebase. `run --mode live`, `taker run` without `--observe-only`,
 `close`, `probe aster-place-cancel`, `probe hl-hedge`, `probe hl-place-cancel` and the
 `*-market`/`*-roundtrip` probes place real orders and can
-lose money through spread, fees, slippage and execution failures. Neither the tests nor the
+lose money through spread, fees, slippage and execution failures. Neither unit tests nor the
 dry run prove live venue acceptance, latency or profitability.
 
 The [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md) is the operating manual: how the rights are shared,
 configuration and secrets, the dry run, going live, runtime files, halts and recovery, deploy
-and probes.
+and probes. Dated live-test results and model limits are in [CALIBRATION.md](LIGHTER_ASTER_BOT/CALIBRATION.md).
 
 ## Layout
 
@@ -64,7 +64,7 @@ docker compose logs -f dryrun
 It runs in the background, the fleet's `start_all.bat` starts it too, and its files are in
 `LIGHTER_ASTER_BOT/runs/dry-run/`. The model, halts, diagnostics and the going-live checklist
 are in the [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md#dry-run). Beside it, the `recorder` service
-records the same public feeds to `LIGHTER_ASTER_BOT/data/HYPE/` for backtests
+records HYPE's Aster/Lighter public feeds to `LIGHTER_ASTER_BOT/data/HYPE/` for backtests
 ([Market data tape](LIGHTER_ASTER_BOT/RUNBOOK.md#market-data-tape)).
 
 ## Reports

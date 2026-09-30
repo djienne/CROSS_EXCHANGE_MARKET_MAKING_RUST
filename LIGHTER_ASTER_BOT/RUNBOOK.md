@@ -55,8 +55,8 @@ cargo build --release --locked        # Rust 1.92; the Lighter signers exist for
   engines.
 - A market's `hedge_venue` (`"lighter"` by default, the same in its `[[taker.markets]]` and
   `[[maker.markets]]` entries) names the second leg: `HYPE-HL` trades Aster against
-  Hyperliquid. The bot sends Hyperliquid IOCs only, since the venue offers this account no
-  dead-man to cancel a resting order. Live, it reads `hyperliquid.env` ([Probes](#probes)), and
+  Hyperliquid. The engines send Hyperliquid IOCs only; resting orders exist only in probes.
+  Live, it reads `hyperliquid.env` ([Probes](#probes)), and
   the leverage gate wants 1x on both legs: set the Hyperliquid market to 1x cross first.
 - A `[[taker.markets]]` entry with `first_venue = "lighter"` has no `aster_symbol` and no
   `[[maker.markets]]` entry, and must hedge on Hyperliquid: `HYPE-LH` takes both sides on
@@ -85,7 +85,7 @@ stopped container keeps its log for review; `docker rm bot-hype` before the next
 Stop with Ctrl-C, SIGINT, SIGTERM or SIGHUP (`tmux send-keys -t lighter_aster_bot C-c`,
 `docker kill --signal=SIGINT bot-hype`). XEMM drains first, then the taker.
 XEMM quiesces admission, cancels makers, drains fills and execution outcomes, corrects net
-residuals, reconciles and flushes persistence; this can take up to ~190 s per engine, after
+residuals, reconciles and flushes persistence; the controller allows 200 s per engine, after
 any status poll in progress (up to 25 s). Never stop it with a shorter kill: `docker stop`
 needs `-t 460`, and compose already sets `stop_grace_period: 460s`. Paired positions stay
 open and delta-neutral ([`close`](#close-a-position) exits them). Exit 0 means a clean stop; nonzero means a halt, an unresolved engine
@@ -119,9 +119,9 @@ market: an Aster MARKET order, and IOCs through XEMM's hedge worker at
 from the fills (from a fresh read after one that filled nothing), and must then read flat, or
 the command names it and exits nonzero. `--market` takes a market id or its coin: HYPE and
 HYPE-HL both close HYPE. It takes each venue's leg lock, so it refuses while a live `run` or
-`taker run` trades there ("another live writer holds runs/bot-LIGHTER-HYPE.lock"). It readies
-every selected venue before its first order and sends nothing if one is down (`--venue` then
-closes the others).
+`taker run` trades there. It initializes every selected client before sending orders; a setup
+failure sends nothing (`--venue` selects a subset). Later read or order failures can still
+leave a leg open: check the reported results and positions.
 
 ## Dry run
 
@@ -152,8 +152,8 @@ The venue model targets AWS Tokyo timings, with estimates where measurements are
   their price fills them outright in the model; a crossing book fills up to its crossing size.
 - **Venue rules**: live filters, measured reduce-only exceptions, Aster deadman and listen-key
   expiry, Lighter sequential nonces and Hyperliquid five significant figures. Rate limits are
-  approximations: separate 60/min Lighter read and transaction buckets (Standard shares one,
-  so a live burst can see 429s the dry run cannot) and 1200 Hyperliquid weight/min.
+  approximations: separate 60/min Lighter read and transaction buckets (Standard shares one
+  and has per-type limits, so the model can miss 429s) and 1200 Hyperliquid weight/min.
 - **Accounts**: one cross account per venue from the `[dry_run]` balances. Fees come from the
   bot's own fee keys, so the dry run cannot catch a wrong one. Funding follows the public
   rates at Aster and Lighter settlement times; Hyperliquid funding is not simulated.
@@ -261,6 +261,7 @@ Windows bind mount as mode 777: on this host, put `XEMM_ENV_MODE_CHECK=off` in t
 
 The `recorder` service (container `lighter-aster-recorder`, `record --market HYPE`) records
 HYPE's Aster/Lighter public feeds for later replay. `record` currently supports only this venue combination:
+
 - **Aster:** `depth20@100ms` (20 levels), `bookTicker` and `aggTrade`.
 - **Lighter:** `order_book` (a snapshot, then deltas: the whole book), `trade` and `market_stats`.
 - **REST:** Aster `premiumIndex` every minute; `exchangeInfo` and `orderBooks` hourly.
@@ -425,9 +426,10 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
     prices, to the same values, through the ask, with a lapsed permit, and of the cancelled
     order, which must close the slot); a post-only through the ask; cancel-all; the 10 s
     dead-man. A position left over is closed reduce-only.
-  - `probe lighter-market --max-usd 12` / `probe hl-hedge --market HYPE-HL --max-usd 12`:
+  - `probe lighter-market --max-usd 13` / `probe hl-hedge --market HYPE-HL --max-usd 14`:
     XEMM's hedge worker on Lighter / Hyperliquid sends a hedge, an IOC that cannot fill
     (printing whether its reject reads as the retryable no-fill), and reduce-only closes.
+    The rounded minimum plus two size steps must fit the cap, or no order is sent.
   - `taker aster-market-roundtrip --max-usd 7` / `taker lighter-market-roundtrip --max-usd
     12`: the taker's entry order, after one bounded under the bid that cannot fill. The Aster
     one closes with XEMM's reduce-only MARKET. They clean
@@ -439,8 +441,8 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
   reads the account, fees and action budget. `probe hl-place-cancel` (one post-only buy 10 %
   under the bid, cancelled) and `probe hl-market` (a ~$10.5 IOC buy sold back reduce-only) trade
   real funds: both need `--i-understand-live --max-usd <10.5..20>`, a flat start and no open
-  order. Every action spends the account's lifetime budget (10k + ~1 per USDC traded), and
-  there is no dead-man below $1M of volume.
+  order. Actions spend the address's allowance (initial 10k + ~1 per USDC traded).
+  The engines do not implement a Hyperliquid dead-man refresh.
 
 ## Orchestrator leftovers
 

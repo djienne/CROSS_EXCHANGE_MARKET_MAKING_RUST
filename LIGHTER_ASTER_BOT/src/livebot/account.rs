@@ -174,7 +174,7 @@ impl AccountState {
     pub fn publish_maker_queries(&self, queries: Vec<MakerQuery>) { self.maker_queries.store(Arc::new(queries)); }
     pub fn maker_queries(&self) -> Arc<Vec<MakerQuery>> { self.maker_queries.load_full() }
 
-    /// Wait-free read of the current snapshot.
+    /// Lock-free read of the current snapshot.
     pub fn load(&self) -> Arc<AccountSnapshot> {
         self.snapshot.load_full()
     }

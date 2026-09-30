@@ -121,7 +121,7 @@ impl MakerSlot {
         self.amend_from.is_some()
     }
 
-    /// The most this order can still fill: during an amend, from the larger of its two sizes.
+    /// Maximum cumulative fill size: during an amend, the larger of its old and requested sizes.
     fn fillable_lots(&self) -> i64 {
         self.amend_from.map_or(self.qty_lots, |(_, old)| old.max(self.qty_lots))
     }
@@ -293,8 +293,8 @@ impl OrderManager {
         }
     }
 
-    /// Record an amend of the Open order on (market, side) to new values. The order keeps its
-    /// ids; the old values stay until the venue answers, since a fill may land at either.
+    /// Record an amend of the Open order on (market, side). Keep its ids and retain both the
+    /// old and requested values until the venue answers, since a fill may land at either.
     pub fn on_amend_sent(&mut self, market: &MarketId, side: Side, price_ticks: i64, qty_lots: i64, now_ns: i64) {
         self.record_replace(market, now_ns);
         let Some(slot) = self.slot_mut(market, side) else { return };

@@ -204,7 +204,7 @@ impl VenueBook {
 
     /// Hot publish: store the freshest book, refresh BOTH liveness stamps (a book is
     /// also a frame), bump the generation, and wake any attached strategy loop. Called
-    /// from the ingest thread on every book snapshot. Wait-free for readers; no lock.
+    /// from the ingest thread on every book snapshot. Book reads are lock-free.
     #[inline]
     pub fn publish(&self, book: OrderBook) {
         if !accept_exch_ts(&self.last_book_exch_ms, exch_ms(&book)) {
@@ -410,20 +410,20 @@ impl VenueBook {
         }
     }
 
-    /// Wait-free read of the latest hot book. `None` until the first hot publish, or
+    /// Lock-free read of the latest hot book. `None` until the first hot publish, or
     /// always `None` if the publisher doesn't have a `MarketScale`.
     #[inline]
     pub fn load_hot(&self) -> Option<Arc<HotBook>> {
         self.hot.load_full()
     }
 
-    /// Wait-free read of the latest fast BBO assist book.
+    /// Lock-free read of the latest fast BBO assist book.
     #[inline]
     pub fn load_bbo(&self) -> Option<Arc<OrderBook>> {
         self.bbo.load_full()
     }
 
-    /// Wait-free read of the latest integer BBO assist book.
+    /// Lock-free read of the latest integer BBO assist book.
     #[inline]
     pub fn load_bbo_hot(&self) -> Option<Arc<HotBook>> {
         self.bbo_hot.load_full()

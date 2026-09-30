@@ -87,7 +87,7 @@ pub struct BookCheckCfg {
     /// so a one-off REST/WS timing skew never trips it — only sustained divergence.
     #[serde(default = "default_book_check_breaches")]
     pub consecutive_breaches: u32,
-    /// REST depth levels requested from Aster (Lighter always returns up to 20). Default 20.
+    /// REST depth limit requested from Aster and Lighter. Default 20; Hyperliquid uses its own limit.
     #[serde(default = "default_book_check_depth_limit")]
     pub depth_limit: u32,
     /// Max concurrent REST requests in one scan. Bounded concurrency narrows the scan

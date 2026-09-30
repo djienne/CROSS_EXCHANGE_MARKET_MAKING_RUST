@@ -1,6 +1,6 @@
 //! Live primitive probes. `lighter_aster_bot probe <check>` exercises XEMM's own venue calls
-//! with the REAL signers, printing each call's latency and the resulting state, and cleans up
-//! any order it opens. [`run`] lists the checks; those that send REAL orders need
+//! with the REAL signers, printing latency and state and attempting cleanup on failure.
+//! [`run`] lists the checks; those that send REAL orders need
 //! `--i-understand-live` and take the venue's leg lock. [`close`], the operator's exit, flattens
 //! a coin on every venue through the same order paths.
 
@@ -451,8 +451,8 @@ async fn probe_hedge(cfg: &Config, target: &str, venue: CloseVenue, i_understand
         &async || Ok(hl.open_orders_info().await?.len())).await
 }
 
-/// [`probe_hedge`]'s orders, from flat: sized just over the venue minimum, then closed through
-/// [`close_on_worker`] whatever failed, leaving no order open.
+/// [`probe_hedge`]'s orders, from flat: sized above the venue minimum, with cleanup through
+/// [`close_on_worker`] after the steps succeed or fail.
 #[allow(clippy::too_many_arguments)]
 async fn hedge_steps<W: std::future::Future<Output = ()> + Send + 'static>(cfg: &Config, venue: CloseVenue, spec: &MarketSpec,
     size_decimals: u32, max_usd: Decimal,
@@ -514,7 +514,7 @@ pub async fn close(cfg: &Config, target: &str, venues: &[CloseVenue], i_understa
         .collect::<Result<Vec<_>>>()?;
     let hedged = |hedge_venue| MarketCfg { hedge_venue, ..market.clone() };
     let slippage_bps = cfg.live.lighter.emergency_slippage_bps;
-    // Every selected venue ready before the first order, so one that is down cannot leave another's leg naked.
+    // Initialize all selected clients before sending orders; later reads or writes can still fail.
     let stop = CancellationToken::new();
     let _stop = stop.clone().drop_guard();
     let (aster, lighter, hyperliquid) = tokio::try_join!(

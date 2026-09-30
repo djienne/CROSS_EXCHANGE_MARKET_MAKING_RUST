@@ -6,11 +6,11 @@ code change.
 
 ## Model changes and known gaps
 
-- 2026-09-30 10:10 UTC (`3472012`): `[dry_run] hyperliquid_rtt_ms` went from `[200, 500]` to
-  `[200, 900]`, for every Hyperliquid leg (HYPE-HL and HYPE-LH). A dry run reads it when it
-  starts, so a report across that restart mixes both models: pass `--since` after it.
+- 2026-09-30 (`3472012`): `[dry_run] hyperliquid_rtt_ms` went from `[200, 500]` to
+  `[200, 900]` for both Hyperliquid routes. Regular dry runs adopted it at 10:11:52 UTC;
+  reports across that restart mix models, so pass `--since` after it.
 - The simulator gives Lighter separate 60/min read and transaction buckets; Standard shares one,
-  and idle reads already use ~46/min, so the dry run cannot show a live burst's 429s.
+  and idle reads already use ~46/min, so the model can miss 429s caused by combined traffic.
 - A live-vs-twin comparison should run the twin with the live host's measured latencies (from
   Windows: Aster ~350 ms per order call, Hyperliquid ~950 ms per action), not the Tokyo profile;
   otherwise fill-rate differences mix location with simulator fidelity. With a handful of fills
@@ -61,15 +61,14 @@ The HYPE interval is 08:37:52–09:16:05 UTC; HYPE-HL is 09:18:47–10:03:45 UTC
 | Window, minutes | 38.22 | 38.22 | 44.97 | 44.97 |
 | Native maker fills (buy/sell) | 6 (2/4) | 4 (1/3) | 2 (1/1) | 1 (0/1) |
 | Maker fills/hour | 9.42 | 6.28 | 2.67 | 1.33 |
-| First hedge fill observed, p50 ms (samples) | 564 (6) | 323 (4) | 973 (2) | 414 (1) |
+| First hedge fill observed, p50 ms (logical trades) | 562 (5) | 323 (4) | 943 (1) | 654 (1) |
 | Amend round trip, p50 ms (samples) | 345 (565) | 105 (555) | 351 (828) | 103 (1317) |
 | Maker/hedge fees, bps | 0/0 | 0/0 | 0/4.5 | 0/4.5 |
 | Gross bps, mean per logical trade | -1.764 | -2.609 | 0.809 | -2.310 |
 | Execution net, USD | -0.011445 | -0.013470 | -0.009575 | -0.00884658 |
 
-The first-hedge-fill row used the definition then current, per hedge attempt from its creation;
-`bot_stats.py` now measures per trade from the first maker fill. With 2 samples its p50 is the
-larger one.
+The first-hedge-fill row was recomputed with `bot_stats.py` at `1c59df5`: per logical trade,
+from its first maker fill on the local monotonic clock, including retries and accumulation.
 
 All four containers stopped with exit 0, empty orders and zero net residual. Real accounts
 finished flat: HYPE's remaining 0.30 pair was closed by `close`, while HYPE-HL's buy/sell
@@ -81,10 +80,10 @@ through their 25-minute keepalive cadence. One HYPE stale-account sweep cleared 
 the pre-fill-snapshot mismatch and missing-amend false uncertainty did not recur.
 
 Aster's ~250 ms network floor leaves ~95–101 ms per amend, consistent with the Tokyo model.
-Lighter's 564 ms observed hedge includes a ~252 ms reply and its documented 300 ms Standard
+Lighter's 562 ms observed hedge includes a ~252 ms reply and its documented 300 ms Standard
 delay ([account types](https://apidocs.lighter.xyz/docs/account-types)); its twin's 323 ms is
-consistent with that delay and the configured short RTT. Hyperliquid action replies were
-942/973 ms with a 290 ms info round trip. Its API forwards actions to a node and waits for
+consistent with that delay and the configured short RTT. Hyperliquid's original per-attempt
+first-fill timings were 942/973 ms with a 290 ms info round trip. Its API forwards actions to a node and waits for
 commitment ([API servers](https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/api-servers)),
 so subtracting an info ping also leaves forwarding/consensus time. The normal simulation's
 Hyperliquid tail is widened to `[200, 900]`, matching the published co-located median/p99
@@ -100,3 +99,14 @@ HYPE-LH executed one matched 0.15 entry: expected/realized gross 4.666/2.802 bps
 opportunity; the operator close left both accounts flat, with whole-cycle cost $0.007532.
 Neither maker trial observed a taker rights handover; its entry gate remained enforced.
 These are operational checks with limited market coverage, not evidence of profitability.
+
+## Real-order regression, 2026-09-30 15:53–16:02 UTC
+
+At `1c59df5`, Aster placement/amend/reject/cancel/dead-man checks and real buy/reduce-only
+roundtrips passed; so did Lighter's hedge-worker and native taker paths, and Hyperliquid's
+post-only/cancel, IOC and hedge-worker paths. Capped probes used $13, or $14 for the Hyperliquid
+worker after a $13 cap correctly refused its rounded size. Final reads showed all accounts
+flat with no open orders. Net execution cash change was -$0.032819 at stablecoin parity.
+The shared `close` command was also checked from flat; no simultaneous three-venue close
+of open positions or live taker handover was exercised. Detailed logs are local in
+`runs/live-order-check-20260930155334Z/`; the screener and dry runs kept collecting.
