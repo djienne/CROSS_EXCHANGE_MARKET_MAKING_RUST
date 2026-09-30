@@ -285,9 +285,10 @@ lighter_feed_ms      = [5, 30]
 aster_user_stream_ms = [10, 50]
 lighter_account_ms   = [5, 30]
 # Hyperliquid (its account starts with lighter_balance_usdc and follows lighter_account_ms).
-# Hyperliquid states a 0.2 s median end to end (one block) from Tokyo; from this host an IOC took
-# ~0.9 s with the network to Tokyo (probe 2026-09-27). Its feed is an estimate; calibrate both.
-hyperliquid_rtt_ms  = [200, 500]
+# Hyperliquid's co-located order latency is 200 ms median / 900 ms p99 (HyperCore overview).
+# Windows IOCs measured 942-973 ms on 2026-09-30, including network and API-to-node forwarding;
+# an info ping removes only the client-to-API trip, so those calls do not set the Tokyo median.
+hyperliquid_rtt_ms  = [200, 900]
 hyperliquid_feed_ms = [5, 30]
 # Hidden size ahead of us at our price, as a multiple of the visible size (Aster offers a HIDDEN
 # time in force); calibrate from the prints the visible book cannot explain.

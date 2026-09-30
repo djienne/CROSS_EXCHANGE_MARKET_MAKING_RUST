@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -80,6 +81,53 @@ class BotStatsTests(unittest.TestCase):
         self.assertEqual((q["refresh_round_trip_ms"]["p50"], q["refresh_round_trip_ms"]["p90"]), (100, 200))
         self.assertEqual(q["uptime_pct"], {"Buy": 48.0})  # 100..1100 and 1200..5000 of 10 s
         self.assertEqual(q["answers"]["amend_rejected"], 1)
+        self.assertEqual(q["amend_round_trip_ms"]["n"], 2)
+
+    def test_cancelled_amend_is_not_timed_against_a_later_order(self) -> None:
+        t = 1_790_000_000_000
+        rec = lambda ms, kind, **detail: {"ts_ms": t + ms, "kind": kind, "market": "HYPE", "detail": detail}
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp)
+            write_jsonl(runs / "bot-HYPE-journal.jsonl", [
+                rec(0, "place", side="Buy", client_id="b1"),
+                rec(100, "order_update", client_id="b1", state="accepted"),
+                rec(200, "amend", side="Buy", client_id="b1"),
+                rec(300, "order_update", client_id="b1", state="filled_or_expired"),
+                rec(5000, "place", side="Buy", client_id="b2"),
+                rec(5100, "order_update", client_id="b2", state="accepted"),
+                rec(5200, "amend", side="Buy", client_id="b2"),
+                rec(5300, "order_update", client_id="b2", state="amended"),
+            ])
+            since, until = (datetime.fromtimestamp((t + ms) / 1000, timezone.utc) for ms in (0, 10_000))
+            q = bot_stats.quotes(runs, "HYPE", since, until)
+        self.assertEqual(q["refresh_round_trip_ms"], {"n": 1, "mean": 100, "p50": 100, "p90": 100})
+
+    def test_custom_runs_cli_counts_fills_and_uses_first_host_observation(self) -> None:
+        t = 1_790_000_000_000
+        rec = lambda ms, kind, **detail: {"schema_version": 2, "economic_status": "confirmed",
+            "ts_ms": t + ms, "kind": kind, "market": "HYPE", "detail": detail}
+        maker = rec(100, "maker_fill", logical_id="l1", maker_side="Buy", qty="1", px="100", fee_usd="0",
+                    order_id="o1", trade_id="t1", client_id="b1")
+        hedge = lambda ms, seen: rec(ms, "execution_progress", logical_id="l1", attempt_id="h1", venue="lighter",
+            side="Sell", purpose="hedge", cumulative_qty="1", cumulative_quote_usd="101", cumulative_fee_usd="0",
+            fee_complete=True, terminal=True, created_ns=100_000_000, observed_ns=seen)
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp)
+            write_jsonl(runs / "bot-HYPE-journal.jsonl", [maker, maker, hedge(650, 650_000_000), hedge(900, 900_000_000),
+                rec(1200, "maker_fill", logical_id="l2", maker_side="Sell", qty="1", px="101", fee_usd="0",
+                    order_id="o2", trade_id="t2", client_id="s1"),
+                # The same private stream also reports a recovery MARKET, which is not a maker.
+                rec(1500, "maker_fill", logical_id="l3", maker_side="Sell", qty="1", px="100", fee_usd="0.04",
+                    order_id="o3", trade_id="t3", client_id="r1", reduce_only=True)])
+            since, until = (datetime.fromtimestamp((t + ms) / 1000, timezone.utc).isoformat() for ms in (0, 3_600_000))
+            proc = subprocess.run([sys.executable, bot_stats.__file__, "--market", "HYPE", "--runs", tmp,
+                "--since", since, "--now", until, "--json"], check=True, capture_output=True, text=True)
+            result = json.loads(proc.stdout)
+            self.assertEqual(Path(result["runs"]), runs.resolve())
+        x = result["xemm"]
+        self.assertEqual((x["maker_fills"], x["maker_sides"], x["maker_fills_per_hour"]), (2, {"buy": 1, "sell": 1}, 2))
+        self.assertEqual(x["maker_fees_bps"], {"n": 2, "mean": 0, "p50": 0, "p90": 0})
+        self.assertEqual(x["hedge_first_fill_observed_ms"], {"n": 1, "mean": 550, "p50": 550, "p90": 550})
 
 
 if __name__ == "__main__":

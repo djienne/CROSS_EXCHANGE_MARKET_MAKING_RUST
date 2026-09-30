@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execution quality and health of `run`: python3 bot_stats.py --market HYPE [--dry-run] [--json].
+"""Execution quality and health of `run`: python3 bot_stats.py --market HYPE [--dry-run] [--runs DIR] [--json].
 
 combined_pnl.py says how much was made; this says why. It covers five things:
 - how much of the expected edge each taker trade kept, and which leg lost the rest;
@@ -8,6 +8,7 @@ combined_pnl.py says how much was made; this says why. It covers five things:
 - what the controller did, and how XEMM handed the rights to the taker;
 - for a dry run, whether the simulator stayed faithful to its latency model.
 The model's targets are in bot.toml [dry_run].
+Taker fields named aster/lighter describe the first/hedge legs; the venue lists identify them.
 """
 from __future__ import annotations
 
@@ -86,6 +87,8 @@ def taker(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, 
     hours = (now - since).total_seconds() / 3600
     return {
         "trades": len(trades["net_usd"]), "wins": sum(x > 0 for x in trades["net_usd"]),
+        "first_venues": sorted({r.get("first_venue") or "aster" for r in final.values()}),
+        "hedge_venues": sorted({r.get("hedge_venue") or "lighter" for r in final.values()}),
         "net_usd": round(sum(trades["net_usd"]), 6),
         "edge_kept": round(realized / expected, 3) if expected else None,
         **{k: dist(v) for k, v in trades.items() if k != "net_usd"},
@@ -111,8 +114,39 @@ def xemm(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, A
         firsts = {v: min((f.timestamp for f in t["fills"] if f.venue == v and f.timestamp), default=None) for v in ("aster", "lighter")}
         if all(firsts.values()):
             stats["hedge_delay_ms"].append((firsts["lighter"] - firsts["aster"]).total_seconds() * 1000)
+        for f in t["fills"]:
+            # The Aster user stream also calls a reduce-only recovery MARKET a maker_fill.
+            if f.venue == "aster" and (f.source.get("kind") != "maker_fill" or f.source.get("detail", {}).get("reduce_only")):
+                continue
+            if f.timestamp and since <= f.timestamp <= now and f.quote and f.fee is not None:
+                stats["maker_fees_bps" if f.venue == "aster" else "hedge_fees_bps"].append(float(f.fee / f.quote * 10_000))
+    makers = [f for t in trades for f in t["fills"] if f.source.get("kind") == "maker_fill"
+              and not f.source.get("detail", {}).get("reduce_only")
+              and f.qty > 0 and f.timestamp and since <= f.timestamp <= now]
+    # Venue clocks can differ. This delay uses the host's monotonic clock, from the hedge
+    # obligation's creation to its first observed fill; later fee/backfill notices do not add samples.
+    attempts = {f.attempt_id for t in trades for f in t["fills"] if f.venue != "aster"}
+    observed = {}
+    for _, r in iter_jsonl(path):
+        d = r.get("detail", {})
+        if (not isinstance(d, dict) or r.get("market") != market or r.get("kind") != "execution_progress" or d.get("purpose") != "hedge"
+                or d.get("attempt_id") not in attempts
+                or not since.timestamp() * 1000 <= r.get("ts_ms", 0) <= now.timestamp() * 1000
+                or float(d.get("cumulative_qty") or 0) <= 0):
+            continue
+        created, seen = d.get("created_ns"), d.get("observed_ns")
+        if created and seen and seen >= created:
+            key = d["attempt_id"]
+            delay = (seen - created) / 1_000_000
+            observed[key] = min(observed.get(key, delay), delay)
+    stats["hedge_first_fill_observed_ms"] = list(observed.values())
+    hours = (now - since).total_seconds() / 3600
     return {"trades": len(trades), "incomplete": sum(t["net_pnl_usdc"] is None for t in trades),
-            "residual": sum(t["residual_qty"] != 0 for t in trades), **{k: dist(v) for k, v in stats.items()}}
+            "residual": sum(t["residual_qty"] != 0 for t in trades),
+            "maker_fills": len(makers), "maker_sides": dict(collections.Counter(f.side for f in makers)),
+            "maker_fills_per_hour": round(len(makers) / hours, 2) if hours > 0 else None,
+            "known_net_usd": float(sum(t["net_pnl_usdc"] for t in trades if t["net_pnl_usdc"] is not None)),
+            **{k: dist(v) for k, v in stats.items()}}
 
 
 def quotes(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, Any]:
@@ -121,9 +155,9 @@ def quotes(runs: Path, market: str, since: datetime, now: datetime) -> dict[str,
     path = runs / f"bot-{market}-journal.jsonl"
     lo, hi = since.timestamp() * 1000, now.timestamp() * 1000
     kinds, answers, side_of = collections.Counter(), collections.Counter(), {}
-    asked: dict[str, int] = {}  # side -> when its refresh was sent
+    asked: dict[str, tuple[str, int, str]] = {}  # side -> client, refresh time, kind
     resting: dict[str, tuple[str, int]] = {}  # side -> (client id, resting since)
-    round_trip, up = [], collections.Counter()
+    round_trip, amend_trip, up = [], [], collections.Counter()
     for _, r in iter_jsonl(path) if path.exists() else ():
         ts, kind, d = r.get("ts_ms", 0), r.get("kind"), r.get("detail")
         if not lo <= ts <= hi or not isinstance(d, dict):
@@ -134,12 +168,19 @@ def quotes(runs: Path, market: str, since: datetime, now: datetime) -> dict[str,
             if cid and side:
                 side_of[cid] = side
             if kind in ("replace", "amend"):
-                asked[side] = ts
+                asked[side] = (cid, ts, kind)
         elif kind == "order_update" and (side := side_of.get(cid)):
             state, held = d.get("state"), resting.get(side)
             answers[state] += 1
-            if state in ("accepted", "amended", "amend_rejected") and side in asked:
-                round_trip.append(ts - asked.pop(side))
+            request = asked.get(side)
+            if request and ((request[2] == "replace" and state == "accepted")
+                    or (request[0] == cid and request[2] == "amend" and state in ("amended", "amend_rejected"))):
+                elapsed = ts - asked.pop(side)[1]
+                round_trip.append(elapsed)
+                if request[2] == "amend":
+                    amend_trip.append(elapsed)
+            elif request and request[0] == cid and request[2] == "amend" and state in ("cancelled", "filled_or_expired"):
+                asked.pop(side)
             if state in ("accepted", "amended") and (not held or held[0] != cid):
                 # An order that ended unjournaled (a sweep, a restart) counts as resting until
                 # the side's next one, so the uptime is an upper bound.
@@ -153,6 +194,7 @@ def quotes(runs: Path, market: str, since: datetime, now: datetime) -> dict[str,
     minutes = max(hi - lo, 1) / 60_000
     return {"per_min": {k: round(n / minutes, 2) for k, n in sorted(kinds.items())}, "answers": dict(answers),
             "refresh_round_trip_ms": dist(round_trip),
+            "amend_round_trip_ms": dist(amend_trip),
             "uptime_pct": {s: round(100 * t / max(hi - lo, 1), 1) for s, t in sorted(up.items())}}
 
 
@@ -238,11 +280,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--market", default="HYPE")
     parser.add_argument("--dry-run", action="store_true", help="Report the dry run (LIGHTER_ASTER_BOT/runs/dry-run/).")
+    parser.add_argument("--runs", type=Path, help="Read this runs directory instead of the default live or dry-run directory.")
     parser.add_argument("--since", default=None, help="UTC/RFC3339 start. Default: as combined_pnl.py.")
     parser.add_argument("--now", default=None)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
-    runs = report_roots(Path(__file__).resolve().parent, args.dry_run)[1]
+    runs = args.runs.resolve() if args.runs else report_roots(Path(__file__).resolve().parent, args.dry_run)[1]
+    if args.runs and not runs.is_dir():
+        parser.error(f"runs directory does not exist: {runs}")
     since = parse_dt(args.since or default_since(runs, args.market, args.dry_run))
     result = report(runs, args.market, since, parse_dt(args.now) if args.now else utc_now())
     if args.json:

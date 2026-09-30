@@ -225,6 +225,15 @@ treat it as a bug. The reports take `--dry-run` (`python3 ../combined_pnl.py --d
 `python3 ../bot_stats.py --dry-run` summarizes these diagnostics together with the trades'
 edge kept and slippage per leg.
 
+For an isolated live/paper comparison, `bot_stats.py --runs DIR` overrides the default
+directory. Use identical `--since` and `--now` on both reports; `--dry-run` still selects the
+paper start-time default when `--since` is omitted. Native `maker_fills` and `maker_sides`
+count deduplicated exchange fills, while `trades` groups logical obligations. The
+`hedge_first_fill_observed_ms` distribution uses this host's monotonic clock from obligation
+creation to the first observed hedge fill, once per attempt, excluding later fee/backfill
+notices. `hedge_delay_ms` retains the exchange-clock, per-obligation comparison. Amend timing
+matches the same client id's reply; a later placement never completes an unanswered amend.
+
 What the dry run cannot tell: whether the maker fee keys are right (the taker keys matched
 the live probes); the bot's market impact beyond the liquidity it takes; how Aster's ~100 ms
 splits around matching (assumed pessimistically); anything about liquidation. Lighter
@@ -452,6 +461,58 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
   real funds: both need `--i-understand-live --max-usd <10.5..20>`, a flat start and no open
   order. Every action spends the account's lifetime budget (10k + ~1 per USDC traded), and
   there is no dead-man below $1M of volume.
+
+## Live tests and twin calibration, 2026-09-30
+
+Bounded trials used commit `7f2ee12`, $13 clips (0.15 HYPE here), $40 caps, $3 loss stops,
+maker minimum net edge 0 and minimum touch distance 1 bp. Each real route ran alone with an
+isolated paper twin on the identical saved profile. That profile retains the old Hyperliquid
+latency `[200, 500]`; the calibration below applies to subsequent normal dry runs.
+Profiles, logs, shutdown residuals and JSON reports are local in `runs/stage3-20260930/`.
+The HYPE interval is 08:37:52–09:16:05 UTC; HYPE-HL is 09:18:47–10:03:45 UTC.
+
+| Measurement | HYPE live | HYPE twin | HYPE-HL live | HYPE-HL twin |
+| --- | ---: | ---: | ---: | ---: |
+| Window, minutes | 38.22 | 38.22 | 44.97 | 44.97 |
+| Native maker fills (buy/sell) | 6 (2/4) | 4 (1/3) | 2 (1/1) | 1 (0/1) |
+| Maker fills/hour | 9.42 | 6.28 | 2.67 | 1.33 |
+| First hedge fill observed, p50 ms (samples) | 564 (6) | 323 (4) | 973 (2) | 414 (1) |
+| Amend round trip, p50 ms (samples) | 345 (565) | 105 (555) | 351 (828) | 103 (1317) |
+| Maker/hedge fees, bps | 0/0 | 0/0 | 0/4.5 | 0/4.5 |
+| Gross bps, mean per logical trade | -1.764 | -2.609 | 0.809 | -2.310 |
+| Execution net, USD | -0.011445 | -0.013470 | -0.009575 | -0.00884658 |
+
+All four containers stopped with exit 0, empty orders and zero net residual. Real accounts
+finished flat: HYPE's remaining 0.30 pair was closed by `close`, while HYPE-HL's buy/sell
+cycle closed itself. HYPE's whole-cycle wallet delta was -$0.02276013, including the operator
+close and funding; operator closes do not enter the engine journal. HYPE-HL's flat equity
+fell from $228.80656775 to $228.79699275, exactly the journal's -$0.009575. The combined PnL
+and trade-history reports agree on the journal economics. Both streams stayed connected
+through their 25-minute keepalive cadence. One HYPE stale-account sweep cleared in 2.54 s;
+the pre-fill-snapshot mismatch and missing-amend false uncertainty did not recur.
+
+Aster's ~250 ms network floor leaves ~95–101 ms per amend, consistent with the Tokyo model.
+Lighter's 564 ms observed hedge includes a ~252 ms reply and its documented 300 ms Standard
+delay ([account types](https://apidocs.lighter.xyz/docs/account-types)); its twin's 323 ms is
+consistent with that delay and the configured short RTT. Hyperliquid action replies were
+942/973 ms with a 290 ms info round trip. Its API forwards actions to a node and waits for
+commitment ([API servers](https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/api-servers)),
+so subtracting an info ping also leaves forwarding/consensus time. The normal simulation's
+Hyperliquid tail is widened to `[200, 900]`, matching the published co-located median/p99
+([HyperCore](https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/overview)); these two
+Windows samples do not estimate a Tokyo median or p99. Fill counts and unequal resting
+uptime are insufficient to fit `hidden_queue_multiplier`, which remains 0.5. Gross/net
+capture includes adverse selection and hedge price movement; the journal lacks a separate
+submission-time hedge VWAP, so it cannot identify hedge slippage independently.
+
+The 15-minute standalone HYPE and HYPE-HL taker trials had no qualifying opportunity.
+HYPE-LH executed one matched 0.15 entry: expected/realized gross 4.666/2.802 bps, edge kept
+0.601, fees 4.499 bps and entry net -$0.002171. Its reduce-filter trial found no reverse
+opportunity; the operator close left both accounts flat, with whole-cycle cost $0.007532.
+Neither maker trial observed a taker rights handover; its entry gate remained enforced.
+These are operational checks with limited market coverage, not evidence of profitability.
+For Stage 5, choose one normal-profile route with the user; HYPE has the best directly
+observed hedge speed and zero hedge fees in these trials.
 
 ## Orchestrator leftovers
 
