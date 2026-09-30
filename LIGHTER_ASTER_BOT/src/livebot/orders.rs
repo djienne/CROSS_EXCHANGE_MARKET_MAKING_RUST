@@ -210,7 +210,12 @@ impl OrderManager {
     }
 
     fn remember_maker(&mut self, market: &MarketId, side: Side, client_id: &str, qty_lots: i64) {
-        if self.recent_makers.len() >= 64 { self.recent_makers.pop_front(); }
+        if self.recent_makers.len() >= 64 {
+            // Never forget a resting order: an amended one outlives many places on the other side.
+            let live = |id: &str| self.slots.iter().any(|m| [&m.bid, &m.ask].iter().any(|s| s.is_live() && s.client_id.as_deref() == Some(id)));
+            let oldest = self.recent_makers.iter().position(|q| !live(&q.client_id)).unwrap_or(0);
+            self.recent_makers.remove(oldest);
+        }
         self.recent_makers.push_back(super::account::MakerQuery { market: market.clone(), side, client_id: client_id.to_owned(), qty_lots });
     }
 
@@ -228,6 +233,18 @@ impl OrderManager {
         })
     }
 
+    fn slot_mut(&mut self, market: &MarketId, side: Side) -> Option<&mut MakerSlot> {
+        self.market_mut(market).map(|m| match side { Side::Buy => &mut m.bid, Side::Sell => &mut m.ask })
+    }
+
+    /// The most the slot's order can fill, as the uncertainty checks read it from
+    /// [`expected_maker`](Self::expected_maker): both sizes while an amend is in flight, the
+    /// settled one after. A slot the answer cleared keeps the in-flight maximum.
+    fn sync_maker_size(&mut self, market: &MarketId, side: Side) {
+        let Some((id, lots)) = self.slot(market, side).and_then(|s| Some((s.client_id.clone()?, s.fillable_lots()))) else { return };
+        if let Some(query) = self.recent_makers.iter_mut().find(|q| q.client_id == id) { query.qty_lots = lots; }
+    }
+
     pub fn current_hot_order(&self, market: &MarketId, side: Side) -> Option<HotCurrentOrder> {
         self.slot(market, side).and_then(|s| {
             (s.is_live() && s.remaining_lots() > 0).then(|| HotCurrentOrder { px_ticks: s.price_ticks })
@@ -235,8 +252,7 @@ impl OrderManager {
     }
 
     pub fn bind_admission(&mut self, market: &MarketId, side: Side, ticket: std::sync::Arc<super::fills::Admission>) {
-        if let Some(m) = self.market_mut(market) {
-            let slot = match side { Side::Buy => &mut m.bid, Side::Sell => &mut m.ask };
+        if let Some(slot) = self.slot_mut(market, side) {
             if let Some(old) = slot.queued_admission.replace(ticket) { old.cancel_queued(); }
         }
     }
@@ -253,11 +269,7 @@ impl OrderManager {
     /// Allocate the next client id for a new order on (market, side), bumping the epoch.
     pub fn next_client_id(&mut self, market: &MarketId, side: Side) -> Option<String> {
         let session = self.session.clone();
-        let m = self.market_mut(market)?;
-        let slot = match side {
-            Side::Buy => &mut m.bid,
-            Side::Sell => &mut m.ask,
-        };
+        let slot = self.slot_mut(market, side)?;
         let id = aster_client_id(&session, market, side, slot.quote_epoch);
         slot.quote_epoch += 1;
         Some(id)
@@ -267,11 +279,7 @@ impl OrderManager {
     pub fn on_place_sent(&mut self, market: &MarketId, side: Side, client_id: String, price_ticks: i64, qty_lots: i64, now_ns: i64) {
         self.remember_maker(market, side, &client_id, qty_lots);
         self.record_replace(market, now_ns);
-        if let Some(m) = self.market_mut(market) {
-            let slot = match side {
-                Side::Buy => &mut m.bid,
-                Side::Sell => &mut m.ask,
-            };
+        if let Some(slot) = self.slot_mut(market, side) {
             slot.state = OrderLifecycle::PendingPlace;
             slot.client_id = Some(client_id);
             slot.venue_order_id = None;
@@ -289,11 +297,7 @@ impl OrderManager {
     /// ids; the old values stay until the venue answers, since a fill may land at either.
     pub fn on_amend_sent(&mut self, market: &MarketId, side: Side, price_ticks: i64, qty_lots: i64, now_ns: i64) {
         self.record_replace(market, now_ns);
-        let Some(m) = self.market_mut(market) else { return };
-        let slot = match side {
-            Side::Buy => &mut m.bid,
-            Side::Sell => &mut m.ask,
-        };
+        let Some(slot) = self.slot_mut(market, side) else { return };
         if slot.state != OrderLifecycle::Open {
             return;
         }
@@ -302,33 +306,27 @@ impl OrderManager {
         slot.state = OrderLifecycle::PendingAmend;
         slot.amends += 1;
         slot.last_requote_ns = now_ns;
-        // The reconciler judges a filled order by its size: keep the larger one.
-        let client_id = slot.client_id.clone();
-        if let Some(query) = self.recent_makers.iter_mut().find(|q| Some(&q.client_id) == client_id.as_ref()) {
-            query.qty_lots = query.qty_lots.max(qty_lots);
-        }
+        self.sync_maker_size(market, side);
     }
 
     /// The venue refused the amend: the order rests at its old values.
     pub fn on_amend_rejected(&mut self, market: &MarketId, side: Side) {
-        if let Some(m) = self.market_mut(market) {
-            settle_amend(match side { Side::Buy => &mut m.bid, Side::Sell => &mut m.ask }, false);
+        if let Some(slot) = self.slot_mut(market, side) {
+            settle_amend(slot, false);
         }
+        self.sync_maker_size(market, side);
     }
 
     /// Record a venue ack (order is now Open / known by `venue_order_id`).
     pub fn on_acked(&mut self, market: &MarketId, side: Side, venue_order_id: String) {
-        if let Some(m) = self.market_mut(market) {
-            let slot = match side {
-                Side::Buy => &mut m.bid,
-                Side::Sell => &mut m.ask,
-            };
+        if let Some(slot) = self.slot_mut(market, side) {
             slot.venue_order_id = Some(venue_order_id);
             if slot.state == OrderLifecycle::PendingPlace {
                 slot.state = OrderLifecycle::Open;
             }
             settle_amend(slot, true);
         }
+        self.sync_maker_size(market, side);
     }
 
     /// Return the targeted cancel to send for this slot, suppressing duplicates while a cancel is
@@ -341,11 +339,7 @@ impl OrderManager {
         retry_backoff_ms: u64,
     ) -> CancelTarget {
         let retry_ns = (retry_backoff_ms as i64).saturating_mul(1_000_000);
-        let Some(m) = self.market_mut(market) else { return CancelTarget::None };
-        let slot = match side {
-            Side::Buy => &mut m.bid,
-            Side::Sell => &mut m.ask,
-        };
+        let Some(slot) = self.slot_mut(market, side) else { return CancelTarget::None };
         if !slot.is_live() {
             return CancelTarget::None;
         }
@@ -366,11 +360,7 @@ impl OrderManager {
     /// Record that a cancel was sent for (market, side).
     pub fn on_cancel_sent(&mut self, market: &MarketId, side: Side, now_ns: i64) {
         self.record_replace(market, now_ns);
-        if let Some(m) = self.market_mut(market) {
-            let slot = match side {
-                Side::Buy => &mut m.bid,
-                Side::Sell => &mut m.ask,
-            };
+        if let Some(slot) = self.slot_mut(market, side) {
             if slot.is_live() {
                 slot.last_cancel_attempt_ns = now_ns;
                 slot.state = OrderLifecycle::PendingCancel;
@@ -396,11 +386,7 @@ impl OrderManager {
         if cum_filled_lots <= 0 {
             return;
         }
-        if let Some(m) = self.market_mut(market) {
-            let slot = match side {
-                Side::Buy => &mut m.bid,
-                Side::Sell => &mut m.ask,
-            };
+        if let Some(slot) = self.slot_mut(market, side) {
             if slot.client_id.as_deref() == Some(client_id) {
                 // Venue/user-stream updates carry cumulative filled quantity for the order. Accept
                 // duplicate/out-of-order partials without moving backwards, and expose the residual
@@ -415,11 +401,7 @@ impl OrderManager {
 
     /// Record that the slot is now empty (cancel confirmed, filled, or expired).
     pub fn on_closed(&mut self, market: &MarketId, side: Side) {
-        if let Some(m) = self.market_mut(market) {
-            let slot = match side {
-                Side::Buy => &mut m.bid,
-                Side::Sell => &mut m.ask,
-            };
+        if let Some(slot) = self.slot_mut(market, side) {
             clear_slot(slot);
         }
     }
@@ -450,24 +432,10 @@ impl OrderManager {
         }
     }
 
-    /// Every live order's client id.
-    #[cfg(test)]
-    pub fn known_client_ids(&self) -> std::collections::HashSet<String> {
-        let mut out = std::collections::HashSet::new();
-        for m in &self.slots {
-            for slot in [&m.bid, &m.ask] {
-                if let Some(id) = &slot.client_id {
-                    out.insert(id.clone());
-                }
-            }
-        }
-        out
-    }
-
     /// Whether a venue fill's client id belongs to THIS session's bot orders. Maker client ids are
     /// `X{session}-{MARKET}-{B|S}-{epoch}`, so the `X{session}-` prefix attributes a fill to us —
     /// it accepts a legitimate LATE fill (one that arrives after a cancel already closed the slot,
-    /// so `known_client_ids()` would miss it) while rejecting foreign / manual / prior-run orders
+    /// so no slot holds it any more) while rejecting foreign / manual / prior-run orders
     /// that must NEVER trigger a hedge.
     pub fn is_own_client_id(&self, client_id: &str) -> bool {
         !client_id.is_empty() && client_id.starts_with(&format!("X{}-", self.session.as_str()))
@@ -527,14 +495,12 @@ mod tests {
         assert_eq!(m.slot(&"BTC".into(), Side::Buy).unwrap().state, OrderLifecycle::PendingPlace);
         m.on_acked(&"BTC".into(), Side::Buy, "oid1".into());
         assert_eq!(m.slot(&"BTC".into(), Side::Buy).unwrap().state, OrderLifecycle::Open);
-        assert!(m.known_client_ids().contains(&id));
         assert_eq!(m.live_slots(), vec![("BTC".into(), Side::Buy)]);
         m.on_cancel_sent(&"BTC".into(), Side::Buy, 1_000_000);
         assert_eq!(m.slot(&"BTC".into(), Side::Buy).unwrap().state, OrderLifecycle::PendingCancel);
         assert!(m.slot(&"BTC".into(), Side::Buy).unwrap().is_live()); // still fillable
         m.on_closed(&"BTC".into(), Side::Buy);
         assert_eq!(m.slot(&"BTC".into(), Side::Buy).unwrap().state, OrderLifecycle::Idle);
-        assert!(m.known_client_ids().is_empty());
         assert!(m.live_slots().is_empty());
     }
 
@@ -556,7 +522,7 @@ mod tests {
 
         m.on_maker_fill_progress(&"BTC".into(), Side::Buy, &id, 10);
         assert_eq!(m.slot(&"BTC".into(), Side::Buy).unwrap().state, OrderLifecycle::Idle);
-        assert!(m.known_client_ids().is_empty());
+        assert!(m.live_slots().is_empty());
     }
 
     #[test]
@@ -572,6 +538,8 @@ mod tests {
         m.on_amend_rejected(&market, Side::Buy);
         let slot = m.slot(&market, Side::Buy).unwrap();
         assert_eq!((slot.state, slot.price_ticks, slot.qty_lots), (OrderLifecycle::Open, 1000, 5));
+        // A refused amend never held its size, so a fill of the old 5 covers the order.
+        assert_eq!(m.expected_maker(&id).map(|q| q.qty_lots), Some(5));
         m.on_amend_sent(&market, Side::Buy, 999, 7, 20);
         m.on_acked(&market, Side::Buy, "oid1".into());
         let slot = m.slot(&market, Side::Buy).unwrap();
@@ -582,6 +550,23 @@ mod tests {
         m.on_cancel_sent(&market, Side::Buy, 31);
         m.on_acked(&market, Side::Buy, "oid1".into());
         assert_eq!(m.slot(&market, Side::Buy).unwrap().state, OrderLifecycle::PendingCancel);
+    }
+
+    #[test]
+    fn an_amended_order_outlives_64_places_on_the_other_side() {
+        let (mut m, market): (_, MarketId) = (mgr(), "BTC".into());
+        let bid = m.next_client_id(&market, Side::Buy).unwrap();
+        m.on_place_sent(&market, Side::Buy, bid.clone(), 1000, 5, 0);
+        m.on_acked(&market, Side::Buy, "oid1".into());
+        for i in 0..70 {
+            m.on_amend_sent(&market, Side::Buy, 1000 + i, 5, i);
+            m.on_acked(&market, Side::Buy, "oid1".into());
+            let ask = m.next_client_id(&market, Side::Sell).unwrap();
+            m.on_place_sent(&market, Side::Sell, ask, 2000, 5, i);
+            m.on_closed(&market, Side::Sell);
+        }
+        // Its uncertainty could never be backfilled or cleared by a covering fill otherwise.
+        assert_eq!(m.expected_maker(&bid).map(|q| q.qty_lots), Some(5));
     }
 
     #[test]
