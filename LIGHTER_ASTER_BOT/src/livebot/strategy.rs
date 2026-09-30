@@ -2037,7 +2037,10 @@ impl Strategy {
         let may = self.note_quote_gate(market, now_ns);
         let pos = self.position_context(market, now_ns);
 
-        for side in [Side::Buy, Side::Sell] {
+        // The side that requoted longer ago decides first, so one side's amends cannot starve the other's.
+        let requoted = |side| self.orders.slot(market, side).map_or(i64::MIN, |s| s.last_requote_ns);
+        let sides = if requoted(Side::Buy) > requoted(Side::Sell) { [Side::Sell, Side::Buy] } else { [Side::Buy, Side::Sell] };
+        for side in sides {
             let fc_idx = if side == Side::Buy { 0 } else { 1 };
             if fast_cancelled[fc_idx] {
                 continue;
@@ -2226,6 +2229,11 @@ impl Strategy {
                         let why = if amend_capped { "AMEND_CAP_CANCEL" } else { "BACKPRESSURE_CANCEL_ONLY" };
                         self.journal.reason(now_ns, "cancel", Some(market.0.clone()), why);
                     }
+                    return;
+                }
+                // Queued behind the other side's command, an amend would find the books moved and
+                // go out as a cancel: decide it on fresh books once that command is answered.
+                if non_urgent && self.orders.slot(market, side.opposite()).is_some_and(|s| s.is_live() && s.state != OrderLifecycle::Open) {
                     return;
                 }
                 let permit = self.maker_permit(market, now_ns, versions);
@@ -4183,6 +4191,35 @@ lighter_symbol = "BTC"
         strat.handle_exec_event(ExecEvent::PlaceAck { client_id: place_cid, venue_order_id: "oid0".into() }, t_soon + 1);
         strat.apply_decision(&m, Side::Buy, SideDecision::Replace { desired: Box::new(desired), reason: ReplaceReason::QuantityChanged }, &scale, t_later).await;
         assert!(matches!(erx.try_recv(), Ok(ExecCommand::Amend { .. })), "non-urgent replace after the interval must go through");
+    }
+
+    #[tokio::test]
+    async fn a_non_urgent_amend_waits_for_the_other_sides_answer() {
+        let account = AccountState::default();
+        let (etx, mut erx) = tokio::sync::mpsc::channel(128); // above the cancel reserve
+        let (htx, _hrx) = tokio::sync::mpsc::channel(16);
+        let mut strat = live_strat(etx, htx, account.clone());
+        let (m, scale): (MarketId, _) = ("BTC".into(), MarketScale::from_spec(&spec()));
+        let t0 = 1_000_000_000_i64;
+        account.publish(funded_snapshot(t0, Decimal::ZERO, Decimal::ZERO));
+        let mut resting = Vec::new();
+        for side in [Side::Buy, Side::Sell] {
+            let SideDecision::Place(desired) = evaluate_side(&edge(), &qcfg(), &books().0, &books().1, side, &spec(), 5000, ts(), &PositionContext::unconstrained(), true, None, true)
+                else { panic!("expected a place") };
+            let client_id = strat.orders.next_client_id(&m, side).unwrap();
+            strat.orders.on_place_sent(&m, side, client_id.clone(), 1000, 10, t0);
+            strat.handle_exec_event(ExecEvent::PlaceAck { client_id: client_id.clone(), venue_order_id: "oid".into() }, t0 + 1);
+            resting.push((desired, client_id));
+        }
+        let later = t0 + 100_000_000; // past the requote interval, within the snapshot age
+        let replace = |i: usize| SideDecision::Replace { desired: resting[i].0.clone(), reason: ReplaceReason::PriceChanged };
+        strat.apply_decision(&m, Side::Buy, replace(0), &scale, later).await;
+        assert!(matches!(erx.try_recv(), Ok(ExecCommand::Amend { .. })));
+        strat.apply_decision(&m, Side::Sell, replace(1), &scale, later).await;
+        assert!(erx.try_recv().is_err(), "held while the bid's amend is unanswered");
+        strat.handle_exec_event(ExecEvent::PlaceAck { client_id: resting[0].1.clone(), venue_order_id: "oid".into() }, later + 1);
+        strat.apply_decision(&m, Side::Sell, replace(1), &scale, later + 2).await;
+        assert!(matches!(erx.try_recv(), Ok(ExecCommand::Amend { ref client_id, .. }) if *client_id == resting[1].1));
     }
 
     #[tokio::test]
