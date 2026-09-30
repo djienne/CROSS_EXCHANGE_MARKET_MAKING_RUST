@@ -244,10 +244,11 @@ splits around matching (assumed pessimistically); anything about liquidation. Li
 signatures are not verified. Live timings are under [Probes](#probes).
 
 **Going live.** Live runs in the `bot` container, on this Windows host or a Linux host
-([Deploy](#deploy)). Live refuses credential files that group or other can read. Docker Desktop
-shows Windows bind mounts as mode 777, so the container's entrypoint copies the env files at
-0600 into a memory-only tmpfs of the bot user and points `*_ENV_PATH` there; the check still
-applies to what the bot reads.
+([Deploy](#deploy)). Live refuses credential files that group or other can read. The `bot`
+container's entrypoint applies that check to the host's env files, then copies them at 0600 into
+a memory-only tmpfs of the bot user and points `*_ENV_PATH` there. Docker Desktop shows every
+Windows bind mount as mode 777: on this host, put `XEMM_ENV_MODE_CHECK=off` in the `.env` beside
+`docker-compose.yml`.
 
 1. The dry run has run for days with no unexplained reject, halt or `no route` warning, and
    its reports agree with the simulated equity net of funding and open-position marks.

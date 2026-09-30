@@ -41,12 +41,14 @@ services:
       ASTER_ENV_PATH: /run/creds/aster.env
       LIGHTER_ENV_PATH: /run/creds/lighter.env
       HYPERLIQUID_ENV_PATH: /run/creds/hyperliquid.env
-    # Docker Desktop shows Windows bind mounts as mode 777, which `run --mode live` refuses for
-    # credentials. The bot reads 0600 copies in a memory-only tmpfs of its own user instead;
-    # the check itself stays.
+      XEMM_ENV_MODE_CHECK: ${XEMM_ENV_MODE_CHECK:-}
+    # The bot reads 0600 copies in a memory-only tmpfs of its own user, so the entrypoint checks
+    # the host files first: group/other access is refused, as `run --mode live` refuses it. Docker
+    # Desktop shows every Windows bind mount as mode 777; there, set XEMM_ENV_MODE_CHECK=off in the
+    # .env beside this file.
     tmpfs:
       - /run/creds:mode=0700,uid=${XEMM_UID:-1000},gid=${XEMM_GID:-1000}
-    entrypoint: ["sh", "-c", "for f in aster lighter hyperliquid; do [ ! -e /app/$$f.env ] || install -m 600 /app/$$f.env /run/creds/; done; exec lighter_aster_bot \"$$@\"", "lighter_aster_bot"]
+    entrypoint: ["sh", "-c", "for f in aster lighter hyperliquid; do s=/app/$$f.env; [ -e $$s ] || continue; m=$$(stat -Lc %a $$s); case $$XEMM_ENV_MODE_CHECK:$$m in off:*|*00) ;; *) echo \"refusing $$s: mode $$m; chmod 600 it, or set XEMM_ENV_MODE_CHECK=off in the .env beside docker-compose.yml\" >&2; exit 1;; esac; install -m 600 $$s /run/creds/; done; exec lighter_aster_bot \"$$@\"", "lighter_aster_bot"]
     volumes:
       # Mount the WHOLE deploy dir read-only at the working dir, so bot.toml, the signer
       # binaries and the secret env files (aster.env / lighter.env / hyperliquid.env) are
