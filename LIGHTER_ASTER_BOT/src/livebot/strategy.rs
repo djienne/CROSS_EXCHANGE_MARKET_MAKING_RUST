@@ -1724,8 +1724,7 @@ impl Strategy {
         if self.frozen && self.clean_start {
             return Some(MAKER_GATE_FROZEN);
         }
-        let snap = self.account.load();
-        let pending_snapshot = self.markets.iter().any(|m| self.snapshot_predates_position_action(&snap, m));
+        let positions = self.position_status(&self.account.load());
         let inputs = MakerGateInputs {
             clean_start_done: self.clean_start,
             // Per-market (NOT the global watchdog gate): only THIS market's own Aster+Lighter feed
@@ -1741,14 +1740,14 @@ impl Strategy {
                 .as_ref()
                 .is_none_or(|s| s.age_ms(now_ns) <= self.cfg.live.max_user_stream_staleness_ms),
             // A pre-execution read cannot establish a mismatch. Still check all other risk gates.
-            positions_reconciled: pending_snapshot || self.positions_reconciled(),
+            positions_reconciled: positions != Some(false),
             no_orphan_hedge: !self.has_orphan_hedge(),
             unhedged_within_limits: self.unhedged_within_limits(now_ns),
         };
         if let Err(reason) = evaluate_maker_gate(&inputs) {
             return Some(reason.as_str());
         }
-        if pending_snapshot { return Some("POSITION_SNAPSHOT_PENDING"); }
+        if positions.is_none() { return Some("POSITION_SNAPSHOT_PENDING"); }
         if self.cooldown.active(now_ns, market) {
             return Some("COOLDOWN");
         }
@@ -1850,13 +1849,18 @@ impl Strategy {
     }
 
     /// True when every market's predicted position agrees with the exchange-reported snapshot
-    /// within `max_position_mismatch_usd`. A single mismatch ⇒ freeze (returns
-    /// false).
+    /// within `max_position_mismatch_usd`. A single mismatch ⇒ freeze (returns false).
     fn positions_reconciled(&self) -> bool {
-        let snap = self.account.load();
+        self.position_status(&self.account.load()) == Some(true)
+    }
+
+    /// [`positions_reconciled`](Self::positions_reconciled), or `None` while any market's read
+    /// began before its latest execution: checked first, so a mismatch elsewhere cannot turn a
+    /// pending read into a sweep.
+    fn position_status(&self, snap: &AccountSnapshot) -> Option<bool> {
+        if self.markets.iter().any(|m| self.snapshot_predates_position_action(snap, m)) { return None; }
         let tol = self.cfg.live.max_position_mismatch_usd;
         for m in &self.markets {
-            if self.snapshot_predates_position_action(&snap, m) { return false; }
             let mark = self.mark_cache.get(m).copied().unwrap_or(Decimal::ZERO);
             if mark <= Decimal::ZERO {
                 continue; // no mark ⇒ can't judge; don't spuriously freeze on a missing book
@@ -1866,10 +1870,10 @@ impl Strategy {
             let pred_h = self.hl_pos.get(m).map(|p| p.qty).unwrap_or(Decimal::ZERO);
             let rep_h = snap.reported_position(super::account::Venue::Hedge, m);
             if position_mismatch(pred_a, rep_a, mark, tol) || position_mismatch(pred_h, rep_h, mark, tol) {
-                return false;
+                return Some(false);
             }
         }
-        true
+        Some(true)
     }
 
     /// True while the total in-flight (not yet hedged) Aster notional and the oldest unhedged
@@ -1968,26 +1972,8 @@ impl Strategy {
                         };
                         match hot_precheck_side(a_hot, h_hot, side, current, now_ns, &self.precheck_cfg) {
                             HotPrecheck::CancelFast(_reason) => {
-                                let target = self.cancel_target(market, side, now_ns);
-                                let CancelTarget::Send { client_id, venue_order_id } = target else {
-                                    continue;
-                                };
-                                let cmd = ExecCommand::Cancel {
-                                    market: market.clone(), client_id, venue_order_id,
-                                };
-                                match self.try_send_aster_cmd(cmd, AsterCommandPriority::RiskReducing, now_ns) {
-                                    ExecDispatch::Sent => {
-                                        self.orders.on_cancel_sent(market, side, now_ns);
-                                        let idx = if side == Side::Buy { 0 } else { 1 };
-                                        fast_cancelled[idx] = true;
-                                    }
-                                    ExecDispatch::BudgetBlocked => {
-                                        self.note_aster_budget_block(now_ns, "fast_cancel_budget_blocked", AsterCommandPriority::RiskReducing);
-                                        self.freeze_and_sweep(now_ns, "fast_cancel_budget_blocked");
-                                    }
-                                    ExecDispatch::QueueFull | ExecDispatch::QueueClosed => {
-                                        self.freeze_and_sweep(now_ns, "fast_cancel_dispatch_failed");
-                                    }
+                                if self.send_cancel(market, side, now_ns, "fast_cancel_budget_blocked") {
+                                    fast_cancelled[if side == Side::Buy { 0 } else { 1 }] = true;
                                 }
                             }
                             HotPrecheck::NeedExactQuote => {}
@@ -2111,29 +2097,11 @@ impl Strategy {
         match decision {
             SideDecision::Hold => {}
             SideDecision::Cancel { reason } => {
-                let target = self.cancel_target(market, side, now_ns);
-                let CancelTarget::Send { client_id, venue_order_id } = target else {
-                    return;
-                };
-                // Dispatch FIRST; mutate local state only if the command is actually queued.
-                // A dropped cancel that silently desyncs local state is a safety hazard.
-                let cmd = ExecCommand::Cancel { market: market.clone(), client_id, venue_order_id };
-                match self.try_send_aster_cmd(cmd, AsterCommandPriority::RiskReducing, now_ns) {
-                    ExecDispatch::Sent => {
-                        self.orders.on_cancel_sent(market, side, now_ns);
-                        if reason == ReplaceReason::QuoteTooCloseToTouch {
-                            self.latch_aster_touch_guard(market, side, now_ns);
-                        }
-                        self.journal.typed(now_ns, "cancel", Some(market.0.clone()), JournalDetail::Quote(QuoteRecord { side, price: None, qty: None, reason: Some(reason.as_str()), client_id: self.orders.slot(market, side).and_then(|s| s.client_id.clone()) }), "confirmed");
+                if self.send_cancel(market, side, now_ns, "targeted_cancel_budget_blocked") {
+                    if reason == ReplaceReason::QuoteTooCloseToTouch {
+                        self.latch_aster_touch_guard(market, side, now_ns);
                     }
-                    ExecDispatch::BudgetBlocked => {
-                        self.note_aster_budget_block(now_ns, "targeted_cancel_budget_blocked", AsterCommandPriority::RiskReducing);
-                        self.freeze_and_sweep(now_ns, "aster_command_budget_exhausted");
-                    }
-                    ExecDispatch::QueueFull | ExecDispatch::QueueClosed => {
-                        warn!("exec queue full/closed: cancel NOT sent for {market} {side:?}; freezing + safety sweep");
-                        self.freeze_and_sweep(now_ns, "exec_queue_send_failed");
-                    }
+                    self.journal.typed(now_ns, "cancel", Some(market.0.clone()), JournalDetail::Quote(QuoteRecord { side, price: None, qty: None, reason: Some(reason.as_str()), client_id: self.orders.slot(market, side).and_then(|s| s.client_id.clone()) }), "confirmed");
                 }
             }
             SideDecision::Place(desired) => {
@@ -2192,34 +2160,18 @@ impl Strategy {
                 }
                 if let Some(&suppress_ns) = self.margin_suppressed.get(&(market.clone(), side)) {
                     if now_ns.saturating_sub(suppress_ns) < 10_000_000_000 {
+                        // The refused amend left the order at the price this decision leaves.
+                        if self.send_cancel(market, side, now_ns, "margin_suppressed_cancel") {
+                            self.journal.reason(now_ns, "cancel", Some(market.0.clone()), "MARGIN_SUPPRESSED_CANCEL");
+                        }
                         return;
                     }
                     self.margin_suppressed.remove(&(market.clone(), side));
                     info!("margin suppression expired for {market} {side:?}");
                 }
                 if self.cfg.live.quote.reduce_position_only && reason == ReplaceReason::NoLongerProfitable {
-                    let target = self.cancel_target(market, side, now_ns);
-                    let CancelTarget::Send { client_id, venue_order_id } = target else {
-                        return;
-                    };
-                    let cmd = ExecCommand::Cancel {
-                        market: market.clone(),
-                        client_id,
-                        venue_order_id,
-                    };
-                    match self.try_send_aster_cmd(cmd, AsterCommandPriority::RiskReducing, now_ns) {
-                        ExecDispatch::Sent => {
-                            self.orders.on_cancel_sent(market, side, now_ns);
-                            self.journal.reason(now_ns, "cancel", Some(market.0.clone()), "NO_LONGER_PROFITABLE_CANCEL_ONLY");
-                        }
-                        ExecDispatch::BudgetBlocked => {
-                            self.note_aster_budget_block(now_ns, "no_longer_profitable_cancel_only", AsterCommandPriority::RiskReducing);
-                            self.freeze_and_sweep(now_ns, "aster_command_budget_exhausted");
-                        }
-                        ExecDispatch::QueueFull | ExecDispatch::QueueClosed => {
-                            warn!("exec queue full/closed: no-longer-profitable cancel-only NOT sent for {market} {side:?}; freezing + safety sweep");
-                            self.freeze_and_sweep(now_ns, "exec_queue_send_failed");
-                        }
+                    if self.send_cancel(market, side, now_ns, "no_longer_profitable_cancel_only") {
+                        self.journal.reason(now_ns, "cancel", Some(market.0.clone()), "NO_LONGER_PROFITABLE_CANCEL_ONLY");
                     }
                     return;
                 }
@@ -2270,29 +2222,9 @@ impl Strategy {
                     // Under backpressure, prefer a cancel-only risk reduction over an amend. This
                     // drains stale/unprofitable exposure while preserving queue reserve. An order
                     // at the amend cap is cancelled too; the next tick places a fresh one.
-                    let target = self.cancel_target(market, side, now_ns);
-                    let CancelTarget::Send { client_id, venue_order_id } = target else {
-                        return;
-                    };
-                    let cmd = ExecCommand::Cancel {
-                        market: market.clone(),
-                        client_id,
-                        venue_order_id,
-                    };
-                    match self.try_send_aster_cmd(cmd, AsterCommandPriority::RiskReducing, now_ns) {
-                        ExecDispatch::Sent => {
-                            self.orders.on_cancel_sent(market, side, now_ns);
-                            let why = if amend_capped { "AMEND_CAP_CANCEL" } else { "BACKPRESSURE_CANCEL_ONLY" };
-                            self.journal.reason(now_ns, "cancel", Some(market.0.clone()), why);
-                        }
-                        ExecDispatch::BudgetBlocked => {
-                            self.note_aster_budget_block(now_ns, "urgent_cancel_only_budget_blocked", AsterCommandPriority::RiskReducing);
-                            self.freeze_and_sweep(now_ns, "aster_command_budget_exhausted");
-                        }
-                        ExecDispatch::QueueFull | ExecDispatch::QueueClosed => {
-                            warn!("exec queue full/closed: backpressure cancel-only NOT sent for {market} {side:?}; freezing + safety sweep");
-                            self.freeze_and_sweep(now_ns, "exec_queue_send_failed");
-                        }
+                    if self.send_cancel(market, side, now_ns, "urgent_cancel_only_budget_blocked") {
+                        let why = if amend_capped { "AMEND_CAP_CANCEL" } else { "BACKPRESSURE_CANCEL_ONLY" };
+                        self.journal.reason(now_ns, "cancel", Some(market.0.clone()), why);
                     }
                     return;
                 }
@@ -2482,25 +2414,31 @@ impl Strategy {
     /// cooldown means neither side should rest while we hedge).
     fn cancel_both_sides(&mut self, market: &MarketId, now_ns: i64) {
         for side in [Side::Buy, Side::Sell] {
-            let target = self.cancel_target(market, side, now_ns);
-            let CancelTarget::Send { client_id, venue_order_id } = target else {
-                continue;
-            };
-            // Dispatch FIRST; a dropped post-fill cancel leaves a maker order resting (could
-            // re-fill) while local state says cancelled — escalate to a freeze, never silent.
-            let cmd = ExecCommand::Cancel { market: market.clone(), client_id, venue_order_id };
-            match self.try_send_aster_cmd(cmd, AsterCommandPriority::RiskReducing, now_ns) {
-                ExecDispatch::Sent => self.orders.on_cancel_sent(market, side, now_ns),
-                ExecDispatch::BudgetBlocked => {
-                    self.note_aster_budget_block(now_ns, "post_fill_cancel_budget_blocked", AsterCommandPriority::RiskReducing);
-                    self.freeze_and_sweep(now_ns, "aster_command_budget_exhausted");
-                }
-                ExecDispatch::QueueFull | ExecDispatch::QueueClosed => {
-                    error!("CRITICAL: post-fill cancel for {market} {side:?} dropped (queue full/closed); freezing");
-                    self.freeze_and_sweep(now_ns, "exec_queue_send_failed");
-                }
+            self.send_cancel(market, side, now_ns, "post_fill_cancel_budget_blocked");
+        }
+    }
+
+    /// Queues a risk-reducing cancel of this side's order, if it has one; true once queued. Local
+    /// state changes only then: a cancel that cannot be queued would leave the order resting (it
+    /// can still fill) while local state says cancelled, so it freezes and sweeps instead.
+    fn send_cancel(&mut self, market: &MarketId, side: Side, now_ns: i64, budget_cause: &'static str) -> bool {
+        let CancelTarget::Send { client_id, venue_order_id } = self.cancel_target(market, side, now_ns) else { return false };
+        let cmd = ExecCommand::Cancel { market: market.clone(), client_id, venue_order_id };
+        match self.try_send_aster_cmd(cmd, AsterCommandPriority::RiskReducing, now_ns) {
+            ExecDispatch::Sent => {
+                self.orders.on_cancel_sent(market, side, now_ns);
+                return true;
+            }
+            ExecDispatch::BudgetBlocked => {
+                self.note_aster_budget_block(now_ns, budget_cause, AsterCommandPriority::RiskReducing);
+                self.freeze_and_sweep(now_ns, "aster_command_budget_exhausted");
+            }
+            ExecDispatch::QueueFull | ExecDispatch::QueueClosed => {
+                error!("CRITICAL: cancel for {market} {side:?} dropped ({budget_cause}, queue full/closed); freezing + safety sweep");
+                self.freeze_and_sweep(now_ns, "exec_queue_send_failed");
             }
         }
+        false
     }
 
     /// Fold a worker/venue event back into the order + hedge state.
@@ -4278,6 +4216,31 @@ lighter_symbol = "BTC"
 
         assert!(matches!(erx.try_recv(), Ok(ExecCommand::Cancel { .. })), "live reduce-only stale quote must be cancel-only");
         assert!(erx.try_recv().is_err(), "cancel-only path must not enqueue a replacement place");
+    }
+
+    #[tokio::test]
+    async fn a_margin_refused_amend_cancels_the_quote_it_meant_to_move() {
+        let account = AccountState::default();
+        let (etx, mut erx) = tokio::sync::mpsc::channel(64);
+        let (htx, _hrx) = tokio::sync::mpsc::channel(16);
+        let mut strat = live_strat(etx, htx, account.clone());
+        let (m, scale): (MarketId, _) = ("BTC".into(), MarketScale::from_spec(&spec()));
+        let desired = match evaluate_side(&edge(), &qcfg(), &books().0, &books().1, Side::Buy, &spec(), 5000, ts(), &PositionContext::unconstrained(), true, None, true) {
+            SideDecision::Place(d) => *d,
+            other => panic!("expected place, got {other:?}"),
+        };
+        // Funded, so the margin guard passes and only the suppression can decide.
+        let t0 = crate::hotpath::clock::mono_now_ns();
+        account.publish(funded_snapshot(t0, dec!(0), dec!(0)));
+        let cid = strat.orders.next_client_id(&m, Side::Buy).unwrap();
+        strat.orders.on_place_sent(&m, Side::Buy, cid.clone(), 1000, 10, t0);
+        strat.handle_exec_event(ExecEvent::PlaceAck { client_id: cid.clone(), venue_order_id: "oid0".into() }, t0 + 1);
+        strat.orders.on_amend_sent(&m, Side::Buy, 1001, 10, t0 + 2);
+        strat.handle_exec_event(ExecEvent::AmendReject { client_id: cid.clone(), reason: "Margin is insufficient".into() }, t0 + 3);
+        let replace = SideDecision::Replace { desired: Box::new(desired), reason: ReplaceReason::PriceChanged };
+        strat.apply_decision(&m, Side::Buy, replace, &scale, t0 + 4).await;
+        assert!(std::iter::from_fn(|| erx.try_recv().ok()).any(|c| matches!(c, ExecCommand::Cancel { ref client_id, .. } if *client_id == cid)),
+            "the order still rests where the refused amend meant to move it from");
     }
 
     #[test]

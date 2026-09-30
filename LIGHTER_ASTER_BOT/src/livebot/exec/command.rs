@@ -123,8 +123,8 @@ pub enum ExecCommand {
 ///   processed the `PlaceAck` (orders.rs is the sole setter), which proves no `Place` for
 ///   that client id can still be queued — so reordering cannot produce the
 ///   `-2011 → AlreadyGone → slot cleared → ghost order rests` sequence. Un-acked cancels
-///   (`venue_order_id: None`) stay FIFO. An `Amend` it overtakes finds no order (-2013) and
-///   changes nothing.
+///   (`venue_order_id: None`) stay FIFO. An `Amend` it overtakes has lost its permit to that
+///   cancel, so the worker sends a DELETE instead, which finds the order gone (`CancelAck`).
 /// - `FlattenAster`: reduce-only MARKET with no slot interaction.
 /// - `CancelAllBot` must stay FIFO: sweeping ahead of queued `Place`s
 ///   would let those places rest AFTER the sweep.
