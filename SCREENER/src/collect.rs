@@ -705,7 +705,8 @@ pub async fn run(cfg: Config, dir: PathBuf, stop: CancellationToken) -> Result<(
         let now = wall_ms();
         let gates = tokio::task::block_in_place(|| load_gates(&dir, rec.span_ms(), now));
         tracing::info!("gate history: {} pairs, loaded in {:.1} s", gates.len(), (wall_ms() - now) as f64 / 1e3);
-        let params = json!({ "version": 2, "collect": &cfg.collect, "recording": &rec, "preroll_ms": PREROLL_MS, "tail_ms": TAIL_MS, "window_ms": WINDOW_MS, "edge_bin_bps": EDGE_BIN_BPS });
+        let params = json!({ "version": 2, "collect": &cfg.collect, "recording": &rec, "preroll_ms": PREROLL_MS, "tail_ms": TAIL_MS, "window_ms": WINDOW_MS, "edge_bin_bps": EDGE_BIN_BPS,
+            "hyperliquid_source": if std::env::var_os("HL_PUBLIC_WS").is_some() { "central_hub" } else { "direct" }, "receipt_clock": "consumer arrival after local relay" });
         let header = vec![format!("P\t{params}"), format!("U\t{}", serde_json::to_string(&pairs)?)];
         let (store, writer) = Store::open(&dir, header)?;
         let day_end = now - now.rem_euclid(DAY_MS) + DAY_MS;

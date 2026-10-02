@@ -18,7 +18,7 @@ enum Frame {
     Book { coin: String, time: i64, levels: [Vec<Level>; 2] },
     #[serde(rename = "trades")]
     Trades(Vec<Print>),
-    #[serde(rename = "subscriptionResponse")]
+    #[serde(rename = "subscriptionResponse", alias = "hubStatus")]
     Subscribed(serde::de::IgnoredAny),
     #[serde(other)]
     Other,
@@ -135,6 +135,7 @@ mod tests {
         assert_eq!(f.events(snapshot, &index, 20_000).unwrap().len(), 1);
         assert!(f.expire(40_000).is_empty());
         f.events(r#"{"channel":"pong"}"#, &index, 50_000).unwrap();
+        assert!(f.events(r#"{"channel":"hubStatus","data":{"registered":["BTC"]}}"#, &index, 50_000).unwrap().is_empty());
         assert_eq!(f.expire(50_001).len(), 1);
         f.reset();
         assert!(f.events(&print(101, 5), &index, 50_002).unwrap().is_empty());
