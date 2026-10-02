@@ -37,6 +37,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 ############################
 # 2) Runtime
 ############################
+FROM builder AS central-checks
+COPY bot.toml /app/bot.toml
+COPY --from=fixtures /execution_economics.json /tests/fixtures/execution_economics.json
+COPY --from=signers /lighter-signer-linux-amd64.so /app/signers/lighter-signer-linux-amd64.so
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo test --release --locked hyperliquid
+
 FROM debian:bookworm-slim AS runtime
 
 # rustls/webpki-roots bundles Mozilla roots, but install ca-certificates so every

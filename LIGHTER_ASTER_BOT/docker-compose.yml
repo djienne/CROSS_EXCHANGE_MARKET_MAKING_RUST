@@ -129,6 +129,9 @@ services:
   dryrun-hl:
     <<: *dryrun
     container_name: lighter-aster-dryrun-hl
+    environment:
+      HL_PUBLIC_WS: ws://hyperliquid-data-hub:8766/ws?consumer=xemm-hl
+    networks: [default, market-data]
     command: ["run", "--market", "HYPE-HL", "--mode", "dry-run", "--ack-breaker"]
     # Declared again: cpu_limits.bat keeps each service's own `cpus`.
     deploy:
@@ -141,6 +144,9 @@ services:
   dryrun-lh:
     <<: *dryrun
     container_name: lighter-aster-dryrun-lh
+    environment:
+      HL_PUBLIC_WS: ws://hyperliquid-data-hub:8766/ws?consumer=xemm-lh
+    networks: [default, market-data]
     command: ["run", "--market", "HYPE-LH", "--mode", "dry-run", "--ack-breaker"]
     deploy:
       resources:
@@ -182,3 +188,8 @@ services:
 volumes:
   # The live Aster nonce counter (`bot` service); it takes the image's /nonce owner.
   aster-nonce:
+
+networks:
+  market-data:
+    external: true
+    name: hyperliquid-market-data

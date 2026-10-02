@@ -12,6 +12,9 @@ use tokio_util::sync::CancellationToken;
 pub const ASTER_WS: &str = "wss://fstream.asterdex.com";
 pub const LIGHTER_WS: &str = "wss://mainnet.zklighter.elliot.ai/stream";
 pub const HYPERLIQUID_WS: &str = "wss://api.hyperliquid.xyz/ws";
+pub fn hyperliquid_ws() -> String {
+    std::env::var("HL_PUBLIC_WS").unwrap_or_else(|_| HYPERLIQUID_WS.to_string())
+}
 /// Aster allows 200 streams per connection.
 pub const ASTER_STREAMS_PER_CONNECTION: usize = 190;
 /// Lighter allows 500 subscriptions per connection.
@@ -78,7 +81,7 @@ async fn session(url: &str, subscribe: &[String], on: &mut impl FnMut(Wire<'_>))
                 continue;
             }
             _ = ping.tick() => {
-                let ping = if url == HYPERLIQUID_WS { Message::Text(r#"{"method":"ping"}"#.into()) } else { Message::Ping(Vec::new()) };
+                let ping = if url == HYPERLIQUID_WS || url == hyperliquid_ws() { Message::Text(r#"{"method":"ping"}"#.into()) } else { Message::Ping(Vec::new()) };
                 send(&mut write, ping).await?;
                 continue;
             }

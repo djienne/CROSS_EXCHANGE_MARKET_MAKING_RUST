@@ -25,6 +25,11 @@ const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 
 /// The websocket of the REST origin `rest_base`.
 pub fn ws_url(rest_base: &str) -> String {
+    // Only redirect the real public feed. Simulated venue URLs must stay local
+    // to each dry run, and account/order REST calls still use rest_base.
+    if rest_base.trim_end_matches('/') == "https://api.hyperliquid.xyz" {
+        if let Ok(url) = std::env::var("HL_PUBLIC_WS") { return url; }
+    }
     format!("{}/ws", rest_base.trim_end_matches('/').replacen("http", "ws", 1))
 }
 

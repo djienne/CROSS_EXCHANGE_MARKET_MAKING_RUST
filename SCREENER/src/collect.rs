@@ -779,11 +779,14 @@ async fn run_day(mut collector: Collector, pairs: &[Pair], store: &Store, day_en
         let ids: Vec<usize> = markets.iter().enumerate().filter(|(_, m)| m.venue == venue).map(|(i, _)| i).collect();
         let chunk = match venue { Venue::Aster => feeds::ASTER_STREAMS_PER_CONNECTION / 2, Venue::Lighter => feeds::LIGHTER_SUBSCRIPTIONS_PER_CONNECTION / 2, Venue::Hyperliquid => 300 };
         for ids in ids.chunks(chunk) {
-            let (url, subscribe) = match venue {
+            let (url, mut subscribe): (String, Vec<String>) = match venue {
                 Venue::Aster => (format!("{}/stream?streams={}", feeds::ASTER_WS, ids.iter().flat_map(|&i| ["bookTicker", "aggTrade"].map(|s| format!("{}@{s}", markets[i].symbol.to_lowercase()))).collect::<Vec<_>>().join("/")), Vec::new()),
                 Venue::Lighter => (feeds::LIGHTER_WS.to_string(), ids.iter().flat_map(|&i| ["ticker", "trade"].map(|c| json!({"type":"subscribe", "channel":format!("{c}/{}", markets[i].id.expect("Lighter market id"))}).to_string())).collect()),
-                Venue::Hyperliquid => (feeds::HYPERLIQUID_WS.to_string(), ids.iter().flat_map(|&i| [json!({"type":"bbo","coin":markets[i].symbol}), json!({"type":"l2Book","coin":markets[i].symbol,"fast":true}), json!({"type":"trades","coin":markets[i].symbol})].map(|subscription| json!({"method":"subscribe", "subscription":subscription}).to_string())).collect()),
+                Venue::Hyperliquid => (feeds::hyperliquid_ws(), ids.iter().flat_map(|&i| [json!({"type":"bbo","coin":markets[i].symbol}), json!({"type":"l2Book","coin":markets[i].symbol,"fast":true}), json!({"type":"trades","coin":markets[i].symbol})].map(|subscription| json!({"method":"subscribe", "subscription":subscription}).to_string())).collect()),
             };
+            if venue == Venue::Hyperliquid && url != feeds::HYPERLIQUID_WS {
+                subscribe.insert(0, json!({"method":"register", "coins":ids.iter().map(|&i| &markets[i].symbol).collect::<Vec<_>>()}).to_string());
+            }
             let connection = connections.len();
             connections.push((venue, ids.to_vec()));
             let (tx, day) = (tx.clone(), day.clone());

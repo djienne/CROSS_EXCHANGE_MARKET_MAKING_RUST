@@ -8,6 +8,9 @@ services:
     build: .
     image: aster_lighter_screener:latest
     container_name: aster-lighter-screener
+    environment:
+      HL_PUBLIC_WS: ws://hyperliquid-data-hub:8766/ws?consumer=xemm-screener
+    networks: [default, market-data]
     user: "${XEMM_UID:-1000}:${XEMM_GID:-1000}"
     volumes:
       - ./screener.toml:/app/screener.toml:ro
@@ -44,3 +47,8 @@ services:
         limits:
           cpus: '1'
           memory: 8G
+
+networks:
+  market-data:
+    external: true
+    name: hyperliquid-market-data
