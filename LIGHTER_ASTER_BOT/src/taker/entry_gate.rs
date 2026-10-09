@@ -208,7 +208,8 @@ pub struct OpportunityGate {
     healthy: Arc<AtomicBool>,
     changed: Arc<Notify>,
     sequence: u64,
-    prune_pending: bool,
+    /// The time of the Prune sent and not yet seen applied.
+    prune_pending: Option<DateTime<Utc>>,
     last_sample_at: Option<DateTime<Utc>>,
 }
 
@@ -252,7 +253,7 @@ impl OpportunityGate {
             }
         })?;
         Ok(Self { cfg: cfg.clone(), market: market.clone(), path, snapshot, tx, healthy, changed,
-            sequence: 0, prune_pending: false, last_sample_at: None })
+            sequence: 0, prune_pending: None, last_sample_at: None })
     }
 
     pub fn path(&self) -> &Path { &self.path }
@@ -277,17 +278,22 @@ impl OpportunityGate {
                 sample_count: snapshot.count, decision: "off", recorded: false };
         }
         let expired = snapshot.valid_through.is_some_and(|through| input.timestamp > through);
-        if expired && !self.prune_pending {
+        // A window pruned at `sent` is valid through `sent` or later (or empty): the Prune is applied, and a
+        // window expired again since then needs another one, or the gate waits for it forever.
+        if self.prune_pending.is_some_and(|sent| snapshot.valid_through.is_none_or(|through| through >= sent)) {
+            self.prune_pending = None;
+        }
+        if expired && self.prune_pending.is_none() {
             if self.tx.try_send(HistoryCommand::Prune(input.timestamp)).is_err() {
                 self.healthy.store(false, Ordering::Release);
-            } else { self.prune_pending = true; }
+            } else { self.prune_pending = Some(input.timestamp); }
         }
         if !self.healthy() || snapshot.sequence != self.sequence || expired {
             return GateEvaluation { allow_execution: false, would_allow: false, threshold_bps: None,
                 sample_count: snapshot.count,
                 decision: if self.healthy() { "history_pending" } else { "history_unavailable" }, recorded: false };
         }
-        self.prune_pending = false;
+        self.prune_pending = None;
         let threshold = (required + self.cfg.min_extra_bps).max(snapshot.percentile.unwrap_or(required));
         let ready = snapshot.count >= self.cfg.min_history_samples;
         let would_allow = ready && input.gross_edge_bps >= threshold;
@@ -617,6 +623,34 @@ mod tests {
         }
         assert_eq!(gate.snapshot.load().percentile, Some(dec!(7)));
         assert_eq!(fs::read(&path).unwrap(), original);
+        drop(gate);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_window_expired_again_after_its_prune_is_pruned_again() {
+        // 2026-10-02 dry run: the pruned window's next-oldest sample expired before the next evaluate,
+        // which then waited for a Prune that was never sent: history_pending for a week.
+        let dir = tmp_dir("reprune");
+        let t0 = Utc::now() - Duration::hours(80);
+        let path = dir.join("opportunities_HYPE.jsonl");
+        append_test_row(&path, &row(t0, "HYPE", dec!(8)));
+        append_test_row(&path, &row(t0 + Duration::minutes(30), "HYPE", dec!(9)));
+        let start = t0 + Duration::hours(72) - Duration::seconds(1);
+        let mut gate = OpportunityGate::new(&cfg(EntryGateMode::Enforce), &MarketId::from("HYPE"), dir.to_str().unwrap(), start).unwrap();
+        let wait_for = |gate: &OpportunityGate, count: usize| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while gate.loaded_samples() != count {
+                assert!(std::time::Instant::now() < deadline, "the window never pruned to {count} samples");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        let after_expiry = |seconds: i64| t0 + Duration::hours(72) + Duration::seconds(seconds);
+        assert_eq!(gate.evaluate(sampled_input(after_expiry(1), dec!(9)), dec!(6)).decision, "history_pending");
+        wait_for(&gate, 1);
+        assert_eq!(gate.evaluate(sampled_input(after_expiry(31 * 60), dec!(9)), dec!(6)).decision, "history_pending");
+        wait_for(&gate, 0);
+        assert_ne!(gate.evaluate(sampled_input(after_expiry(32 * 60), dec!(9)), dec!(6)).decision, "history_pending");
         drop(gate);
         let _ = fs::remove_dir_all(dir);
     }
