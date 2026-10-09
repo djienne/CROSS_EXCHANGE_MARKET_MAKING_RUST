@@ -195,7 +195,6 @@ struct ThresholdSnapshot {
 
 enum HistoryCommand {
     Sample(u64, OpportunitySample),
-    Prune(DateTime<Utc>),
     Stop(oneshot::Sender<()>),
 }
 
@@ -208,8 +207,6 @@ pub struct OpportunityGate {
     healthy: Arc<AtomicBool>,
     changed: Arc<Notify>,
     sequence: u64,
-    /// The time of the Prune sent and not yet seen applied.
-    prune_pending: Option<DateTime<Utc>>,
     last_sample_at: Option<DateTime<Utc>>,
 }
 
@@ -237,15 +234,17 @@ impl OpportunityGate {
                 match command {
                     HistoryCommand::Sample(next, sample) => {
                         if let Err(error) = writer.as_mut().expect("active history writer").append(&sample, false) {
-                            worker_health.store(false, Ordering::Release);
-                            warn!("opportunity journal failed; entries blocked: {error:#}");
+                            if worker_health.swap(false, Ordering::AcqRel) {
+                                warn!("opportunity journal failed; entries blocked until a write succeeds: {error:#}");
+                            }
                         } else {
+                            // A write that succeeds again ends the failure, without a restart.
+                            worker_health.store(true, Ordering::Release);
                             window.insert(sample.timestamp, sample.gross_edge_bps);
                             window.prune(sample.timestamp);
                         }
                         sequence = next;
                     }
-                    HistoryCommand::Prune(now) => window.prune(now),
                     HistoryCommand::Stop(ack) => { let _ = ack.send(()); break; }
                 }
                 worker_snapshot.store(Arc::new(window.snapshot(sequence)));
@@ -253,7 +252,7 @@ impl OpportunityGate {
             }
         })?;
         Ok(Self { cfg: cfg.clone(), market: market.clone(), path, snapshot, tx, healthy, changed,
-            sequence: 0, prune_pending: None, last_sample_at: None })
+            sequence: 0, last_sample_at: None })
     }
 
     pub fn path(&self) -> &Path { &self.path }
@@ -278,22 +277,15 @@ impl OpportunityGate {
                 sample_count: snapshot.count, decision: "off", recorded: false };
         }
         let expired = snapshot.valid_through.is_some_and(|through| input.timestamp > through);
-        // A window pruned at `sent` is valid through `sent` or later (or empty): the Prune is applied, and a
-        // window expired again since then needs another one, or the gate waits for it forever.
-        if self.prune_pending.is_some_and(|sent| snapshot.valid_through.is_none_or(|through| through >= sent)) {
-            self.prune_pending = None;
-        }
-        if expired && self.prune_pending.is_none() {
-            if self.tx.try_send(HistoryCommand::Prune(input.timestamp)).is_err() {
-                self.healthy.store(false, Ordering::Release);
-            } else { self.prune_pending = Some(input.timestamp); }
-        }
         if !self.healthy() || snapshot.sequence != self.sequence || expired {
+            // No decision, but sampling never waits for one: the worker prunes the window at each
+            // sample and a successful write ends a journal failure, so a gate that stopped sampling
+            // here would stay pending for good (2026-10-02: a week of `history_pending`).
+            let decision = if self.healthy() { "history_pending" } else { "history_unavailable" };
+            let recorded = self.record_if_due(input, decision, None, snapshot.count, false);
             return GateEvaluation { allow_execution: false, would_allow: false, threshold_bps: None,
-                sample_count: snapshot.count,
-                decision: if self.healthy() { "history_pending" } else { "history_unavailable" }, recorded: false };
+                sample_count: snapshot.count, decision, recorded };
         }
-        self.prune_pending = None;
         let threshold = (required + self.cfg.min_extra_bps).max(snapshot.percentile.unwrap_or(required));
         let ready = snapshot.count >= self.cfg.min_history_samples;
         let would_allow = ready && input.gross_edge_bps >= threshold;
@@ -309,8 +301,11 @@ impl OpportunityGate {
 
     fn record_if_due(&mut self, input: OpportunityGateInput<'_>, decision: &str,
         threshold_bps: Option<Decimal>, sample_count: usize, force: bool) -> bool {
-        if !force && self.last_sample_at.is_some_and(|last| input.timestamp - last
-            < Duration::milliseconds(self.cfg.sample_interval_ms as i64)) { return false; }
+        // A clock stepped back past the last sample does not hold sampling until it catches up.
+        let interval = Duration::milliseconds(self.cfg.sample_interval_ms as i64);
+        if !force && self.last_sample_at.is_some_and(|last| (Duration::zero()..interval).contains(&(input.timestamp - last))) {
+            return false;
+        }
         let sample = OpportunitySample {
             timestamp: input.timestamp, market: self.market.0.clone(), direction: input.direction.to_string(),
             gross_edge_bps: input.gross_edge_bps, expected_net_margin_bps: input.expected_net_margin_bps,
@@ -328,8 +323,9 @@ impl OpportunityGate {
         };
         let next = self.sequence + 1;
         if self.tx.try_send(HistoryCommand::Sample(next, sample)).is_err() {
-            self.healthy.store(false, Ordering::Release);
-            warn!("opportunity history queue unavailable; entries blocked");
+            if self.healthy.swap(false, Ordering::AcqRel) {
+                warn!("opportunity history queue unavailable; entries blocked");
+            }
             return false;
         }
         self.sequence = next;
@@ -614,43 +610,46 @@ mod tests {
         append_test_row(&path, &row(now - Duration::hours(71), "HYPE", dec!(100)));
         append_test_row(&path, &row(now, "HYPE", dec!(7)));
         let original = fs::read(&path).unwrap();
-        let gate = OpportunityGate::new(&cfg(EntryGateMode::Enforce), &MarketId::from("HYPE"), dir.to_str().unwrap(), now).unwrap();
-        gate.tx.blocking_send(HistoryCommand::Prune(now + Duration::hours(2))).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while gate.loaded_samples() != 2 {
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        let mut gate = OpportunityGate::new(&cfg(EntryGateMode::Enforce), &MarketId::from("HYPE"), dir.to_str().unwrap(), now).unwrap();
+        // A sample two hours on prunes the 71 h old row, wherever it sits in the file.
+        assert!(gate.evaluate(sampled_input(now + Duration::hours(2), dec!(5)), dec!(6)).recorded);
+        settle(&gate);
+        assert_eq!(gate.loaded_samples(), 3);
         assert_eq!(gate.snapshot.load().percentile, Some(dec!(7)));
-        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(fs::read(&path).unwrap().starts_with(&original), "pruning never rewrites the history");
         drop(gate);
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn a_window_expired_again_after_its_prune_is_pruned_again() {
-        // 2026-10-02 dry run: the pruned window's next-oldest sample expired before the next evaluate,
-        // which then waited for a Prune that was never sent: history_pending for a week.
-        let dir = tmp_dir("reprune");
+    fn sampling_never_waits_for_a_decision() {
+        // 2026-10-02 dry runs: an expired window waited for a Prune handshake and recorded nothing, so
+        // it stayed `history_pending` for a week. Every undecided state still samples, and that sample
+        // is what lets the gate decide again.
+        let dir = tmp_dir("keeps_sampling");
         let t0 = Utc::now() - Duration::hours(80);
         let path = dir.join("opportunities_HYPE.jsonl");
         append_test_row(&path, &row(t0, "HYPE", dec!(8)));
         append_test_row(&path, &row(t0 + Duration::minutes(30), "HYPE", dec!(9)));
         let start = t0 + Duration::hours(72) - Duration::seconds(1);
         let mut gate = OpportunityGate::new(&cfg(EntryGateMode::Enforce), &MarketId::from("HYPE"), dir.to_str().unwrap(), start).unwrap();
-        let wait_for = |gate: &OpportunityGate, count: usize| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while gate.loaded_samples() != count {
-                assert!(std::time::Instant::now() < deadline, "the window never pruned to {count} samples");
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        };
-        let after_expiry = |seconds: i64| t0 + Duration::hours(72) + Duration::seconds(seconds);
-        assert_eq!(gate.evaluate(sampled_input(after_expiry(1), dec!(9)), dec!(6)).decision, "history_pending");
-        wait_for(&gate, 1);
-        assert_eq!(gate.evaluate(sampled_input(after_expiry(31 * 60), dec!(9)), dec!(6)).decision, "history_pending");
-        wait_for(&gate, 0);
-        assert_ne!(gate.evaluate(sampled_input(after_expiry(32 * 60), dec!(9)), dec!(6)).decision, "history_pending");
+        let at = |seconds: i64| t0 + Duration::hours(72) + Duration::seconds(seconds);
+        let expired = gate.evaluate(sampled_input(at(1), dec!(9)), dec!(6));
+        assert_eq!((expired.decision, expired.recorded), ("history_pending", true));
+        settle(&gate);
+        assert_eq!(gate.evaluate(sampled_input(at(2), dec!(9)), dec!(6)).decision, "warmup_block");
+        // Expired again when the second row ages out: sampled again, and deciding (and trading) again.
+        assert!(gate.evaluate(sampled_input(at(31 * 60), dec!(9)), dec!(6)).recorded);
+        settle(&gate);
+        assert_eq!(gate.evaluate(sampled_input(at(31 * 60 + 1), dec!(9)), dec!(6)).decision, "would_execute");
+        // A failed journal write: the next write that succeeds makes the gate healthy again.
+        gate.healthy.store(false, Ordering::Release);
+        let failed = gate.evaluate(sampled_input(at(40 * 60), dec!(9)), dec!(6));
+        assert_eq!((failed.decision, failed.recorded), ("history_unavailable", true));
+        settle(&gate);
+        assert!(gate.healthy());
+        // A clock stepped back an hour still samples.
+        assert!(gate.evaluate(sampled_input(at(40 * 60) - Duration::hours(1), dec!(9)), dec!(6)).recorded);
         drop(gate);
         let _ = fs::remove_dir_all(dir);
     }
