@@ -2600,7 +2600,7 @@ pub(crate) async fn resolve_lighter_evidence(
         Some(value) if confirmed_terminal(&value) => LegEvidence { fee_evidence:value.fee_evidence, terminal: true,
             qty: Some(value.filled_qty), fill: value.fill,
             order_id: value.terminal_order.and_then(|order| order.order_index), error: None },
-        _ => LegEvidence::unresolved(format!("Lighter order {client} has no terminal evidence")),
+        _ => LegEvidence::unresolved(format!("order {client} has no terminal evidence")),
     }
 }
 
@@ -3086,9 +3086,9 @@ async fn submit_lighter_hedge_retry(
     let (outcome, pending) = match tokio::time::timeout(timeout, lighter.submit_market_order_deferred_fill(
         &spec.market_id, plan.side, plan.qty, plan.price_bound, reduce_only)).await {
         Ok(result) => result,
-        Err(_) => return ("Lighter hedge retry submit deadline".to_string(), None, Some("unresolved".to_string()),
+        Err(_) => return (format!("{} hedge retry submit deadline", lighter.name()), None, Some("unresolved".to_string()),
             Some("submission identity unavailable at deadline".to_string()), serde_json::json!({
-                "venue":"lighter","submitted":true,"identity_unavailable":true,"side":plan.side.as_str(),"qty":plan.qty}),Vec::new()),
+                "venue":lighter.name(),"submitted":true,"identity_unavailable":true,"side":plan.side.as_str(),"qty":plan.qty}),Vec::new()),
     };
     let identity = other_order_identity(lighter, &outcome, plan.side, plan.qty);
     let evidence = resolve_lighter_evidence(spec, lighter, &outcome, pending, plan.side, plan.qty,

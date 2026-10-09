@@ -96,10 +96,12 @@ impl HyperliquidVenue {
         (outcome, None)
     }
 
-    /// The order's end and its fills with their fees, by cloid.
+    /// The order's end and its fills with their fees, by cloid. Waits at least until an unknown
+    /// order is final ([`resolution_timeout`]), whatever `timeout` says.
     pub async fn resolve_order_terminal(&self, market: &MarketId, client_order_index: i64, timeout: Duration) -> Result<LighterFillConfirmation> {
         self.check(market)?;
         let (cloid, sent_ms) = (cloid(client_order_index), client_order_index / 1000);
+        let timeout = resolution_timeout(timeout, client_order_index, Utc::now().timestamp_millis());
         let fills = tokio::time::timeout(timeout, async {
             loop {
                 let unknown_is_final = Utc::now().timestamp_millis() > sent_ms + ORDER_TTL_MS as i64 + 1_000;
@@ -150,6 +152,16 @@ fn account_of(state: &Value, coin: &str) -> Result<LighterAccountSnapshot> {
         account_value_usdc: Some(dec(&state["marginSummary"]["accountValue"])? - upnl),
         unrealized_pnl_usdc: Some(upnl),
     })
+}
+
+/// How long resolving the order sent as `client_order_index` may take: `timeout`, but never less
+/// than until an unknown order is final (1 s past its `expiresAfter`) plus 2 s for the reads that
+/// show it. A shorter wait can never resolve a lost reply: the hedge retry's and recovery's 5 s
+/// end before the 6 s an unknown IOC needs, so a 503 on the retry halted the taker with its
+/// position one-legged (HYPE-LH dry run, 2026-10-02).
+fn resolution_timeout(timeout: Duration, client_order_index: i64, now_ms: i64) -> Duration {
+    let resolvable_ms = client_order_index / 1000 + ORDER_TTL_MS as i64 + 1_000 + 2_000;
+    timeout.max(Duration::from_millis((resolvable_ms - now_ms).max(0) as u64))
 }
 
 /// The cloid of client index `index`: 16 bytes, the index in the low ones.
@@ -296,5 +308,17 @@ mod tests {
         let unpriced = confirmation(1, &[json!({"sz": "0.5", "px": "40", "tid": 7, "oid": 9})]).fill.unwrap();
         assert_eq!(unpriced.fee_provenance, FeeProvenance::Unknown, "a fill without its fee is not a venue fee of 0");
         assert!(confirmation(1, &[]).fill.is_some_and(|f| f.qty.is_zero()), "no fill is a terminal zero");
+    }
+
+    /// A lost reply resolves only past the order's `expiresAfter`, so a shorter budget (the hedge
+    /// retry's 5 s) is stretched to reach it; a longer one, or one starting later, stands.
+    #[test]
+    fn a_resolution_outlasts_an_unknown_order() {
+        let sent_ms = 1_790_967_077_057;
+        let index = sent_ms * 1000 + 40;
+        let wait = resolution_timeout(Duration::from_secs(5), index, sent_ms + 20);
+        assert!(wait > Duration::from_millis(ORDER_TTL_MS + 1_000), "{wait:?} ends before an unknown order is final");
+        assert_eq!(resolution_timeout(Duration::from_secs(30), index, sent_ms), Duration::from_secs(30));
+        assert_eq!(resolution_timeout(Duration::from_secs(1), index, sent_ms + 60_000), Duration::from_secs(1));
     }
 }
