@@ -31,7 +31,8 @@ summarizes them. The `[controller]` table of `bot.toml` holds the status poll an
 cross-engine loss stop. The controller reads the accounts from XEMM's own snapshot, which XEMM
 refreshes every 6 s with the shipped settings, every 2 s while a fill, hedge, sweep or hand-over
 settles; it reads the venues only at start-up. The HYPE route's idle Lighter reads total about
-20/min: XEMM accounts 10, the taker's 2 while it waits for XEMM's lease, book checks 8. A start
+26/min: XEMM accounts 10, taker accounts 8, book checks 8. The taker keeps its 15 s pace while it
+waits for XEMM's lease: its scan skips any snapshot older than 30 s. A start
 adds about 15, each account read once. Standard's shared REST/transaction cap is 60/min; executions and other clients
 consume the remaining allowance ([rate limits](https://apidocs.lighter.xyz/docs/rate-limits)).
 

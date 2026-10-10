@@ -1036,7 +1036,6 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
         account_tx.clone(),
         execution_epoch.clone(),
         account_refresh_now.clone(),
-        options.lease.clone(),
     );
 
     let http = rest_book::client()?;
@@ -3545,7 +3544,6 @@ fn spawn_account_snapshot_refresher(
     tx: watch::Sender<AccountSnapshot>,
     execution_epoch: Arc<AtomicU64>,
     refresh_now: Arc<Notify>,
-    lease: Option<watch::Receiver<Option<ExecutionLease>>>,
 ) -> tokio::task::JoinHandle<()> {
     let refresh_ms = (cfg.live.max_account_snapshot_age_ms as u64 / 2).max(10_000);
     let retry_ms = cfg.risk.min_reconcile_interval_ms.max(5_000);
@@ -3565,10 +3563,6 @@ fn spawn_account_snapshot_refresher(
             tokio::select! {
                 _ = tick.tick() => {}
                 _ = refresh_now.notified() => tokio::time::sleep_until(last + Duration::from_secs(5)).await,
-            }
-            // Waiting for XEMM's lease, every 4th period: the grant re-reads the accounts.
-            if lease.as_ref().is_some_and(|l| l.borrow().is_none()) && last.elapsed() < every * 4 {
-                continue;
             }
             if execution_epoch.load(Ordering::Acquire) % 2 != 0 {
                 continue;
