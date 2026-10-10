@@ -162,7 +162,10 @@ The venue model targets AWS Tokyo timings, with estimates where measurements are
   rates at Aster and Lighter settlement times; Hyperliquid funding is not simulated.
   A maintenance-margin breach is reported, not liquidated.
 
-Docker (from this directory; the fleet's `start_all.bat` also starts it):
+The three dry runs run on the Tokyo VPS (`../VPS.md`), and only there since 2026-10-10;
+`python vps.py pull` copies their files to `runs/tokyo/dry-run/` daily, and the reports read that
+copy. The commands below run one here, by name: their services sit behind the `dryrun` profile,
+so the fleet's `start_all.bat` no longer starts them. Docker (from this directory):
 
 ```bash
 docker compose up -d --build dryrun dryrun-hl dryrun-lh   # HYPE, HYPE-HL, HYPE-LH (taker only)
@@ -330,8 +333,9 @@ python ../dryrun_summary.py --runs LIGHTER_ASTER_BOT/runs/replay/HYPE-20260928T0
   bot's files are in its `dry-run/`; `bot_stats.py`/`combined_pnl.py --runs <run>/dry-run` default
   to its window, and `combined_pnl`'s `by_day` gives net per UTC day of the market (its times less
   `shift_ms`).
-- **Gate.** The entry gate starts from the live dry run's samples of the 72 h before `--from`
-  (`runs/dry-run/opportunities_<M>.jsonl`, read-only, or `--gate <file>`) at or above the run's
+- **Gate.** The entry gate starts from the samples of the 72 h before `--from` of the dry run
+  that ran beside the tape's recorder (`runs/tokyo/dry-run/opportunities_<M>.jsonl`, the VPS's,
+  for a `data-tokyo` tape, else this PC's `runs/dry-run/`; read-only), or `--gate <file>`, at or above the run's
   required edge, as its bot would have logged them (Premium's are fewer); below 50 the taker
   stays in warm-up. The
   live sampler was frozen 2026-10-02 to 10-09, so replay that week as one window, not per day.

@@ -1,13 +1,16 @@
 # The pair screener (README.md): records the moments that matter on every pair listed on two of
 # Aster, Lighter and Hyperliquid, then ranks them for the bot's strategies. Public data only: no
 # credentials, no orders. Independent of the bot: its own image, container and data.
-#   docker compose up -d --build              # start (the fleet's start_all.bat does this too)
+#   docker compose up -d --build screener     # collect here; since 2026-10-10 the Tokyo VPS
+#                                             # collects (VPS.md) and `vps.py pull` copies it
 #   docker compose run --rm report            # rank the pairs
 services:
   screener:
     build: .
     image: aster_lighter_screener:latest
     container_name: aster-lighter-screener
+    # Not started by a bare `up -d` (or start_all.bat): the Tokyo VPS collects.
+    profiles: ["collect"]
     environment:
       HL_PUBLIC_WS: ws://hyperliquid-data-hub:8766/ws?consumer=xemm-screener
     networks: [default, market-data]

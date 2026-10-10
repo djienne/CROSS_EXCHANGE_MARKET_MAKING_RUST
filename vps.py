@@ -5,15 +5,17 @@
   python vps.py status    # services, memory, disk, runs/ and data sizes
   python vps.py logs [N] [MARKET]  # last N journal lines of a dry run (default 50, HYPE)
   python vps.py screener  # upload, build and (re)start the pair screener's collector
-  python vps.py pull [--dry-run]  # copy closed data files home, verify, prune the VPS's old ones
+  python vps.py pull [--dry-run]  # copy closed data files home, verify, prune the VPS's old ones;
+                                  # copy the dry runs' runs/ to LIGHTER_ASTER_BOT/runs/tokyo/
 
 Only git-tracked files go up (uncommitted edits included, untracked files and *.env never), so no
 credentials or runs/ leave this machine. Ponytail: files deleted locally stay on the VPS; if that
 ever matters, wipe ~/xemm/LIGHTER_ASTER_BOT/src before extracting.
 
 Since 2026-10-10 the VPS collects and this PC stores (this PC's route to Tokyo stalls for tens of
-seconds): the tape recorder (`record --market HYPE`: Aster, Lighter and Hyperliquid, ~0.19 GB/day)
-and the screener's collector (full pair list, ~0.1-0.2 GB/day) run permanently, and a Windows
+seconds): the three dry runs, the tape recorder (`record --market HYPE`: Aster, Lighter and
+Hyperliquid, ~0.19 GB/day) and the screener's collector (full pair list, ~0.1-0.2 GB/day) run
+permanently there and nowhere else, and a Windows
 scheduled task runs `pull` daily (VPS.md). Disk stays bounded: journald 200 MB, the build dir
 <= 3 GB, a daily timer gzips the dry run's logs past 1 GB and stops the collectors below 4 GB
 free, and `pull` deletes a VPS file only once copied, verified and KEEP_DAYS old.
@@ -48,6 +50,8 @@ KEEP_DAYS = 7
 # Remote data dir, local copy, file pattern; names start with their UTC start (YYYY-MM-DDTHHMMSSZ).
 PULLS = [("/root/xemm/LIGHTER_ASTER_BOT/data", ROOT / "LIGHTER_ASTER_BOT" / "data-tokyo", "*/*.tape.zst"),
          ("/root/xemm/SCREENER/data", ROOT / "SCREENER" / "data-tokyo", "*.screen.zst")]
+# The dry runs' runs/ comes whole to here; the reports read its dry-run/ by default.
+RUNS_COPY = ROOT / "LIGHTER_ASTER_BOT" / "runs" / "tokyo"
 
 UNIT = """[Unit]
 Description=XEMM {market} dry run (simulated venues, no credentials)
@@ -302,9 +306,38 @@ def pull(dry_run):
             ssh(f"cd {src} && rm -- " + " ".join(shlex.quote(r) for r in old))
         print(f"  {src}: {len(sizes)} files, {len(closed)} closed, {len(todo)} to copy"
               f"{'' if dry_run else f' ({copied} copied, {failed} failed)'}, {len(old)} past {KEEP_DAYS} days", flush=True)
+    try:
+        pull_runs(dry_run)
+    except (subprocess.CalledProcessError, OSError, tarfile.TarError) as e:
+        print(f"  FAILED runs/ copy ({e}); the next pull retries it", flush=True)
     if not dry_run:
         ssh(f"free=$(df -m --output=avail / | tail -1 | tr -d ' '); echo \"  VPS: $free MB free\";"
             f" [ \"$free\" -lt {FLOOR_MB} ] || systemctl start {RECORDER} {SCREENER}")
+
+
+def pull_runs(dry_run):
+    """Copies the dry runs' files (the VPS's runs/dry-run/, and each runs/archive/ batch not here
+    yet) over RUNS_COPY, then writes the copy's time to pulled_at.txt: the reports end their
+    window there. Ponytail: the logs come whole each day, gzipped (~10x); they reach ~1 GB before
+    the archive moves them (~10 days for three markets), so up to ~100 MB, ~1 min at 2 MB/s.
+    Past that, rsync --append would send only the new bytes."""
+    have = [p.name for p in (RUNS_COPY / "archive").glob("*")]
+    if dry_run:
+        print(f"  would copy {REMOTE}/runs/dry-run (and archive/ but {len(have)} batches here) to {RUNS_COPY}")
+        return
+    at = datetime.now(timezone.utc)
+    skip = " ".join(shlex.quote(f"--exclude=archive/{name}") for name in have)
+    # tar exits 1 when a log grew while read: the copy holds it up to then.
+    ssh(f"rm -f /tmp/runs.tgz; cd {REMOTE}/runs || exit 2; nice tar -czf /tmp/runs.tgz --exclude='*.lock' {skip} dry-run archive; [ $? -le 1 ]")
+    RUNS_COPY.mkdir(parents=True, exist_ok=True)
+    part = RUNS_COPY / "runs.tgz.part"
+    subprocess.run(["scp", "-q", "-l", "16000", *OPTS, f"{HOST}:/tmp/runs.tgz", part.name], cwd=RUNS_COPY, check=True)
+    with tarfile.open(part) as tar:
+        files = [m for m in tar.getmembers() if (m.isfile() or m.isdir()) and not m.name.startswith("/") and ".." not in m.name.split("/")]
+        tar.extractall(RUNS_COPY, members=files)
+    part.unlink()
+    (RUNS_COPY / "pulled_at.txt").write_text(f"{at:%Y-%m-%dT%H:%M:%SZ}\n")
+    print(f"  {REMOTE}/runs: {sum(m.isfile() for m in files)} files copied to {RUNS_COPY}", flush=True)
 
 
 def main():

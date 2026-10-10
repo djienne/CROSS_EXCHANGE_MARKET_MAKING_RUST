@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from combined_pnl import default_since, iso, iter_jsonl, parse_dt, replay_window, report_roots, utc_now
+from combined_pnl import copy_end, default_since, iso, iter_jsonl, parse_dt, replay_window, report_roots, utc_now
 from economics import parse_timestamp, xemm_journal
 
 
@@ -298,7 +298,7 @@ def print_human(value: Any, indent: int = 0) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--market", default="HYPE")
-    parser.add_argument("--dry-run", action="store_true", help="Report the dry run (LIGHTER_ASTER_BOT/runs/dry-run/).")
+    parser.add_argument("--dry-run", action="store_true", help="Report the dry run (the VPS's, copied to LIGHTER_ASTER_BOT/runs/tokyo/dry-run/).")
     parser.add_argument("--runs", type=Path, help="Read this runs directory instead of the default live or dry-run directory.")
     parser.add_argument("--since", default=None, help="UTC/RFC3339 start. Default: as combined_pnl.py.")
     parser.add_argument("--now", default=None)
@@ -309,7 +309,8 @@ def main() -> int:
         parser.error(f"runs directory does not exist: {runs}")
     window = replay_window(runs) if args.runs else None  # a replay: its own window, on its clock
     since = parse_dt(args.since or (window[0] if window else default_since(runs, args.market, args.dry_run)))
-    now = parse_dt(args.now or window[1]) if args.now or window else utc_now()
+    end = args.now or (window[1] if window else copy_end(runs))  # a copy ends when it was taken
+    now = parse_dt(end) if end else utc_now()
     result = {**report(runs, args.market, since, now), "shift_ms": window[2] if window else 0}
     if args.json:
         print(json.dumps(result, indent=2))

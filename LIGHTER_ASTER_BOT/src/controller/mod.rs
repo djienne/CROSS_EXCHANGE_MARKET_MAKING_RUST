@@ -144,7 +144,7 @@ pub struct Variant {
     pub premium: bool,
     /// Instead of `[dry_run] seed`.
     pub seed: Option<u64>,
-    /// Entry-gate samples instead of the live dry run's `opportunities_<M>.jsonl`.
+    /// Entry-gate samples instead of [`default_gate`]'s.
     pub gate: Option<PathBuf>,
 }
 
@@ -202,7 +202,7 @@ pub(crate) async fn replay_with(mut cfg: BotConfig, runs_root: &Path, market: &s
     ensure!(!dir.exists(), "{} exists: remove it to replay that window again", dir.display());
     let rfc3339 = |us: i64| DateTime::from_timestamp_micros(us).unwrap_or_default().to_rfc3339();
     let (edge, arb) = (&cfg.maker.edge, &cfg.taker.arb);
-    let gate_source = variant.gate.clone().unwrap_or_else(|| runs_root.join("dry-run").join(format!("opportunities_{market}.jsonl")));
+    let gate_source = variant.gate.clone().unwrap_or_else(|| default_gate(runs_root, &market, &replay.files));
     let mut about = serde_json::json!({"market": market, "from": rfc3339(replay.from_us), "until": rfc3339(replay.until_us),
         "lead_ms": replay.lead_us / 1_000, "tape": replay.files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>(),
         "commit": COMMIT, "config": variant.config.display().to_string(), "latency_k": variant.latency, "lighter": tier, "seed": seed,
@@ -224,6 +224,15 @@ pub(crate) async fn replay_with(mut cfg: BotConfig, runs_root: &Path, market: &s
     about["gate_samples"] = seed_gate(&cfg, &gate_source, &market, from_us, shift_us, &dir.join("dry-run"))?.into();
     std::fs::write(dir.join("replay.json"), format!("{about:#}\n"))?;
     run_with(cfg, &dir, &market, LiveMode::DryRun, false, false, stop).await
+}
+
+/// The entry-gate samples a replay seeds from by default: those of the dry run that ran beside the
+/// tape's recorder. A `data-tokyo` tape's is the Tokyo VPS's (`vps.py pull` copies it to
+/// `runs/tokyo/`); any other's is this PC's (`runs/dry-run/`, until 2026-10-10).
+fn default_gate(runs_root: &Path, market: &str, tape: &[PathBuf]) -> PathBuf {
+    let tokyo = tape.iter().any(|file| file.components().any(|c| c.as_os_str() == "data-tokyo"));
+    let home = if tokyo { runs_root.join("tokyo") } else { runs_root.to_path_buf() };
+    home.join("dry-run").join(format!("opportunities_{market}.jsonl"))
 }
 
 /// Seeds a replay's entry gate (its files in `runs`) with the samples in `source` (the live dry
@@ -715,6 +724,13 @@ mod tests {
         assert_eq!(written, ["bot.toml", "data", "dry-run", "replay"], "a replay writes in its own directory only");
         assert_eq!(std::fs::read_to_string(dir.join("dry-run").join("opportunities_HYPE.jsonl")).unwrap(), history);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_tokyo_tape_seeds_the_gate_from_the_tokyo_dry_run() {
+        let gate = |file: &str| default_gate(Path::new("runs"), "HYPE", &[PathBuf::from(file)]);
+        assert_eq!(gate("data-tokyo/HYPE/2026-10-11T000000Z.tape.zst"), Path::new("runs/tokyo/dry-run/opportunities_HYPE.jsonl"));
+        assert_eq!(gate("data/HYPE/2026-09-28T000000Z.tape.zst"), Path::new("runs/dry-run/opportunities_HYPE.jsonl"));
     }
 
     /// The same arbitrage with both engines hedging on Hyperliquid: the taker's second leg takes

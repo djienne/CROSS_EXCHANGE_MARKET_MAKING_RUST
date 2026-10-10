@@ -51,7 +51,7 @@ stale Hyperliquid book invalidates only its own pairs. No credentials or order c
 ## Run
 
 ```bash
-docker compose up -d --build                        # collect (start_all.bat starts it too)
+docker compose up -d --build screener               # collect here (the Tokyo VPS collects since 2026-10-10)
 docker compose logs -f                              # traffic and memory every 5 min
 docker compose run --rm screener universe           # today's pairs, with their Aster taker fee
 docker compose run --rm report                      # the ranking, from all the data

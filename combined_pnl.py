@@ -215,10 +215,19 @@ def selected_xemm_journals(
 
 def report_roots(stack_root: Path, dry_run: bool = False) -> tuple[Path, Path]:
     """The `runs/` directories the reports read by default: the retired stacks' and `run`'s.
-    A dry run keeps every file in `LIGHTER_ASTER_BOT/runs/dry-run/`, which live never shares,
-    so both resolve there."""
+    A dry run keeps every file in its `runs/dry-run/`, which live never shares, so both resolve
+    there: the Tokyo VPS's, which `vps.py pull` copies to `LIGHTER_ASTER_BOT/runs/tokyo/` daily
+    (this PC's own, until 2026-10-10, stay in `LIGHTER_ASTER_BOT/runs/dry-run/`: `--runs`)."""
     bot_runs = stack_root / "LIGHTER_ASTER_BOT" / "runs"
-    return (bot_runs / "dry-run", bot_runs / "dry-run") if dry_run else (stack_root / "runs", bot_runs)
+    dry = bot_runs / "tokyo" / "dry-run"
+    return (dry, dry) if dry_run else (stack_root / "runs", bot_runs)
+
+
+def copy_end(runs: Path) -> str | None:
+    """When `runs` is the daily copy of the VPS's dry runs (`runs/tokyo/dry-run/`), when it was
+    taken: its records end there, so a report's window does too."""
+    path = runs.parent / "pulled_at.txt"
+    return path.read_text(encoding="utf-8").strip() if path.exists() else None
 
 
 def default_since(bot_runs: Path, market: str, dry_run: bool) -> str:
@@ -531,7 +540,7 @@ def parse_args() -> argparse.Namespace:
     window = replay_window(args.runs) if args.runs else None
     args.shift_ms = window[2] if window else 0
     args.since = args.since or (window[0] if window else default_since(bot_runs, args.market, args.dry_run))
-    args.now = args.now or (window[1] if window else None)
+    args.now = args.now or (window[1] if window else copy_end(bot_runs))
     explicit_xemm_journals = bool(args.xemm_journal)
     explicit_xemm_runs_dirs = args.xemm_runs_dir is not None
     if args.taker_trades is None:

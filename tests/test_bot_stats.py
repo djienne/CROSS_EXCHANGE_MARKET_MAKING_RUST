@@ -143,6 +143,16 @@ class BotStatsTests(unittest.TestCase):
         # Net: +100 hedged, 0 unhedged, -4 the recovery's fee.
         self.assertEqual(x["net_bps"], {"n": 3, "mean": 32, "p50": 0, "p90": 100})
 
+    def test_the_tokyo_copy_ends_its_window_when_it_was_pulled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "tokyo" / "dry-run"
+            runs.mkdir(parents=True)
+            (runs.parent / "pulled_at.txt").write_text("2026-10-11T04:00:00Z\n", encoding="utf-8")
+            proc = subprocess.run([sys.executable, bot_stats.__file__, "--market", "HYPE", "--runs", str(runs),
+                "--since", "2026-10-11T00:00:00Z", "--json"], check=True, capture_output=True, text=True)
+            result = json.loads(proc.stdout)
+        self.assertEqual((result["now"][:19], result["hours"]), ("2026-10-11T04:00:00", 4))
+
 
 if __name__ == "__main__":
     unittest.main()

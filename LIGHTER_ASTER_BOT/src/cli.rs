@@ -147,7 +147,8 @@ pub enum Commands {
         /// Instead of [dry_run] seed.
         #[arg(long)]
         seed: Option<u64>,
-        /// Entry-gate samples. Default: the live dry run's runs/dry-run/opportunities_<MARKET>.jsonl.
+        /// Entry-gate samples. Default: opportunities_<MARKET>.jsonl of the dry run beside the tape's
+        /// recorder: runs/tokyo/dry-run/ (the VPS's, pulled) for a data-tokyo tape, else runs/dry-run/.
         #[arg(long)]
         gate: Option<PathBuf>,
     },

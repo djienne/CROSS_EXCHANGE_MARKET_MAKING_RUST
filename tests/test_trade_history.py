@@ -369,7 +369,7 @@ class TradeHistoryTests(unittest.TestCase):
             self.assertEqual(source, "xemm_journal")
 
     def test_dry_run_reports_read_and_write_only_the_dry_run_directory(self) -> None:
-        dry = Path(trade_history.__file__).resolve().parent / "LIGHTER_ASTER_BOT" / "runs" / "dry-run"
+        dry = Path(trade_history.__file__).resolve().parent / "LIGHTER_ASTER_BOT" / "runs" / "tokyo" / "dry-run"
         for module in (combined_pnl, trade_history):
             for flags in ([], ["--dry-run"]):
                 with mock.patch.object(sys, "argv", [module.__name__, *flags]):

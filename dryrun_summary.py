@@ -2,9 +2,12 @@
 """One screen per dry-run market: python3 dryrun_summary.py [--since RFC3339] [--runs <replay>].
 
 It condenses combined_pnl.py (what was made) and bot_stats.py (why) for every market with a
-dry-run state file (LIGHTER_ASTER_BOT/runs/dry-run/bot-<market>.state.json). Run those two with
-`--dry-run --market <M>` for the full detail. `--runs LIGHTER_ASTER_BOT/runs/replay/<run>` reports
-a replay instead, over its tape window (`replay.json`); its times are the tape's, shifted.
+dry-run state file (bot-<market>.state.json) in the Tokyo VPS's dry runs, which `vps.py pull`
+copies to LIGHTER_ASTER_BOT/runs/tokyo/dry-run/ daily; the window ends at that copy. Run those two
+with `--dry-run --market <M>` for the full detail. `--runs <dir>` reads <dir>/dry-run/ instead:
+LIGHTER_ASTER_BOT/runs for this PC's dry runs (until 2026-10-10), or
+LIGHTER_ASTER_BOT/runs/replay/<run> for a replay, over its tape window (`replay.json`; its times
+are the tape's, shifted).
 """
 from __future__ import annotations
 
@@ -15,7 +18,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-RUNS = ROOT / "LIGHTER_ASTER_BOT" / "runs" / "dry-run"
+RUNS = ROOT / "LIGHTER_ASTER_BOT" / "runs" / "tokyo"
 
 
 def report(script: str, runs: Path, market: str, since: str | None, now: str | None) -> dict:
@@ -65,12 +68,13 @@ def summary(runs: Path, market: str, since: str | None, now: str | None) -> None
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--since", default=None, help="UTC/RFC3339 start. Default: each market's dry-run start.")
-    parser.add_argument("--runs", type=Path, default=None, help="A replay's directory (LIGHTER_ASTER_BOT/runs/replay/<run>).")
+    parser.add_argument("--runs", type=Path, default=RUNS, help="The directory holding dry-run/ (default: the Tokyo copy).")
     args = parser.parse_args()
-    runs = RUNS
-    if args.runs:  # the reports default to its window
-        about = json.loads((args.runs / "replay.json").read_text(encoding="utf-8"))
-        runs = args.runs / "dry-run"
+    runs, replay, copied = args.runs / "dry-run", args.runs / "replay.json", args.runs / "pulled_at.txt"
+    if copied.exists():
+        print(f"the Tokyo VPS's dry runs, copied {copied.read_text(encoding='utf-8').strip()} (python vps.py pull)")
+    if replay.exists():  # the reports default to its window
+        about = json.loads(replay.read_text(encoding="utf-8"))
         print(f"replay of {about['from']} -> {about['until']} (latency x{about.get('latency_k', 1)}, Lighter {about.get('lighter', 'standard')}, "
               f"seed {about.get('seed', '?')}, commit {about.get('commit', '?')}), shifted {about['shift_ms'] / 86_400_000:.3f} days; "
               f"gate seeded with {about['gate_samples']} samples")

@@ -8,7 +8,7 @@
 | Toolchain | rustup, Rust 1.92 (`. ~/.cargo/env`), build-essential; no Docker |
 | Code | `/root/xemm/LIGHTER_ASTER_BOT` (git-tracked files only; no `*.env`, no credentials) |
 | Services | `xemm-dryrun`, `xemm-dryrun-hl`, `xemm-dryrun-lh` (systemd): `run --market HYPE` / `HYPE-HL` / `HYPE-LH` `--mode dry-run --ack-breaker` (Aster-Lighter, Aster-Hyperliquid, Lighter-Hyperliquid), 512 MB cap each, SIGINT stop; their simulated venues take free ports (`[dry_run]` ports 0) |
-| Output | `/root/xemm/LIGHTER_ASTER_BOT/runs/dry-run/` |
+| Output | `/root/xemm/LIGHTER_ASTER_BOT/runs/dry-run/`, copied daily to `LIGHTER_ASTER_BOT/runs/tokyo/` (the reports' default) |
 | Collectors | `xemm-recorder` (`record --market HYPE`, 256 MB cap) → `LIGHTER_ASTER_BOT/data/HYPE/`; `xemm-screener` (`screener collect`, 400 MB cap) → `SCREENER/data/`; both enabled at boot, niced below the dry run |
 
 Since 2026-10-10 the VPS collects and the Windows PC stores: this PC's route to Tokyo stalls for
@@ -26,6 +26,10 @@ disk if no pull happens. Disk stays bounded, all set up by `sync` and `pull`:
   (`pulled.json` beside them lists the verified files). It deletes a VPS file only once verified
   here and started more than 7 days ago (the screener's gate reads 72 h back). `--dry-run` lists
   what it would copy and delete.
+- `pull` then copies the VPS's `runs/dry-run/` (and each `runs/archive/` batch not here yet) whole,
+  gzipped, to `LIGHTER_ASTER_BOT/runs/tokyo/` and writes the time to `pulled_at.txt`, where the
+  reports end their window. Only the VPS runs the dry runs and collectors (user, 2026-10-10): this
+  PC's stopped, so nothing is recorded twice.
 - The daily 03:30 UTC script stops both collectors below 4 GB free, so the dry run keeps its disk;
   the next `pull` starts them again once there is room.
 

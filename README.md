@@ -55,14 +55,18 @@ The reports need Python 3.
 
 ## Dry run
 
+The three dry runs (HYPE, HYPE-HL, HYPE-LH) run on the Tokyo VPS (VPS.md), and only there since
+2026-10-10, so nothing is collected twice. `python vps.py pull` copies their files to
+`LIGHTER_ASTER_BOT/runs/tokyo/dry-run/` daily; `LIGHTER_ASTER_BOT/runs/dry-run/` keeps this PC's
+until then. One can still run here by name (`start_all.bat` no longer starts them):
+
 ```bash
 cd LIGHTER_ASTER_BOT
 docker compose up -d --build dryrun dryrun-hl dryrun-lh   # HYPE, HYPE-HL, HYPE-LH
 docker compose logs -f dryrun
 ```
 
-It runs in the background, the fleet's `start_all.bat` starts it too, and its files are in
-`LIGHTER_ASTER_BOT/runs/dry-run/`. The model, halts, diagnostics and the going-live checklist
+The model, halts, diagnostics and the going-live checklist
 are in the [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md#dry-run). The Tokyo VPS records HYPE's
 Aster, Lighter and Hyperliquid public feeds for backtests, and `python vps.py pull` copies them to
 `LIGHTER_ASTER_BOT/data-tokyo/HYPE/` daily ([Market data tape](LIGHTER_ASTER_BOT/RUNBOOK.md#market-data-tape), VPS.md).
@@ -71,8 +75,9 @@ Aster, Lighter and Hyperliquid public feeds for backtests, and `python vps.py pu
 
 Run from the repository root. The reports read the bot's records in `LIGHTER_ASTER_BOT/runs/`;
 `combined_pnl.py` and `trade_history.py` also read the retired orchestrator's in the root
-`runs/` where they exist. With `--dry-run` they read only `LIGHTER_ASTER_BOT/runs/dry-run/`
-and, without `--since`, count from the dry run's first start.
+`runs/` where they exist. With `--dry-run` they read only the Tokyo copy,
+`LIGHTER_ASTER_BOT/runs/tokyo/dry-run/` (`--runs LIGHTER_ASTER_BOT/runs/dry-run` for this PC's),
+and, without `--since`, count from the dry run's first start; their window ends at the copy.
 
 ```bash
 python3 dryrun_summary.py                       # every dry-run market on one screen

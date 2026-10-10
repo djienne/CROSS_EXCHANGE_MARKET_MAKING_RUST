@@ -90,8 +90,11 @@ services:
 
   # The same bot against simulated Aster and Lighter venues fed by live public market data
   # (RUNBOOK.md, "Dry run"). No credentials are mounted, and its dry-run identity signs for
-  # no real account.
+  # no real account. Since 2026-10-10 the dry runs run on the Tokyo VPS (VPS.md), whose copy
+  # `vps.py pull` brings to runs/tokyo/ daily; behind a profile so a bare `up -d` never runs a
+  # second set here, while `up -d dryrun` by name still does. runs/dry-run/ keeps this PC's.
   dryrun: &dryrun
+    profiles: ["dryrun"]
     build:
       context: .
       dockerfile: Dockerfile
@@ -209,8 +212,10 @@ services:
       - ./signers:/app/signers:ro
       - ./data:/app/data:ro
       - ./data-tokyo:/app/data-tokyo:ro
-      # The live dry run's entry-gate samples seed each replay's gate.
+      # The dry runs' entry-gate samples seed each replay's gate: this PC's (until 2026-10-10)
+      # and the Tokyo VPS's, pulled.
       - ./runs/dry-run:/app/runs/dry-run:ro
+      - ./runs/tokyo/dry-run:/app/runs/tokyo/dry-run:ro
       - ./runs/replay:/app/runs/replay
     command: ["--help"]
     restart: "no"
