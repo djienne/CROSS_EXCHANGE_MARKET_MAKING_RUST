@@ -191,7 +191,10 @@ pub fn start(
 
     let task_handle = handle.clone();
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_millis(cfg.arb.book_sanity.interval_ms));
+        // The first check waits one interval: the start-up burst of account reads already
+        // presses on Lighter's 60/min REST cap.
+        let every = Duration::from_millis(cfg.arb.book_sanity.interval_ms);
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tick.tick().await;

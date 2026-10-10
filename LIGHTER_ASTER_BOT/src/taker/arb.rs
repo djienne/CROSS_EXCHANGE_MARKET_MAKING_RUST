@@ -1005,18 +1005,11 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
         .await?;
     info!("{hedge_venue:?} websocket state ready: market={}", spec.market_id);
     let standby_until_lease = options.lease.is_some();
-    ensure_clean_start(
-        &cfg,
-        &spec,
-        &aster,
-        &lighter,
-        options.observe_only || standby_until_lease,
-    )
-    .await?;
     let account_snapshot_max_age =
         Duration::from_millis(cfg.live.max_account_snapshot_age_ms as u64);
     let execution_epoch = Arc::new(AtomicU64::new(0));
     let mut account = refresh_account_snapshot(&spec.market_id, &aster, &lighter, &execution_epoch).await?;
+    ensure_clean_start(&cfg, &spec, &aster, &lighter, &account, options.observe_only || standby_until_lease)?;
     if options.lease.is_none() && !options.observe_only {
         if cfg.pnl.enabled {
             session.arm_with_equity(account.margins.total_equity_usd()
@@ -3556,7 +3549,9 @@ fn spawn_account_snapshot_refresher(
     let retry_ms = cfg.risk.min_reconcile_interval_ms.max(5_000);
     let rate_limit_retry_ms = 30_000u64;
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_millis(refresh_ms));
+        // The caller has just taken the first snapshot: start one period later.
+        let every = Duration::from_millis(refresh_ms);
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last = tokio::time::Instant::now();
         loop {
@@ -3632,18 +3627,20 @@ async fn reconcile_margins(aster: &FirstLeg, lighter: &OtherLeg) -> Result<Margi
     })
 }
 
-async fn ensure_clean_start(
+/// Judged on the start-up account snapshot, which already holds the positions and open
+/// orders: reading them again would double the start's Lighter REST calls.
+fn ensure_clean_start(
     cfg: &Config,
     spec: &MarketSpec,
     aster: &FirstLeg,
     lighter: &OtherLeg,
+    account: &AccountSnapshot,
     observe_only: bool,
 ) -> Result<()> {
-    let pos = reconcile_positions(&spec.market_id, aster, lighter).await?;
-    let (lighter_ws_qty, divergence_qty) = lighter_ws_divergence(aster, lighter, &spec.market_id, pos);
+    let pos = account.position;
+    let (lighter_ws_qty, divergence_qty) = (account.lighter_ws_qty, account.lighter_ws_rest_divergence_qty);
     let (aster_book, lighter_book) = fetch_books(spec, aster, lighter)?;
-    let open_a = aster.open_orders_count(&spec.market_id).await?;
-    let open_l = lighter.open_orders_count(&spec.market_id).await?;
+    let (open_a, open_l) = (account.aster_open_orders, account.lighter_open_orders);
     if open_a > 0 || open_l > 0 {
         if observe_only {
             warn!(

@@ -232,7 +232,9 @@ impl<E: Engines> Supervisor<E> {
                 self.tasks.push(Task { bot, stop, handle });
             }
         }
-        let mut next_tick = Instant::now();
+        // The first tick waits a poll: `verify_orders_clear` has just read every account (Lighter
+        // Standard allows 60 REST calls a minute), and a lone taker has published no status yet.
+        let mut next_tick = Instant::now() + Duration::from_secs(self.cfg.poll_sec);
         while !self.stopping() {
             self.check_exits().await;
             if !self.stopping() && Instant::now() >= next_tick {
@@ -411,6 +413,7 @@ impl<E: Engines> Supervisor<E> {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
     use super::*;
 
@@ -419,6 +422,7 @@ mod tests {
         status: Arc<Mutex<Option<Value>>>,
         /// Engine stops, in order.
         stopped: Arc<Mutex<Vec<Bot>>>,
+        reads: Arc<AtomicUsize>,
     }
 
     /// Engines that run until stopped; with `taker_fails` the taker instead fails at once.
@@ -441,6 +445,7 @@ mod tests {
         }
 
         async fn status(&self) -> Result<Value> {
+            self.shared.reads.fetch_add(1, Ordering::Relaxed);
             self.shared.status.lock().unwrap().clone().ok_or_else(|| anyhow!("status unavailable"))
         }
     }
@@ -475,6 +480,7 @@ mod tests {
         let stop = sup.stop.clone();
         let running = tokio::spawn(sup.run());
         tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(shared.reads.load(Ordering::Relaxed), 1, "a start reads the accounts once");
         stop.cancel();
         running.await.unwrap().unwrap();
         assert_eq!(*shared.stopped.lock().unwrap(), [Bot::Xemm, Bot::Taker]);
