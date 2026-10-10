@@ -85,10 +85,11 @@ quote_age_ms = 500
 # Feed-delay scenarios for `report --scenario <name>`: each venue's delay from the engine stamp the
 # collector records (Aster T, Lighter last_updated_at, Hyperliquid time) to the bot's view, ms. The
 # replay then runs on the venues' clocks; `--scenario host` rebuilds this host's own delays (the
-# arrival result: a check). Needs v3 data (2026-10-10 on).
-# tokyo: provisional, from 2026-10-10 probes on the Tokyo VPS (Aster bookTicker E + ~26 ms E - T,
-# Lighter ~1 ms, Hyperliquid l2Book fast p50 246 ms); replaced by the VPS collector's own p50s.
+# arrival result: a check). Needs v4 data (2026-10-10 12:13Z on).
+# tokyo: the Tokyo VPS collector's book delays, p50 over its first hour (2026-10-10 12:18-13:26Z,
+# 144 pairs; p99 1.5 s / 0.15 s / 0.47 s). Lighter batches order_book every 50 ms; prints come
+# ~150 ms after the books on Aster and ~85 ms on Lighter, as here. This host: 163 / 131 / 362 ms.
 [report.scenario.tokyo]
-aster_ms       = 33
-lighter_ms     = 1
-hyperliquid_ms = 246
+aster_ms       = 69
+lighter_ms     = 39
+hyperliquid_ms = 241

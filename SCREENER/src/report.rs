@@ -150,8 +150,8 @@ fn timeline(s: &Series, delays: Option<[i64; 2]>) -> (Vec<State>, Vec<State>, Ve
     // The collector pairs each leg's state with the other's of the pre-roll before (`changed`), which
     // covers the scenario while the feeds here lag less than `STALL_MS` (and its delays differ by
     // at most the rest of the pre-roll, `run`). Around a stall (`Summary::stalls`) it may have
-    // missed what the scenario trades: those spans, widened by the pre-roll, are left out
-    // (unrecorded view, no prints).
+    // missed what the scenario trades: those spans, widened by the pre-roll, are left out (an
+    // unknown view, as in a gap, then the books in force again; no prints).
     let mut stalls: Vec<(i64, i64)> = s.summaries.iter().filter_map(|w| w["stalls"].as_array()).flatten()
         .filter_map(|r| Some((r[0].as_i64()? - PREROLL_MS, r[1].as_i64()? + PREROLL_MS))).collect();
     stalls.sort_by_key(|r| r.0);
@@ -164,9 +164,13 @@ fn timeline(s: &Series, delays: Option<[i64; 2]>) -> (Vec<State>, Vec<State>, Ve
     }
     let uncovered = spans.iter().map(|r| r.1 - r.0).sum();
     let out = |t: i64| spans.partition_point(|r| r.0 <= t).checked_sub(1).is_some_and(|i| t < spans[i].1);
+    let unknown = State { t: 0, a: Bbo::default(), l: Bbo::default(), age: [0, 0] };
+    let edges: Vec<State> = spans.iter().flat_map(|r| [Some(State { t: r.0, ..unknown }), state_at(&view, r.1).map(|st| State { t: r.1, ..*st })]).flatten().collect();
     for st in view.iter_mut().filter(|st| out(st.t)) {
-        (st.a, st.l) = (unrecorded, unrecorded);
+        (st.a, st.l) = (unknown.a, unknown.l);
     }
+    view.extend(edges);
+    view.sort_by_key(|st| st.t);
     trades.retain(|tr| !out(tr.t));
     (view, venue, trades, uncovered)
 }
@@ -1096,6 +1100,11 @@ mod tests {
         // From 1,200 ms Lighter is unrecorded, on the venues and in the view.
         assert!(state_at(&venue, 1_250).unwrap().l.bid.is_nan() && state_at(&view, 1_250).unwrap().l.bid.is_nan());
         assert_eq!(state_at(&venue, 1_050).unwrap().a.ask, 100.0);
+        // A stall at 0-50 ms leaves the view out until 1,050 ms; then the books in force are back.
+        let stalled = Series { states: s.states.clone(), marks: s.marks.clone(), summaries: vec![serde_json::json!({"stalls": [[0, 50]]})], ..Default::default() };
+        let (view, _, _, uncovered) = timeline(&stalled, Some([10, 0]));
+        assert!(uncovered == 2_050 && !state_at(&view, -900).unwrap().a.known() && !state_at(&view, 1_040).unwrap().a.known());
+        assert_eq!(state_at(&view, 1_060).unwrap().a.ask, 100.0);
     }
 
     #[test]

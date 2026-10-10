@@ -57,7 +57,7 @@ docker compose run --rm screener universe           # today's pairs, with their 
 docker compose run --rm report                      # the ranking, from all the data
 docker compose run --rm report --since 2026-09-27 --lighter premium --json
 docker compose run --rm report --latency 2          # sensitivity: every latency doubled
-docker compose run --rm report --since 2026-10-11 --scenario tokyo   # on the venues' clocks (v3 days)
+docker compose run --rm report --since 2026-10-11 --scenario tokyo   # on the venues' clocks (v4 days)
 ```
 
 `report` is its own service (profile `report`, never started by `up`): it holds every recorded
