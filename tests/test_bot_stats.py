@@ -140,6 +140,8 @@ class BotStatsTests(unittest.TestCase):
         self.assertEqual(x["hedge_first_fill_observed_ms"], {"n": 1, "mean": 600, "p50": 600, "p90": 600})
         # Bought at 100, hedged at 101: 100 of the 120 bps kept.
         self.assertEqual((x["expected_gross_bps"], x["edge_kept"]), ({"n": 1, "mean": 120, "p50": 120, "p90": 120}, 0.833))
+        # Net: +100 hedged, 0 unhedged, -4 the recovery's fee.
+        self.assertEqual(x["net_bps"], {"n": 3, "mean": 32, "p50": 0, "p90": 100})
 
 
 if __name__ == "__main__":

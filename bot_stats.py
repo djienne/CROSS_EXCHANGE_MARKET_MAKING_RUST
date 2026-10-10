@@ -145,6 +145,8 @@ def xemm(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, A
             stats["gross_bps"].append(float(t["gross_pnl_usdc"] / notional * 10_000))
             if expected is not None:
                 both.append((stats["gross_bps"][-1], expected))
+        if notional and t["net_pnl_usdc"] is not None:
+            stats["net_bps"].append(float(t["net_pnl_usdc"] / notional * 10_000))
         firsts = {v: min((f.timestamp for f in t["fills"] if f.venue == v and f.timestamp), default=None) for v in ("aster", "lighter")}
         if all(firsts.values()):
             stats["hedge_delay_ms"].append((firsts["lighter"] - firsts["aster"]).total_seconds() * 1000)
