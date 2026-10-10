@@ -33,14 +33,14 @@ and probes. Dated live-test results and model limits are in [CALIBRATION.md](LIG
 ├── SCREENER/               which pairs would suit the bot: its own crate and container, public data only (SCREENER/README.md)
 └── LIGHTER_ASTER_BOT/
     ├── bot.toml            config: [controller], [taker], [maker], [dry_run]
-    ├── docker-compose.yml  services: dryrun, dryrun-hl, dryrun-lh, recorder (market-data tape), and bot (live, behind the `live` profile)
+    ├── docker-compose.yml  services: dryrun, dryrun-hl, dryrun-lh, replay (backtest), recorder (stopped; the tape is recorded on the VPS) and bot (live, behind the `live` profile)
     ├── scripts/            deploy_vps.sh, reset_breaker.py
     ├── signers/            Lighter signer libraries (binaries, not secrets)
     ├── src/                controller/ (run), taker/, livebot/ (XEMM), dryrun/ (simulated venues)
     └── RUNBOOK.md
 ```
 
-Git ignores `runs/` (journals, ledgers, latches, state), `data/` (market-data recordings),
+Git ignores `runs/` (journals, ledgers, latches, state), `data/` and `data-tokyo/` (market-data recordings),
 `target/` and `*.env` credential files, including `hyperliquid.env`.
 
 ## Build
@@ -63,9 +63,9 @@ docker compose logs -f dryrun
 
 It runs in the background, the fleet's `start_all.bat` starts it too, and its files are in
 `LIGHTER_ASTER_BOT/runs/dry-run/`. The model, halts, diagnostics and the going-live checklist
-are in the [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md#dry-run). Beside it, the `recorder` service
-records HYPE's Aster/Lighter public feeds to `LIGHTER_ASTER_BOT/data/HYPE/` for backtests
-([Market data tape](LIGHTER_ASTER_BOT/RUNBOOK.md#market-data-tape)).
+are in the [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md#dry-run). The Tokyo VPS records HYPE's
+Aster, Lighter and Hyperliquid public feeds for backtests, and `python vps.py pull` copies them to
+`LIGHTER_ASTER_BOT/data-tokyo/HYPE/` daily ([Market data tape](LIGHTER_ASTER_BOT/RUNBOOK.md#market-data-tape), VPS.md).
 
 ## Reports
 

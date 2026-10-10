@@ -42,6 +42,8 @@ services:
     volumes:
       - ./screener.toml:/app/screener.toml:ro
       - ./data:/app/data:ro
+      # The Tokyo VPS's files (`python vps.py pull`): `report --data data-tokyo`.
+      - ./data-tokyo:/app/data-tokyo:ro
     deploy:
       resources:
         limits:

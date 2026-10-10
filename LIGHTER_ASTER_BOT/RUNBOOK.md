@@ -260,30 +260,39 @@ Windows bind mount as mode 777: on this host, put `XEMM_ENV_MODE_CHECK=off` in t
 
 ## Market data tape
 
-The `recorder` service (container `lighter-aster-recorder`, `record --market HYPE`) records
-HYPE's Aster/Lighter public feeds for [backtests](#backtest). `record` currently supports only this venue combination:
+`record --market HYPE` records HYPE's public feeds for [backtests](#backtest). Since 2026-10-10 it
+runs on the Tokyo VPS as `xemm-recorder` (VPS.md), because this PC's route to Tokyo stalls for tens
+of seconds and a stall is a hole in the tape. `python vps.py pull` copies the files here daily, to
+`data-tokyo/HYPE/`. This PC's own recorder (compose service `recorder`, now behind the `recorder`
+profile) is stopped; its tapes up to 2026-10-10 stay in `data/HYPE/`.
 
 - **Aster:** `depth20@100ms` (20 levels), `bookTicker` and `aggTrade`.
 - **Lighter:** `order_book` (a snapshot, then deltas: the whole book), `trade` and `market_stats`.
+- **Hyperliquid** (from 2026-10-10): `l2Book` fast (5 levels, ~0.5 s), `bbo`, `trades` and
+  `activeAssetCtx` on one connection; `l2Book` slow (20 levels, ~5 s) on another, since its
+  frames do not say which mode they are.
 - **REST:** Aster `premiumIndex` every minute; `exchangeInfo` and `orderBooks` hourly.
 
-Every line carries its arrival time on this host beside the venues' own stamps, so the tape
-holds this host's feed latency too. The recorder is its own process, so the bot never waits on it. Rebuilding the
-dry run does not interrupt it; `docker compose up -d --build recorder` restarts it.
+Every line carries its arrival time on the recording host (the VPS, NTP-synced) beside the venues'
+own stamps, so the tape holds that host's feed latency too. The recorder is its own process, so
+the dry run never waits on it; `python vps.py sync` rebuilds and restarts it (a new file).
 
-**Files.** `data/HYPE/<YYYY-MM-DD>T<HHMMSS>Z.tape.zst`, one per UTC day and per recorder start,
-named after the first line's arrival: tab-separated `<arrival µs>\t<kind>\t<payload>`, with the
-kinds listed in `src/dryrun/tape.rs`. Read a day with `zstd -dc data/HYPE/<day>T*.tape.zst | head`.
+**Files.** `data-tokyo/HYPE/<YYYY-MM-DD>T<HHMMSS>Z.tape.zst` (`data/HYPE/` before 2026-10-10),
+one per UTC day and per recorder start, named after the first line's arrival: tab-separated
+`<arrival µs>\t<kind>\t<payload>`, with the kinds listed in `src/dryrun/tape.rs`. Read a day with
+`zstd -dc data-tokyo/HYPE/<day>T*.tape.zst | head`.
 - The writer flushes every 10 s; an unclean stop can lose unflushed data.
-- `A-` and `L-` lines mark a lost connection. Reconnect attempts back off up to 5 s;
+- `A-`, `L-`, `H-` and `HS-` lines mark a lost connection. Reconnect attempts back off up to 5 s;
   connection and subscription time add to the recovery delay.
-- Aster has no order-book history to download again, and the fleet backup skips files over
-  100 MB (MAKE_BACKUP.py), so copy the tapes elsewhere if they must survive a disk loss.
+- Aster has no order-book history to download again, and the fleet backup skips `.zst` files
+  (MAKE_BACKUP.py), so copy the tapes elsewhere if they must survive a disk loss.
 
 ## Backtest
 
 `replay` is the dry run fed by the tape instead of the live market: the same bot, simulator and
-`[dry_run]` latency model, with the world shifted by the days since `--from`. Each line goes in
+`[dry_run]` latency model, with the world shifted by the days since `--from`. It reads
+`data-tokyo/<M>/` once a Tokyo file starts by `--from`, else `data/<M>/` (`--tape` overrides;
+`replay.json` lists the files used). Each line goes in
 2 minutes ahead of its venue time (the tape's worst feed stalls were 75 s), so this host's stalls
 on the day do not reach the bot. The `replay` service has no network at all and no credentials.
 
@@ -309,7 +318,8 @@ python ../dryrun_summary.py --runs LIGHTER_ASTER_BOT/runs/replay/HYPE-20260928T0
 - **Gate.** The entry gate starts from the live dry run's samples of the 72 h before `--from`
   (`runs/dry-run/opportunities_<M>.jsonl`, read-only); below 50 the taker stays in warm-up. The
   live sampler was frozen 2026-10-02 to 10-09, so replay that week as one window, not per day.
-- **Limits.** HYPE Aster-Lighter only: the tape has no Hyperliquid. A recorder restart without
+- **Limits.** HYPE Aster-Lighter only: the tape's Hyperliquid lines (2026-10-10 on) are not
+  replayed yet. A recorder restart without
   `A-`/`L-` freezes the feeds (the replay warns about silences over 30 s), and a Lighter sequence
   break (a dropped line) closes the book until the next snapshot, which the tape has only after a
   reconnect. The simulator's `lag_ms` and the first window's `late_frames` measure the shift and

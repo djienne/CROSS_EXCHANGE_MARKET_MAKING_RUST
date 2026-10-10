@@ -11,6 +11,7 @@ target-*
 target_*
 runs
 data
+data-tokyo
 
 # VCS / generated / tooling / docs
 .git

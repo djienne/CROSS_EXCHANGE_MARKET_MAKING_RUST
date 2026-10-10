@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -109,8 +109,9 @@ pub enum Commands {
         markets: Option<String>,
     },
 
-    /// Record one market's raw public Aster and Lighter feeds, the dry run's input, to
-    /// `<out>/<MARKET>/*.tape.zst` for backtests (format in src/dryrun/tape.rs).
+    /// Record one market's raw public Aster, Lighter and Hyperliquid feeds, the dry run's input, to
+    /// `<out>/<MARKET>/*.tape.zst` for backtests (format in src/dryrun/tape.rs). Runs on the Tokyo
+    /// VPS (VPS.md); `python vps.py pull` copies its files to data-tokyo/.
     /// Public data only: no credentials, no orders.
     Record {
         /// Market id from config (e.g. HYPE).
@@ -126,7 +127,8 @@ pub enum Commands {
     Replay {
         #[arg(long)]
         market: String,
-        /// The market's tape. Default: data/<MARKET>.
+        /// The market's tape. Default: data-tokyo/<MARKET> (the VPS's, pulled) if one of its files
+        /// starts by --from, else data/<MARKET> (this PC's, until 2026-10-10).
         #[arg(long)]
         tape: Option<PathBuf>,
         /// Venue time, RFC 3339 (2026-09-28T06:00:00Z).
@@ -206,7 +208,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         }
         Commands::Replay { market, tape, from, until } => {
             crate::taker::abort_on_panic();
-            let tape = tape.unwrap_or_else(|| PathBuf::from("data").join(market.to_ascii_uppercase()));
+            let tape = tape.unwrap_or_else(|| crate::dryrun::tape::default_dir(Path::new(""), &market.to_ascii_uppercase(), from.timestamp_micros()));
             crate::controller::replay(&cli.config, &market, &tape, from, until, crate::controller::stop_on_signals()).await?;
         }
     }

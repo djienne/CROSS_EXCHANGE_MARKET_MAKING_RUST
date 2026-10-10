@@ -1,7 +1,7 @@
-//! The market-data tape: one Aster/Lighter market's raw public feeds, recorded by `record` and
-//! replayed by `replay` (a backtest: [`Replay`]). A file per UTC day and per recorder start,
-//! `<dir>/<MARKET>/<YYYY-MM-DD>T<HHMMSS>Z.tape.zst` after its first line's arrival (UTC), of
-//! tab-separated lines `<arrival µs since the epoch>\t<kind>\t<payload>`:
+//! The market-data tape: one market's raw public feeds, recorded by `record` (on the Tokyo VPS since
+//! 2026-10-10: VPS.md) and replayed by `replay` (a backtest: [`Replay`]). A file per UTC day and per
+//! recorder start, `<dir>/<MARKET>/<YYYY-MM-DD>T<HHMMSS>Z.tape.zst` after its first line's arrival
+//! (UTC), of tab-separated lines `<arrival µs since the epoch>\t<kind>\t<payload>`:
 //!
 //! | kind | payload |
 //! |---|---|
@@ -9,12 +9,16 @@
 //! | `A-` | the Aster connection ended, or a reconnect failed (empty); later frames follow a reconnect |
 //! | `L` | a Lighter frame, raw: `order_book` (snapshot, then deltas: the whole book; a new day's file carries on the book of the file before), `trade`, `market_stats` (funding) |
 //! | `L-` | the Lighter connection ended, or a reconnect failed (empty) |
+//! | `H` | a Hyperliquid frame, raw: fast `l2Book` (5 levels, ~0.5 s), `bbo`, `trades`, `activeAssetCtx` (funding, mark), and the venue's acks and pongs |
+//! | `HS` | a Hyperliquid frame of the slow `l2Book` connection (20 levels, ~5 s) |
+//! | `H-`, `HS-` | that Hyperliquid connection ended, or a reconnect failed (empty) |
 //! | `F` | an Aster `premiumIndex` response (funding), every minute |
 //! | `X`, `O` | the Aster `exchangeInfo` and Lighter `orderBooks` responses (filters), hourly |
 //!
-//! Lines are in the order they arrived, which a reader keeps. Their times are this host's wall
-//! clock, which clock corrections step back (2026-09-26: 71 steps over 1 ms, most of a few ms, the
-//! largest 0.37, 0.50 and 0.70 s), so a reader lets no time pass across a step.
+//! `replay` reads the Aster and Lighter kinds only (tapes before 2026-10-10 have no `H`).
+//! Lines are in the order they arrived, which a reader keeps. Their times are the recording host's
+//! wall clock, which clock corrections step back (2026-09-26, on this PC: 71 steps over 1 ms, most
+//! of a few ms, the largest 0.37, 0.50 and 0.70 s), so a reader lets no time pass across a step.
 //!
 //! A file is concatenated zstd frames, flushed every 10 s; an unclean stop can lose queued or
 //! unflushed data. `zstd -dc` reads complete frames. A truncated frame can only end a
@@ -31,6 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
+use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -39,7 +44,7 @@ use super::feed::{self, Input, Upstream, Wire};
 use crate::lighter::messages::OrderBooksResponse;
 use crate::lighter::ws::{stream_url, subscribe_loop, SubscribeOptions};
 
-/// Lines the writer may fall behind by: ~6 minutes of HYPE at ~60 lines/s.
+/// Lines the writer may fall behind by: minutes of HYPE (~60 lines/s of Aster and Lighter, plus Hyperliquid).
 const QUEUE: usize = 20_000;
 const FLUSH: Duration = Duration::from_secs(10);
 /// A flush also happens once this much is buffered.
@@ -160,6 +165,21 @@ const SILENCE_US: i64 = 30_000_000;
 /// A Lighter connection starts with its book whole.
 const SNAPSHOT: &str = "\"subscribed/order_book\"";
 
+/// When a tape file starts (µs), from its name.
+fn start_of(path: &Path) -> Option<i64> {
+    let name = path.file_name()?.to_str()?.strip_suffix(".tape.zst")?;
+    Some(chrono::NaiveDateTime::parse_from_str(name, "%Y-%m-%dT%H%M%SZ").ok()?.and_utc().timestamp_micros())
+}
+
+/// `market`'s tape under `root` for a replay from `from_us`: the Tokyo VPS's (`data-tokyo`, pulled
+/// by `vps.py pull`) once one of its files starts by then, else this PC's own (`data`, recorded
+/// until 2026-10-10). Never a mix: the two overlap in time and a replay reads its files in order.
+pub fn default_dir(root: &Path, market: &str, from_us: i64) -> PathBuf {
+    let tokyo = root.join("data-tokyo").join(market);
+    let started = std::fs::read_dir(&tokyo).into_iter().flatten().filter_map(|e| start_of(&e.ok()?.path())).any(|start| start <= from_us);
+    if started { tokyo } else { root.join("data").join(market) }
+}
+
 /// A replay of a market's tape from `from_us` to `until_us` (µs, venue time): a dry run whose
 /// world is the tape's, shifted by the days since. Ponytail: it runs at the market's own pace;
 /// a faster one would need every clock the bot reads to follow one virtual clock.
@@ -182,10 +202,6 @@ impl Replay {
     /// Finds where in `dir` (`data/<MARKET>`) a replay from `from_us` starts.
     pub fn open(dir: &Path, from_us: i64, until_us: i64, lead_us: i64, stop: CancellationToken) -> Result<Self> {
         ensure!(from_us < until_us, "--from must come before --until");
-        let start_of = |path: &Path| {
-            let name = path.file_name()?.to_str()?.strip_suffix(".tape.zst")?;
-            Some(chrono::NaiveDateTime::parse_from_str(name, "%Y-%m-%dT%H%M%SZ").ok()?.and_utc().timestamp_micros())
-        };
         let mut files: Vec<(i64, PathBuf)> = std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?
             .filter_map(|entry| entry.ok().map(|e| e.path()))
             .filter_map(|path| Some((start_of(&path)?, path)))
@@ -366,7 +382,25 @@ pub async fn record(config: &Path, market: &str, dir: PathBuf, stop: Cancellatio
     tokio::spawn(subscribe_loop(opts, None, move |frame| on_frame.record("L", frame.raw), move || on_close.record("L-", "")));
     let on_body = tape.clone();
     tokio::spawn(async move { feed::aster_premium_poll(aster_base, vec![symbol], "recorder premiumIndex", |body| on_body.record("F", body)).await });
-    tracing::info!("recording {} (Aster {}, Lighter market {index}) into {}", market.id().0, market.aster_symbol, dir.display());
+    // Ponytail: Hyperliquid's coin is the hedge coin's name (`lighter_symbol`), as in the bot's
+    // configs; a coin spelled differently there would need its own field.
+    let coin = market.lighter_symbol.to_ascii_uppercase();
+    let hl_url = crate::connectors::hyperliquid::ws_url(cfg.maker.live.hyperliquid.base_url.trim_end_matches('/'));
+    let mut fast = crate::connectors::hyperliquid::subscriptions(&coin).to_vec();
+    fast.extend([json!({"type": "trades", "coin": coin}), json!({"type": "activeAssetCtx", "coin": coin})]);
+    // The 20-level book on a connection of its own: its frames do not say which mode they are.
+    let slow = vec![json!({"type": "l2Book", "coin": coin})];
+    for (subscriptions, kinds, label) in [(fast, ("H", "H-"), "recorder Hyperliquid"), (slow, ("HS", "HS-"), "recorder Hyperliquid slow l2Book")] {
+        let (tape, url) = (tape.clone(), hl_url.clone());
+        tokio::spawn(async move {
+            feed::hyperliquid_stream(url, subscriptions, label, |wire| match wire {
+                Wire::Text(text) => tape.record(kinds.0, text),
+                Wire::Closed => tape.record(kinds.1, ""),
+            })
+            .await
+        });
+    }
+    tracing::info!("recording {} (Aster {}, Lighter market {index}, Hyperliquid {coin}) into {}", market.id().0, market.aster_symbol, dir.display());
 
     // A failed writer (a full disk) stops the recorder too, so the restart policy shows it.
     let watch = {
@@ -411,14 +445,21 @@ pub(crate) mod tests {
         let dir = crate::dryrun::tests::temp_dir("replay");
         let t0 = wall_us() / 1_000 - 60_000;
         let (top, delta) = (|at| lighter("subscribed", 0, 10, at, r#"[{"price":"99","size":"5"}]"#, r#"[{"price":"101","size":"5"}]"#), |n, at| lighter("update", n, n + 1, at, "[]", "[]"));
+        // Hyperliquid lines (2026-10-10 on) leave an Aster-Lighter replay as it was.
+        let hl = |at: i64| format!(r#"{{"channel":"l2Book","data":{{"coin":"HYPE","time":{at},"levels":[[{{"px":"99","sz":"1","n":1}}],[{{"px":"101","sz":"1","n":1}}]]}}}}"#);
         write_tape(&dir, &[
             (t0 - 5_000, "X", "{}".into()),
             (t0 - 4_000, "O", "{}".into()),
             (t0 - 3_000, "L", top(t0 - 3_000)),
             (t0 - 2_000, "L", top(t0 - 2_000)),
             (t0 - 1_000, "L", delta(10, t0 - 1_000)),
+            (t0 - 700, "H", hl(t0 - 700)),
+            (t0 - 600, "HS", hl(t0 - 600)),
             (t0 - 500, "A", aster_depth(t0 - 500, "99", "101")),
             (t0 + 100, "A", aster_depth(t0 + 100, "99", "101")),
+            (t0 + 150, "H", hl(t0 + 150)),
+            (t0 + 160, "HS-", String::new()),
+            (t0 + 170, "H-", String::new()),
             (t0 + 200, "L", delta(12, t0 + 200)),
             (t0 + 300, "L", delta(13, t0 + 300)),
             (t0 + 400, "L", top(t0 + 400)),
@@ -455,6 +496,19 @@ pub(crate) mod tests {
             (Venue::Aster, aster_us(t0 + 900) + 1, true, true, true),
         ]);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_replay_defaults_to_the_tokyo_tape_once_it_covers_from() {
+        let root = crate::dryrun::tests::temp_dir("tapes");
+        let tokyo = root.join("data-tokyo").join("HYPE");
+        std::fs::create_dir_all(&tokyo).unwrap();
+        std::fs::write(tokyo.join("2026-10-10T150000Z.tape.zst"), b"").unwrap();
+        let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp_micros();
+        assert_eq!(default_dir(&root, "HYPE", at("2026-10-10T14:59:59Z")), root.join("data").join("HYPE"));
+        assert_eq!(default_dir(&root, "HYPE", at("2026-10-10T15:00:00Z")), tokyo);
+        assert_eq!(default_dir(&root, "BTC", at("2026-10-11T00:00:00Z")), root.join("data").join("BTC"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

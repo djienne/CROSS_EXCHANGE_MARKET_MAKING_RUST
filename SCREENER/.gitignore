@@ -1,3 +1,4 @@
 /target
-# Recorded market data (screener collect)
+# Recorded market data (screener collect): this PC's, and the Tokyo VPS's (`vps.py pull`)
 /data
+/data-tokyo

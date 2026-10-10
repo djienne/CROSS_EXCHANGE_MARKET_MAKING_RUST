@@ -721,13 +721,24 @@ const HYPERLIQUID_PING: Duration = Duration::from_secs(20);
 /// (hourly on the venue; about $0.001 an hour on a $60 hedge at 11 % a year). Add it from
 /// `activeAssetCtx` if positions grow.
 async fn hyperliquid_upstream(ws_url: String, mut up: Upstream) {
+    let subscriptions = up.markets.iter().flat_map(|coin| crate::connectors::hyperliquid::subscriptions(coin)).collect();
+    hyperliquid_stream(ws_url, subscriptions, "dry-run upstream Hyperliquid", |wire| match wire {
+        Wire::Text(text) => up.hyperliquid(text),
+        Wire::Closed => up.closed(),
+    })
+    .await
+}
+
+/// Follows the Hyperliquid websocket at `url` with `subscriptions`, reconnecting forever; `on`
+/// gets every text frame and the end of every session. Shared by the simulator and the tape recorder.
+pub async fn hyperliquid_stream(url: String, subscriptions: Vec<Value>, label: &str, mut on: impl FnMut(Wire<'_>)) {
     let mut backoff = Duration::from_secs(1);
     loop {
         let started = Instant::now();
-        if let Err(e) = hyperliquid_session(&ws_url, &mut up).await {
-            tracing::warn!("dry-run upstream Hyperliquid: {e:#}");
+        if let Err(e) = hyperliquid_session(&url, &subscriptions, &mut on).await {
+            tracing::warn!("{label}: {e:#}");
         }
-        up.closed();
+        on(Wire::Closed);
         if started.elapsed() >= Duration::from_secs(60) {
             backoff = Duration::from_secs(1);
         }
@@ -736,14 +747,12 @@ async fn hyperliquid_upstream(ws_url: String, mut up: Upstream) {
     }
 }
 
-async fn hyperliquid_session(url: &str, up: &mut Upstream) -> Result<()> {
+async fn hyperliquid_session(url: &str, subscriptions: &[Value], on: &mut impl FnMut(Wire<'_>)) -> Result<()> {
     let (ws, _) = tokio_tungstenite::connect_async(url).await.context("connect")?;
     let (mut write, mut read) = ws.split();
-    for coin in &up.markets {
-        for subscription in crate::connectors::hyperliquid::subscriptions(coin) {
-            let subscribe = json!({"method": "subscribe", "subscription": subscription});
-            crate::connectors::send_guarded(&mut write, Message::Text(subscribe.to_string())).await?;
-        }
+    for subscription in subscriptions {
+        let subscribe = json!({"method": "subscribe", "subscription": subscription});
+        crate::connectors::send_guarded(&mut write, Message::Text(subscribe.to_string())).await?;
     }
     let mut ping = tokio::time::interval(HYPERLIQUID_PING);
     let mut deadline = tokio::time::Instant::now() + UPSTREAM_IDLE;
@@ -752,7 +761,7 @@ async fn hyperliquid_session(url: &str, up: &mut Upstream) -> Result<()> {
             msg = read.next() => {
                 deadline = tokio::time::Instant::now() + UPSTREAM_IDLE;
                 match msg.context("the upstream closed")?? {
-                    Message::Text(text) => up.hyperliquid(&text),
+                    Message::Text(text) => on(Wire::Text(&text)),
                     Message::Ping(p) => crate::connectors::send_guarded(&mut write, Message::Pong(p)).await?,
                     Message::Close(_) => return Ok(()),
                     _ => {}
@@ -1031,5 +1040,39 @@ pub(crate) mod tests {
         let closed = rx.recv().await.unwrap();
         assert_eq!(closed, Input::Frame { venue: Venue::Lighter, market: "24".into(), exch_us: exch[1] + 1, event: FeedEvent::Gap }, "the repeated funding was not re-sent");
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn the_hyperliquid_stream_subscribes_then_hands_on_each_frame_and_the_session_end() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let frames = [r#"{"channel":"l2Book","data":{"coin":"HYPE"}}"#, r#"{"channel":"trades","data":[]}"#];
+        let venue = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut got = Vec::new();
+            for _ in 0..2 {
+                got.push(serde_json::from_str::<Value>(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap());
+            }
+            for text in frames {
+                ws.send(Message::Text(text.into())).await.unwrap();
+            }
+            ws.close(None).await.unwrap();
+            got
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let subscriptions = vec![json!({"type": "l2Book", "coin": "HYPE"}), json!({"type": "trades", "coin": "HYPE"})];
+        let stream = tokio::spawn(hyperliquid_stream(url, subscriptions.clone(), "test", move |wire| {
+            let _ = tx.send(match wire {
+                Wire::Text(text) => text.to_string(),
+                Wire::Closed => "closed".to_string(),
+            });
+        }));
+        let got = venue.await.unwrap();
+        assert_eq!(got, subscriptions.iter().map(|s| json!({"method": "subscribe", "subscription": s})).collect::<Vec<_>>());
+        for want in [frames[0], frames[1], "closed"] {
+            assert_eq!(rx.recv().await.unwrap(), want);
+        }
+        stream.abort();
     }
 }

@@ -8,8 +8,9 @@ lighter.env
 
 # Runtime outputs: journals, ledgers, controller state, trip latches
 /runs
-# The market-data tape (`record`)
+# The market-data tape (`record`): this PC's, and the Tokyo VPS's (`vps.py pull`)
 /data
+/data-tokyo
 
 # Python caches
 __pycache__/

@@ -1,6 +1,7 @@
 # Keep the build context to the manifests and sources.
 target
 data
+data-tokyo
 .git
 .gitignore
 *.md

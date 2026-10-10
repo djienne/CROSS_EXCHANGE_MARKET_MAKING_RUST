@@ -248,7 +248,7 @@ pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::
     };
     let legs = match &dry.replay {
         Some(replay) => {
-            ensure!(first == Venue::Aster && hedge == Venue::Lighter, "a tape holds Aster and Lighter feeds only");
+            ensure!(first == Venue::Aster && hedge == Venue::Lighter, "a replay feeds Aster and Lighter only (the tape's Hyperliquid lines are not replayed yet)");
             let [aster, lighter] = replay.specs.clone();
             [Listing::parse(first, symbol, cfg, aster)?, Listing::parse(hedge, &market.lighter_symbol, cfg, lighter)?]
         }

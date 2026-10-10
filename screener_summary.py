@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""The screener's best routes so far: python3 screener_summary.py [--top N] [--min-days D] [report options].
+"""The screener's best routes so far: python3 screener_summary.py [--top N] [--min-days D] [--local] [report options].
 
-It runs SCREENER's report in Docker (`docker compose run --rm report --json`; ~1 GB of memory per
+It scores the Tokyo VPS's recording (SCREENER/data-tokyo, pulled daily by `python vps.py pull`;
+clean feeds, from 2026-10-10 12:18Z) unless --local picks this PC's (SCREENER/data, whose feeds
+stall for tens of seconds). It runs SCREENER's report in Docker (`docker compose run --rm report --json`; ~1 GB of memory per
 recorded day, 8 GB cap) and prints the best routes by the report's own `best` fixed strategy.
 Report options (--since, --until, --lighter premium, --latency 2) pass through; SCREENER/README.md
 explains them and the columns. $/day use the configured clip ($13 by default).
@@ -21,8 +23,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--top", type=int, default=15)
     parser.add_argument("--min-days", type=float, default=1.0, help="Hide routes with less data (default 1 day).")
+    parser.add_argument("--local", action="store_true", help="Score this PC's recording instead of the Tokyo VPS's.")
     args, report_args = parser.parse_known_args()
-    out = subprocess.run(["docker", "compose", "run", "--rm", "-T", "report", "--json", *report_args],
+    data = "data" if args.local else "data-tokyo"
+    print(f"data: SCREENER/{data} ({'this PC' if args.local else 'Tokyo VPS'})")
+    out = subprocess.run(["docker", "compose", "run", "--rm", "-T", "report", "--json", "--data", data, *report_args],
                          cwd=SCREENER, check=True, capture_output=True, text=True).stdout
     report = json.loads(out)
     pairs = sorted(report["pairs"], key=lambda p: p["best_usd_day"], reverse=True)

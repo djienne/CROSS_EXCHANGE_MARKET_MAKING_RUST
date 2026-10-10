@@ -1,4 +1,4 @@
-# VPS (Tokyo dry run)
+# VPS (Tokyo dry run and data collection)
 
 | | |
 |---|---|
@@ -9,11 +9,24 @@
 | Code | `/root/xemm/LIGHTER_ASTER_BOT` (git-tracked files only; no `*.env`, no credentials) |
 | Service | `xemm-dryrun` (systemd): `run --market HYPE --mode dry-run --ack-breaker`, 512 MB cap, SIGINT stop |
 | Output | `/root/xemm/LIGHTER_ASTER_BOT/runs/dry-run/` |
+| Collectors | `xemm-recorder` (`record --market HYPE`, 256 MB cap) → `LIGHTER_ASTER_BOT/data/HYPE/`; `xemm-screener` (`screener collect`, 400 MB cap) → `SCREENER/data/`; both enabled at boot, niced below the dry run |
 
-Only the dry run runs here: no recorder tape and no other bulk data collection, except the
-3-day screener run below. `runs/dry-run`
-grows ~37 MB/day for HYPE (2026-10-10: journal 26, book sanity 7.5, diagnostics 2, equity 1.5).
-Disk stays bounded, all set up by `sync`:
+Since 2026-10-10 the VPS collects and the Windows PC stores: this PC's route to Tokyo stalls for
+tens of seconds, which leaves holes in what it records, while the VPS's feeds are clean. Disk use
+is ~0.45 GB/day: the tape ~0.19 (Aster + Lighter 0.15, Hyperliquid ~0.04; estimates until a full
+day is measured), the screener 0.1-0.2, and `runs/dry-run` ~37 MB/day for HYPE (2026-10-10:
+journal 26, book sanity 7.5, diagnostics 2, equity 1.5). That is ~25 days of slack on the free
+disk if no pull happens. Disk stays bounded, all set up by `sync` and `pull`:
+
+- `python vps.py pull` (a Windows scheduled task, "XEMM Tokyo pull", runs it daily at 04:00 UTC
+  and appends to `LIGHTER_ASTER_BOT/data-tokyo/pull.log`) copies every closed file (all but the
+  newest of each directory) to `LIGHTER_ASTER_BOT/data-tokyo/` and `SCREENER/data-tokyo/` at
+  ~2 MB/s, file by file, and accepts a copy only when its SHA-256 equals the VPS's
+  (`pulled.json` beside them lists the verified files). It deletes a VPS file only once verified
+  here and started more than 7 days ago (the screener's gate reads 72 h back). `--dry-run` lists
+  what it would copy and delete.
+- The daily 03:30 UTC script stops both collectors below 4 GB free, so the dry run keeps its disk;
+  the next `pull` starts them again once there is room.
 
 - The daily timer `xemm-dryrun-archive` (03:30 UTC) acts once those four logs pass 1 GB (about
   monthly). It stops the dry run, moves them to `runs/archive/<UTC time>/`, restarts the dry run
@@ -29,8 +42,9 @@ Disk stays bounded, all set up by `sync`:
 From the repository root on Windows:
 
 ```
-python vps.py sync      # upload tracked files (uncommitted edits too), build, restart the dry run
-python vps.py status    # service, memory, disk, runs/ size
+python vps.py sync      # upload tracked files (uncommitted edits too), build, restart the dry run and recorder
+python vps.py status    # services, memory, disk, runs/ and data sizes
+python vps.py pull      # bring the collectors' closed files home (also daily, scheduled)
 python vps.py logs 100  # journal tail
 python vps.py latency   # TCP and HTTPS round trips to Aster, Lighter, Hyperliquid
 ```
@@ -38,15 +52,15 @@ python vps.py latency   # TCP and HTTPS round trips to Aster, Lighter, Hyperliqu
 The release build (thin LTO, one job) takes a while on one CPU and leans on swap; the running dry
 run keeps going until the restart, but its timing is noisier while cargo runs.
 
-## Screener ground truth (3 days from 2026-10-10)
+## Screener collector (permanent since 2026-10-10)
 
-`python vps.py screener` uploads the tracked `SCREENER/` files, builds them and runs the pair
-screener's collector as `xemm-screener`: 400 MB cap, niced below the dry run, not enabled at boot.
-A transient timer, `xemm-screener-stop`, stops it 3 days after the last `screener` call. It writes
-~200 MB/day to `/root/xemm/SCREENER/data`; `python vps.py screener-pull` copies the files to
-`SCREENER/data-tokyo/` (git-ignored). They give `[report.scenario.tokyo]` its delays (the report
-prints them) and the comparison of `report --scenario host` on them with `--scenario tokyo` on the
-local data. Delete the VPS data dir once pulled.
+`python vps.py screener` uploads the tracked `SCREENER/` files, builds them and (re)starts the pair
+screener's collector as `xemm-screener`, with the full pair list: 400 MB cap, niced below the dry
+run, enabled at boot. It began as a 3-day ground truth (from 2026-10-10 12:18Z) and stays. `pull`
+copies its files to `SCREENER/data-tokyo/` (git-ignored), which `python screener_summary.py`
+scores by default (`--local` for this PC's own recording). The first days give
+`[report.scenario.tokyo]` its delays (the report prints them) and the comparison of
+`report --scenario host` on them with `--scenario tokyo` on the local data.
 
 ## Latency from the VPS (2026-10-10)
 

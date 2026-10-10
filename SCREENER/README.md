@@ -100,8 +100,8 @@ or trading connector is imported.
 ## Known limits
 
 - **Top of book only.** Top of book stands in for the bot's VWAP over 10× the clip; moments with
-  less than that at the top are skipped. The bot's `record` command can collect full depth for
-  Aster/Lighter candidates; it does not yet record Hyperliquid routes.
+  less than that at the top are skipped. The bot's `record` command collects full depth (Aster,
+  Lighter and Hyperliquid) for a market a bot trades; it runs on the Tokyo VPS for HYPE only.
 - **The gate.** The gate's samples are counted in 0.25 bps bins, from the pair's required edge at
   the cheaper Lighter tier, and it reads whole 5-minute windows: it opens within a bin of the bot's,
   a window later. At the Premium tier its samples are the Standard ones above Premium's edge. The
@@ -153,6 +153,11 @@ also selects the moments any mix of the two legs' states within the pre-roll cou
 other feed delays than this host's could produce. Version 4 (the same day) adds each summary's
 stall spans; scenarios need it.
 A new run reads the last 72 h of summaries back for its gate.
+
+Since 2026-10-10 the collector also runs permanently on the Tokyo VPS, whose feeds do not stall
+(VPS.md), and `python vps.py pull` copies its closed files to `data-tokyo/` daily.
+`python screener_summary.py` scores `data-tokyo/` by default (`--local` for `data/`); the report
+reads either with `--data`.
 
 With Hyperliquid, files take ~60 MB a day for ~155 pairs (18:03–20:07 UTC on 2026-09-26; twice
 that in the first hours, while the new pairs' gates warmed up at their floors). Aster-Lighter
