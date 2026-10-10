@@ -299,7 +299,7 @@ on the day do not reach the bot. The `replay` service has no network at all and 
 ```bash
 docker compose run -d --name replay-0928 replay replay --market HYPE --from 2026-09-28T00:00:00Z --until 2026-09-29T00:00:00Z
 docker logs -f replay-0928
-python ../dryrun_summary.py --runs LIGHTER_ASTER_BOT/runs/replay/HYPE-20260928T000000Z-20260929T000000Z
+python ../dryrun_summary.py --runs LIGHTER_ASTER_BOT/runs/replay/HYPE-20260928T000000Z-20260929T000000Z-k1-standard-s0
 ```
 
 - **Pace.** It runs at the market's own pace (a day takes a day, after ~2 minutes of warm-up),
@@ -312,11 +312,26 @@ python ../dryrun_summary.py --runs LIGHTER_ASTER_BOT/runs/replay/HYPE-20260928T0
   shared the CPU, 2 ms after). Faster than real time does not work: libfaketime at x10 (one core
   per run) changed the bot's behavior (Aster orders 35/min vs 47, rejects 4/min vs 0.2, Lighter
   rate-limited, half the minutes over 0.5 s late), so speed comes from running windows side by side.
-- **Files.** Each window gets a new `runs/replay/<M>-<from>-<until>/` (an existing one is
-  refused): no simulated account, latch or deadman carries over. `replay.json` holds the
-  window, shift, tape files and gate seed; the bot's files are in its `dry-run/`.
+- **Variants.** `--latency k` multiplies every network and stream delay of `[dry_run]` (round
+  trips, feeds, user/account streams; `0`: none), not Lighter's 300 ms taker delay, a venue rule.
+  `--lighter premium` is Lighter's Premium account: 140 ms taker delay and 2.8 bps taker fee,
+  which the bot decides with (taker required edge 4 + 2.8 + 2 = 8.8 bps, XEMM's hedge fee) and
+  the simulator charges. Its 0.4 bps maker fee is never charged (the bot rests no order on
+  Lighter) and its higher request limit is not modelled (Standard's cost 2 requests in 2 h on
+  2026-09-28). `--seed` overrides `[dry_run] seed`; `--config` a scratch copy of bot.toml (e.g.
+  `hidden_queue_multiplier`), whose name is added to the run's directory.
+- **Files.** Each run gets a new `runs/replay/<M>-<from>-<until>-k<k>-<standard|premium>-s<seed>[-<config>]/`
+  (an existing one is refused): no simulated account, latch or deadman carries over.
+  `replay.json` holds what its numbers depend on: window, shift, tape files, k, account type,
+  seed, the effective `[dry_run]`, the fees, the gate seed and the commit (`unknown` unless the
+  image was built with `GIT_COMMIT=$(git describe --always --dirty) docker compose build`). The
+  bot's files are in its `dry-run/`; `bot_stats.py`/`combined_pnl.py --runs <run>/dry-run` default
+  to its window, and `combined_pnl`'s `by_day` gives net per UTC day of the market (its times less
+  `shift_ms`).
 - **Gate.** The entry gate starts from the live dry run's samples of the 72 h before `--from`
-  (`runs/dry-run/opportunities_<M>.jsonl`, read-only); below 50 the taker stays in warm-up. The
+  (`runs/dry-run/opportunities_<M>.jsonl`, read-only, or `--gate <file>`) at or above the run's
+  required edge, as its bot would have logged them (Premium's are fewer); below 50 the taker
+  stays in warm-up. The
   live sampler was frozen 2026-10-02 to 10-09, so replay that week as one window, not per day.
 - **Limits.** HYPE Aster-Lighter only: the tape's Hyperliquid lines (2026-10-10 on) are not
   replayed yet. A recorder restart without

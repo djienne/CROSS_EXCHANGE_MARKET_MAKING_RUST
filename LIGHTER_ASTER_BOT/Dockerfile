@@ -26,6 +26,10 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
+# The commit the binary reports (controller::COMMIT): compose passes the shell's GIT_COMMIT
+# (`GIT_COMMIT=$(git describe --always --dirty) docker compose build`).
+ARG GIT_COMMIT=unknown
+
 # BuildKit cache mounts make iterative rebuilds (synced bug fixes) fast; the final
 # binary is copied to a stable, non-cache path so the runtime stage can pull it.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

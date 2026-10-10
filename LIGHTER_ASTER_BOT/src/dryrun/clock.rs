@@ -74,6 +74,11 @@ impl From<Latency> for [f64; 2] {
 impl Latency {
     pub const ZERO: Latency = Latency { p50_ms: 0.0, p99_ms: 0.0 };
 
+    /// The same distribution with every delay `k` times as long (`k = 0`: none).
+    pub fn scaled(self, k: f64) -> Result<Self, String> {
+        Self::try_from(<[f64; 2]>::from(self).map(|ms| ms * k))
+    }
+
     pub fn sample_us(&self, rng: &mut Rng) -> i64 {
         if self.p50_ms == 0.0 {
             return 0;
@@ -113,5 +118,8 @@ mod tests {
         assert_eq!(Latency::ZERO.sample_us(&mut a), 0);
         assert!(Latency::try_from([10.0, 5.0]).is_err());
         assert!(Latency::try_from([0.0, 5.0]).is_err());
+        assert_eq!(<[f64; 2]>::from(lat.scaled(2.5).unwrap()), [20.0, 90.0]);
+        assert_eq!(lat.scaled(0.0), Ok(Latency::ZERO));
+        assert!(lat.scaled(-1.0).is_err() && lat.scaled(f64::NAN).is_err());
     }
 }

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -182,6 +183,26 @@ class XemmSummaryTests(unittest.TestCase):
             ])
             self.assertEqual(combined_pnl.default_since(runs, "HYPE", True), "2026-09-24T14:14:54Z")
             self.assertEqual(combined_pnl.default_since(runs, "HYPE", False), combined_pnl.DEFAULT_SINCE)
+
+    def test_a_replay_reports_its_window_and_net_per_market_day(self) -> None:
+        def trade(at: str, net: str = "1") -> dict:  # sold 1 at 101, bought 1 at 100; another net disagrees: incomplete
+            leg = lambda px: {"qty": "1", "vwap": px, "fee_usd": "0", "fee_provenance": "venue"}
+            return {"schema_version": 2, "economic_status": "confirmed", "timestamp": at, "market": "HYPE",
+                    "direction": "SELL_ASTER_BUY_LIGHTER", "aster_order_id": at, "hedge_client_order_index": 1,
+                    "aster_fill": leg("101"), "hedge_fill": leg("100"), "actual_gross_usd": "1", "actual_fees_usd": "0", "actual_net_usd": net}
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "dry-run"
+            runs.mkdir()
+            # Shifted 1 h: the run's 00:30 is the market's 23:30 the day before; its window ends at 03:00.
+            (runs.parent / "replay.json").write_text(json.dumps({"from": "2026-01-02T23:00:00Z", "until": "2026-01-03T02:00:00Z",
+                                                                 "shift_ms": 3_600_000}), encoding="utf-8")
+            write_jsonl(runs / "trades_HYPE.jsonl", [trade("2026-01-03T00:30:00Z"), trade("2026-01-03T01:30:00Z"),
+                                                     trade("2026-01-03T02:00:00Z", net="2"), trade("2026-01-03T04:00:00Z")])
+            out = json.loads(subprocess.run([sys.executable, combined_pnl.__file__, "--runs", str(runs), "--market", "HYPE", "--json"],
+                                            check=True, capture_output=True, text=True).stdout)
+        self.assertEqual((out["since"][:19], out["now"][:19], out["shift_ms"]), ("2026-01-03T00:00:00", "2026-01-03T03:00:00", 3_600_000))
+        days = {day: (d["trades"], Decimal(d["known_net_pnl_usdc"]), d["incomplete"]) for day, d in out["taker"]["by_day"].items()}
+        self.assertEqual(days, {"2026-01-02": (1, Decimal(1), 0), "2026-01-03": (2, Decimal(1), 1)})
 
 
 if __name__ == "__main__":

@@ -203,7 +203,9 @@ def sync():
         " || (. ~/.cargo/env && cargo clean --release)")
     # One job: the VPS has 1 CPU and ~1 GB RAM. Only the build needs swap: the thin-LTO link
     # peaked at 1.27 of its 2.5 GB (2026-10-10); the running services use < 100 MB together.
-    ssh(f". ~/.cargo/env && cd {REMOTE} && CARGO_BUILD_JOBS=1 cargo build --release")
+    # The binary logs the commit it was built from (`-dirty`: uncommitted edits went up too).
+    commit = subprocess.run(["git", "describe", "--always", "--dirty"], cwd=ROOT, check=True, capture_output=True, text=True).stdout.strip()
+    ssh(f". ~/.cargo/env && cd {REMOTE} && GIT_COMMIT={shlex.quote(commit)} CARGO_BUILD_JOBS=1 cargo build --release")
     # The bot logs to stdout -> journald; cap it so the small disk only grows by runs/dry-run.
     ssh("mkdir -p /etc/systemd/journald.conf.d && printf '[Journal]\\nSystemMaxUse=200M\\n'"
         " > /etc/systemd/journald.conf.d/size.conf && systemctl restart systemd-journald")

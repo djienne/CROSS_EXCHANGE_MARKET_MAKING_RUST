@@ -14,7 +14,10 @@ For a live/paper comparison, `--runs DIR` reads an isolated runs directory; give
 same `--since` and `--now`. `maker_fills`/`maker_sides` count deduplicated native exchange fills,
 `trades` logical obligations. `hedge_first_fill_observed_ms` is per trade, on this host's
 monotonic clock, from its first maker fill to its first hedge fill seen (retries included);
-`hedge_delay_ms` compares the venues' own clocks. An amend's round trip ends at the same client
+`hedge_delay_ms` compares the venues' own clocks. XEMM's `expected_gross_bps` is the edge its
+maker fills' quotes were priced at (the journal's place/amend `hedge_vwap`), `edge_kept` the
+realized share of it. A replay's `--runs` defaults to its own window; `shift_ms` maps its times
+back to the market's. An amend's round trip ends at the same client
 id's reply. Report p50 is the upper median for even counts, and with 2 samples the larger one.
 """
 from __future__ import annotations
@@ -28,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from combined_pnl import default_since, iso, iter_jsonl, parse_dt, report_roots, utc_now
+from combined_pnl import default_since, iso, iter_jsonl, parse_dt, replay_window, report_roots, utc_now
 from economics import parse_timestamp, xemm_journal
 
 
@@ -120,12 +123,28 @@ def xemm(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, A
         return {"trades": 0}
     stats = collections.defaultdict(list)
     trades = [t for t in xemm_journal(path, market, now=now)["trades"] if t["timestamp"] and since <= t["timestamp"] <= now]
+    # Each quote's price and the hedge VWAP it was priced from, by client id, in journal order.
+    priced = collections.defaultdict(list)
+    for _, r in iter_jsonl(path):
+        if r.get("kind") in ("place", "amend") and isinstance(d := r.get("detail"), dict) and d.get("hedge_vwap"):
+            priced[d.get("client_id")].append((r.get("ts_ms", 0), float(d["price"]), float(d["hedge_vwap"])))
+    both = []  # (realized, expected) gross bps of the trades with both
     for t in trades:
         notional = t["aster_px"] * t["aster_qty"] if t["aster_px"] and t["aster_qty"] else None
+        quoted = []  # (qty, bps): the edge each maker fill's quote was priced at
+        for f in t["fills"]:
+            at, client = f.source.get("ts_ms", 0), f.source.get("detail", {}).get("client_id")
+            earlier = [q for q in priced.get(client, []) if q[0] <= at]
+            if native_maker(f) and earlier:
+                _, px, hedge = earlier[-1]
+                quoted.append((float(f.qty), (hedge - px if f.side.lower() == "buy" else px - hedge) / px * 10_000))
+        expected = sum(q * bps for q, bps in quoted) / sum(q for q, _ in quoted) if quoted else None
+        if expected is not None:
+            stats["expected_gross_bps"].append(expected)
         if notional and t["gross_pnl_usdc"] is not None:
             stats["gross_bps"].append(float(t["gross_pnl_usdc"] / notional * 10_000))
-        if notional and t["net_pnl_usdc"] is not None:
-            stats["net_bps"].append(float(t["net_pnl_usdc"] / notional * 10_000))
+            if expected is not None:
+                both.append((stats["gross_bps"][-1], expected))
         firsts = {v: min((f.timestamp for f in t["fills"] if f.venue == v and f.timestamp), default=None) for v in ("aster", "lighter")}
         if all(firsts.values()):
             stats["hedge_delay_ms"].append((firsts["lighter"] - firsts["aster"]).total_seconds() * 1000)
@@ -137,12 +156,13 @@ def xemm(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, A
             if f.timestamp and since <= f.timestamp <= now and f.quote and f.fee is not None:
                 stats["maker_fees_bps" if f.venue == "aster" else "hedge_fees_bps"].append(float(f.fee / f.quote * 10_000))
     makers = [f for t in trades for f in t["fills"] if native_maker(f) and f.qty > 0 and f.timestamp and since <= f.timestamp <= now]
-    hours = (now - since).total_seconds() / 3600
+    hours, expected = (now - since).total_seconds() / 3600, sum(e for _, e in both)
     return {"trades": len(trades), "incomplete": sum(t["net_pnl_usdc"] is None for t in trades),
             "residual": sum(t["residual_qty"] != 0 for t in trades),
             "maker_fills": len(makers), "maker_sides": dict(collections.Counter(f.side for f in makers)),
             "maker_fills_per_hour": round(len(makers) / hours, 2) if hours > 0 else None,
             "known_net_usd": float(sum(t["net_pnl_usdc"] for t in trades if t["net_pnl_usdc"] is not None)),
+            "edge_kept": round(sum(g for g, _ in both) / expected, 3) if expected else None,
             **{k: dist(v) for k, v in stats.items()}}
 
 
@@ -285,8 +305,10 @@ def main() -> int:
     runs = args.runs.resolve() if args.runs else report_roots(Path(__file__).resolve().parent, args.dry_run)[1]
     if args.runs and not runs.is_dir():
         parser.error(f"runs directory does not exist: {runs}")
-    since = parse_dt(args.since or default_since(runs, args.market, args.dry_run))
-    result = report(runs, args.market, since, parse_dt(args.now) if args.now else utc_now())
+    window = replay_window(runs) if args.runs else None  # a replay: its own window, on its clock
+    since = parse_dt(args.since or (window[0] if window else default_since(runs, args.market, args.dry_run)))
+    now = parse_dt(args.now or window[1]) if args.now or window else utc_now()
+    result = {**report(runs, args.market, since, now), "shift_ms": window[2] if window else 0}
     if args.json:
         print(json.dumps(result, indent=2))
     else:

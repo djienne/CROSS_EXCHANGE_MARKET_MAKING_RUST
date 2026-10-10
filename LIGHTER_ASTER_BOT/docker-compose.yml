@@ -34,6 +34,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: [GIT_COMMIT]
     image: lighter_aster_bot:live
     working_dir: /app
     user: "${XEMM_UID:-1000}:${XEMM_GID:-1000}"
@@ -94,6 +95,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: [GIT_COMMIT]
     # Its own tag: the fleet's start_all.bat rebuilds this from the working tree, which must
     # never retag the live image.
     image: lighter_aster_bot:dryrun
@@ -164,6 +166,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: [GIT_COMMIT]
     image: lighter_aster_bot:recorder
     container_name: lighter-aster-recorder
     working_dir: /app
@@ -196,6 +199,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: [GIT_COMMIT]
     image: lighter_aster_bot:dryrun
     working_dir: /app
     user: "${XEMM_UID:-1000}:${XEMM_GID:-1000}"

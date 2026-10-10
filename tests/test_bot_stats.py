@@ -114,22 +114,32 @@ class BotStatsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             runs = Path(tmp)
             # A first attempt that filled nothing: the retry's delay counts from the maker fill.
-            write_jsonl(runs / "bot-HYPE-journal.jsonl", [maker, maker, hedge(300, 300_000_000, "h0", "0"),
+            # The fill's quote was last priced at 100 against a 101.2 hedge: 120 bps expected.
+            quote = lambda ms, kind, vwap: rec(ms, kind, side="Buy", price="100", qty="1", client_id="b1", hedge_vwap=vwap)
+            write_jsonl(runs / "bot-HYPE-journal.jsonl", [quote(50, "place", "101.5"), quote(80, "amend", "101.2"),
+                maker, maker, quote(120, "amend", "105"), hedge(300, 300_000_000, "h0", "0"),
                 hedge(650, 650_000_000), hedge(900, 900_000_000),
                 rec(1200, "maker_fill", logical_id="l2", maker_side="Sell", qty="1", px="101", fee_usd="0",
                     order_id="o2", trade_id="t2", client_id="s1"),
                 # The same private stream also reports a recovery MARKET, which is not a maker.
                 rec(1500, "maker_fill", logical_id="l3", maker_side="Sell", qty="1", px="100", fee_usd="0.04",
                     order_id="o3", trade_id="t3", client_id="r1", reduce_only=True)])
-            since, until = (datetime.fromtimestamp((t + ms) / 1000, timezone.utc).isoformat() for ms in (0, 3_600_000))
-            proc = subprocess.run([sys.executable, bot_stats.__file__, "--market", "HYPE", "--runs", tmp,
-                "--since", since, "--now", until, "--json"], check=True, capture_output=True, text=True)
+            # A replay a day later: its window defaults to the tape's, shifted.
+            day = 86_400_000
+            since, until = (datetime.fromtimestamp((t + ms) / 1000, timezone.utc).isoformat() for ms in (-day, 3_600_000 - day))
+            (runs / "replay.json").write_text(json.dumps({"from": since, "until": until, "shift_ms": day}), encoding="utf-8")
+            proc = subprocess.run([sys.executable, bot_stats.__file__, "--market", "HYPE", "--runs", tmp, "--json"],
+                check=True, capture_output=True, text=True)
             result = json.loads(proc.stdout)
             self.assertEqual(Path(result["runs"]), runs.resolve())
+        self.assertEqual(result["shift_ms"], day)
+        self.assertEqual(datetime.fromisoformat(result["since"].replace("Z", "+00:00")).timestamp() * 1000, t)
         x = result["xemm"]
         self.assertEqual((x["maker_fills"], x["maker_sides"], x["maker_fills_per_hour"]), (2, {"buy": 1, "sell": 1}, 2))
         self.assertEqual(x["maker_fees_bps"], {"n": 2, "mean": 0, "p50": 0, "p90": 0})
         self.assertEqual(x["hedge_first_fill_observed_ms"], {"n": 1, "mean": 600, "p50": 600, "p90": 600})
+        # Bought at 100, hedged at 101: 100 of the 120 bps kept.
+        self.assertEqual((x["expected_gross_bps"], x["edge_kept"]), ({"n": 1, "mean": 120, "p50": 120, "p90": 120}, 0.833))
 
 
 if __name__ == "__main__":

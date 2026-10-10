@@ -68,6 +68,9 @@ pub struct QuoteRecord {
     pub qty: Option<Decimal>,
     pub reason: Option<&'static str>,
     pub client_id: Option<String>,
+    /// The hedge's VWAP the quote was priced from (place, amend): its expected edge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hedge_vwap: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Serialize)]

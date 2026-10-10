@@ -5,7 +5,7 @@ import argparse
 import json
 import math
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -76,7 +76,33 @@ def iter_jsonl(path: Path, errors: list[str] | None = None):
                 print(f"warn: skipping invalid JSON in {path}:{line_no}: {exc}", file=sys.stderr)
 
 
-def summarize_taker(path: Path, since: datetime, now: datetime, market: str) -> dict[str, Any]:
+def by_day(trades: list[tuple[datetime | None, Decimal | None]], shift_ms: int) -> dict[str, dict[str, Any]]:
+    """Trades and known net per UTC day of the market (a replay's clock less its shift); a trade
+    without a known net counts as incomplete."""
+    days: dict[str, dict[str, Any]] = {}
+    for ts, net in trades:
+        if ts is not None:
+            day = days.setdefault((ts - timedelta(milliseconds=shift_ms)).date().isoformat(), {"trades": 0, "known_net_pnl_usdc": Decimal(0), "incomplete": 0})
+            day["trades"] += 1
+            if net is None:
+                day["incomplete"] += 1
+            else:
+                day["known_net_pnl_usdc"] += net
+    return dict(sorted(days.items()))
+
+
+def replay_window(runs: Path) -> tuple[str, str, int] | None:
+    """A replay's window on its own clock (`from`/`until` + `shift_ms`) and its shift, from the
+    replay.json beside its `dry-run/` (`runs`) or in `runs`."""
+    for path in (runs.parent / "replay.json", runs / "replay.json"):
+        if path.exists():
+            about = json.loads(path.read_text(encoding="utf-8"))
+            shift = timedelta(milliseconds=about["shift_ms"])
+            return iso(parse_dt(about["from"]) + shift), iso(parse_dt(about["until"]) + shift), about["shift_ms"]
+    return None
+
+
+def summarize_taker(path: Path, since: datetime, now: datetime, market: str, shift_ms: int = 0) -> dict[str, Any]:
     rows = []
     if path.exists():
         for _, row in iter_jsonl(path):
@@ -101,13 +127,15 @@ def summarize_taker(path: Path, since: datetime, now: datetime, market: str) -> 
         "gross_pnl_usdc":sum_optional(confirmed,"gross_pnl_usdc") if not unknown else None,
         "fees_usdc":sum_optional(confirmed,"fees_usdc") if not unknown else None,
         "net_pnl_usdc":net if not unknown else None,
-        "known_net_pnl_usdc":net,"estimated_net_pnl_usdc":estimated,"incomplete_trades":unknown}
+        "known_net_pnl_usdc":net,"estimated_net_pnl_usdc":estimated,"incomplete_trades":unknown,
+        "by_day":by_day([(event_time(row), r["net_pnl_usdc"] if r is not None and r["economic_status"] == "confirmed" else None)
+                         for row, r in zip(rows, normalized)], shift_ms)}
 
 
 
 
 def summarize_xemm_journal(
-    path: Path, market: str, since: datetime, now: datetime, include_untimestamped: bool,
+    path: Path, market: str, since: datetime, now: datetime, include_untimestamped: bool, shift_ms: int = 0,
 ) -> dict[str, Any]:
     parsed = xemm_journal(path, market, now=now)
     trades = []
@@ -133,6 +161,7 @@ def summarize_xemm_journal(
         "fees_usdc": sum_optional(trades,"fees_usdc"),
         "net_pnl_usdc": None if uncertain else known_net,
         "known_net_pnl_usdc": known_net, "incomplete_trades": incomplete,
+        "by_day": by_day([(t["timestamp"], t["net_pnl_usdc"]) for t in trades], shift_ms),
         "unmatched_fills": sum(t["residual_qty"] != 0 and t["lighter_qty"] == 0 for t in trades),
         "unmatched_hedges": sum(t["residual_qty"] != 0 and t["aster_qty"] == 0 for t in trades),
         "qty_mismatches": sum(t["residual_qty"] != 0 for t in trades),
@@ -255,7 +284,7 @@ def projection(net: Decimal | None, capital: Decimal | None, since: datetime, no
 def combine(args: argparse.Namespace) -> dict[str, Any]:
     since = parse_dt(args.since)
     now = parse_dt(args.now) if args.now else utc_now()
-    taker = summarize_taker(args.taker_trades, since, now, args.market)
+    taker = summarize_taker(args.taker_trades, since, now, args.market, args.shift_ms)
     journal_paths, skipped_journals = selected_xemm_journals(
         args.xemm_journal,
         args.xemm_runs_dir,
@@ -269,9 +298,15 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
             since,
             now,
             args.include_untimestamped_xemm,
+            args.shift_ms,
         )
         for path in journal_paths
     ]
+    xemm_days: dict[str, dict[str, Any]] = {}
+    for day, d in ((day, d) for j in xemm_journals for day, d in j["by_day"].items()):
+        acc = xemm_days.setdefault(day, dict.fromkeys(d, 0))
+        for key in d:
+            acc[key] += d[key]
     xemm = {
         "trades": sum(j["trades"] for j in xemm_journals),
         "incomplete_trades": sum(j["incomplete_trades"] for j in xemm_journals),
@@ -288,6 +323,7 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
         "untimestamped_trades": sum(j["untimestamped_trades"] for j in xemm_journals),
         "skipped_untimestamped_trades": sum(j["skipped_untimestamped_trades"] for j in xemm_journals),
         "time_filtered_trades": sum(j["time_filtered_trades"] for j in xemm_journals),
+        "by_day": dict(sorted(xemm_days.items())),
         "journals": xemm_journals,
         "skipped_journals": skipped_journals,
         "journal_selection": args.xemm_journal_selection,
@@ -330,6 +366,7 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
         "market": args.market,
         "since": since,
         "now": now,
+        "shift_ms": args.shift_ms,
         "taker": taker,
         "xemm": xemm,
         "total": total,
@@ -491,7 +528,10 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     roots = (args.runs, args.runs) if args.runs else report_roots(stack_root, args.dry_run)
     legacy_runs, bot_runs = roots
-    args.since = args.since or default_since(bot_runs, args.market, args.dry_run)
+    window = replay_window(args.runs) if args.runs else None
+    args.shift_ms = window[2] if window else 0
+    args.since = args.since or (window[0] if window else default_since(bot_runs, args.market, args.dry_run))
+    args.now = args.now or (window[1] if window else None)
     explicit_xemm_journals = bool(args.xemm_journal)
     explicit_xemm_runs_dirs = args.xemm_runs_dir is not None
     if args.taker_trades is None:

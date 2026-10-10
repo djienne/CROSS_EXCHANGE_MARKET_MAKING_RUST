@@ -2105,7 +2105,7 @@ impl Strategy {
                     if reason == ReplaceReason::QuoteTooCloseToTouch {
                         self.latch_aster_touch_guard(market, side, now_ns);
                     }
-                    self.journal.typed(now_ns, "cancel", Some(market.0.clone()), JournalDetail::Quote(QuoteRecord { side, price: None, qty: None, reason: Some(reason.as_str()), client_id: self.orders.slot(market, side).and_then(|s| s.client_id.clone()) }), "confirmed");
+                    self.journal.typed(now_ns, "cancel", Some(market.0.clone()), JournalDetail::Quote(QuoteRecord { side, price: None, qty: None, reason: Some(reason.as_str()), client_id: self.orders.slot(market, side).and_then(|s| s.client_id.clone()), hedge_vwap: None }), "confirmed");
                 }
             }
             SideDecision::Place(desired) => {
@@ -2141,7 +2141,7 @@ impl Strategy {
                             self.orders.on_place_sent(market, side, cid, price_ticks, qty_lots, now_ns);
                             self.orders.bind_admission(market, side, admission);
                             self.clear_aster_touch_guard(market, side, now_ns);
-                            self.journal.typed(now_ns, "place", Some(market.0.clone()), JournalDetail::Quote(QuoteRecord { side, price: Some(desired.price), qty: Some(desired.qty), reason: None, client_id: self.orders.slot(market, side).and_then(|s| s.client_id.clone()) }), "confirmed");
+                            self.journal.typed(now_ns, "place", Some(market.0.clone()), JournalDetail::Quote(QuoteRecord { side, price: Some(desired.price), qty: Some(desired.qty), reason: None, client_id: self.orders.slot(market, side).and_then(|s| s.client_id.clone()), hedge_vwap: Some(desired.expected_hl_vwap) }), "confirmed");
                         }
                         ExecDispatch::BudgetBlocked => {
                             debug!("Aster command budget/backoff: optional place deferred for {market} {side:?}");
@@ -2255,7 +2255,7 @@ impl Strategy {
                         self.orders.on_amend_sent(market, side, price_ticks, qty_lots, now_ns);
                         self.orders.bind_admission(market, side, admission);
                         self.clear_aster_touch_guard(market, side, now_ns);
-                        self.journal.typed(now_ns, "amend", Some(market.0.clone()), JournalDetail::Quote(QuoteRecord { side, price: Some(desired.price), qty: Some(desired.qty), reason: Some(reason.as_str()), client_id: Some(client_id) }), "confirmed");
+                        self.journal.typed(now_ns, "amend", Some(market.0.clone()), JournalDetail::Quote(QuoteRecord { side, price: Some(desired.price), qty: Some(desired.qty), reason: Some(reason.as_str()), client_id: Some(client_id), hedge_vwap: Some(desired.expected_hl_vwap) }), "confirmed");
                     }
                     ExecDispatch::BudgetBlocked if non_urgent => {
                         debug!("Aster command budget/backoff: optional amend deferred for {market} {side:?} ({})", reason.as_str());

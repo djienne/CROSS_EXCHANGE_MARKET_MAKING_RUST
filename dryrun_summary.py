@@ -12,7 +12,6 @@ import argparse
 import json
 import subprocess
 import sys
-from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -68,18 +67,19 @@ def main() -> int:
     parser.add_argument("--since", default=None, help="UTC/RFC3339 start. Default: each market's dry-run start.")
     parser.add_argument("--runs", type=Path, default=None, help="A replay's directory (LIGHTER_ASTER_BOT/runs/replay/<run>).")
     args = parser.parse_args()
-    runs, since, now = RUNS, args.since, None
-    if args.runs:
+    runs = RUNS
+    if args.runs:  # the reports default to its window
         about = json.loads((args.runs / "replay.json").read_text(encoding="utf-8"))
-        shifted = lambda t: (datetime.fromisoformat(t.replace("Z", "+00:00")) + timedelta(milliseconds=about["shift_ms"])).isoformat()
-        runs, since, now = args.runs / "dry-run", since or shifted(about["from"]), shifted(about["until"])
-        print(f"replay of {about['from']} -> {about['until']}, shifted {about['shift_ms'] / 86_400_000:.3f} days; gate seeded with {about['gate_samples']} samples")
+        runs = args.runs / "dry-run"
+        print(f"replay of {about['from']} -> {about['until']} (latency x{about.get('latency_k', 1)}, Lighter {about.get('lighter', 'standard')}, "
+              f"seed {about.get('seed', '?')}, commit {about.get('commit', '?')}), shifted {about['shift_ms'] / 86_400_000:.3f} days; "
+              f"gate seeded with {about['gate_samples']} samples")
     markets = sorted(p.name[len("bot-"):-len(".state.json")] for p in runs.glob("bot-*.state.json"))
     if not markets:
         print(f"no dry-run state in {runs}")
         return 1
     for market in markets:
-        summary(runs, market, since, now)
+        summary(runs, market, args.since, None)
     return 0
 
 

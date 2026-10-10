@@ -127,25 +127,90 @@ pub async fn run(config: &Path, market: &str, mode: LiveMode, ack_breaker: bool,
     run_with(cfg, Path::new(RUNS_DIR), market, mode, ack_breaker, reset_baseline, stop).await
 }
 
+/// The git commit the binary was built from (`GIT_COMMIT` at build time: the Dockerfile's build
+/// argument, `vps.py sync`), so a run's numbers can be traced to its code.
+pub const COMMIT: &str = match option_env!("GIT_COMMIT") {
+    Some(commit) => commit,
+    None => "unknown",
+};
+
+/// What a replay changes from its config (`replay --latency/--lighter/--seed/--gate`).
+#[derive(Debug, Clone)]
+pub struct Variant {
+    pub config: PathBuf,
+    /// Every network and stream delay times this (`[dry_run]`); 0 is none.
+    pub latency: f64,
+    /// Lighter's Premium account instead of Standard: [`PREMIUM_TAKER_BPS`], its taker delay.
+    pub premium: bool,
+    /// Instead of `[dry_run] seed`.
+    pub seed: Option<u64>,
+    /// Entry-gate samples instead of the live dry run's `opportunities_<M>.jsonl`.
+    pub gate: Option<PathBuf>,
+}
+
+impl Default for Variant {
+    fn default() -> Self {
+        Self { config: PathBuf::from("bot.toml"), latency: 1.0, premium: false, seed: None, gate: None }
+    }
+}
+
+/// Lighter's Premium account (docs, account types and fees, 2026-10): 0.4 bps maker and 2.8 bps
+/// taker fees where Standard pays none, and taker orders delayed 140 ms instead of 300.
+pub const PREMIUM_MAKER_BPS: Decimal = rust_decimal_macros::dec!(0.4);
+pub const PREMIUM_TAKER_BPS: Decimal = rust_decimal_macros::dec!(2.8);
+pub const PREMIUM_TAKER_DELAY_MS: i64 = 140;
+
+impl Variant {
+    /// Applies the variant to `cfg`. Both engines and the simulated venues read the same fee
+    /// keys, so a Premium replay decides on and is charged the Premium taker fee. Its maker fee is
+    /// never charged: the bot rests no order on Lighter.
+    fn apply(&self, cfg: &mut BotConfig) -> Result<()> {
+        if self.premium {
+            (cfg.taker.arb.lighter_taker_fee_bps, cfg.maker.edge.taker_fee_bps) = (PREMIUM_TAKER_BPS, PREMIUM_TAKER_BPS);
+        }
+        let dry = cfg.dry_run.as_mut().context("replay needs a [dry_run] table in the config")?;
+        dry.scale_network(self.latency).context("--latency")?;
+        if self.premium {
+            dry.lighter_taker_delay_ms = PREMIUM_TAKER_DELAY_MS;
+        }
+        dry.seed = self.seed.unwrap_or(dry.seed);
+        dry.validate()
+    }
+}
+
 /// `replay`: `run --mode dry-run` against the tape in `tape` (`data/<M>`) from `from` to `until`
-/// (venue time) instead of the live market, in a new `runs/replay/<M>-<from>-<until>/`. It ends
-/// with the bot's drain once the tape passes `until`.
-pub async fn replay(config: &Path, market: &str, tape: &Path, from: DateTime<Utc>, until: DateTime<Utc>, stop: CancellationToken) -> Result<()> {
-    let cfg = BotConfig::load(config)?;
+/// (venue time) instead of the live market, as `variant` changes it, in a new
+/// `runs/replay/<M>-<from>-<until>-k<latency>-<tier>-s<seed>[-<config>]/`. It ends with the bot's
+/// drain once the tape passes `until`.
+pub async fn replay(market: &str, tape: &Path, from: DateTime<Utc>, until: DateTime<Utc>, variant: &Variant, stop: CancellationToken) -> Result<()> {
+    let cfg = BotConfig::load(&variant.config)?;
     let replay = crate::dryrun::tape::Replay::open(tape, from.timestamp_micros(), until.timestamp_micros(), crate::dryrun::tape::LEAD_US, stop.clone())?;
-    replay_with(cfg, Path::new(RUNS_DIR), market, replay, stop).await
+    replay_with(cfg, Path::new(RUNS_DIR), market, replay, variant, stop).await
 }
 
 /// [`replay`] with the tape opened and the runs directory given.
-pub(crate) async fn replay_with(mut cfg: BotConfig, runs_root: &Path, market: &str, replay: crate::dryrun::tape::Replay, stop: CancellationToken) -> Result<()> {
+pub(crate) async fn replay_with(mut cfg: BotConfig, runs_root: &Path, market: &str, replay: crate::dryrun::tape::Replay, variant: &Variant, stop: CancellationToken) -> Result<()> {
     let market = market.to_ascii_uppercase();
+    variant.apply(&mut cfg)?;
+    let tier = if variant.premium { "premium" } else { "standard" };
+    let seed = cfg.dry_run.as_ref().map_or(0, |dry| dry.seed);
+    // Config variants (a sed of bot.toml) are named by their file.
+    let config = variant.config.file_stem().map(|s| s.to_string_lossy()).filter(|s| s != "bot").map(|s| format!("-{s}")).unwrap_or_default();
     let stamp = |us: i64| DateTime::from_timestamp_micros(us).unwrap_or_default().format("%Y%m%dT%H%M%SZ").to_string();
-    let dir = runs_root.join("replay").join(format!("{market}-{}-{}", stamp(replay.from_us), stamp(replay.until_us)));
+    let dir = runs_root.join("replay").join(format!("{market}-{}-{}-k{}-{tier}-s{seed}{config}", stamp(replay.from_us), stamp(replay.until_us), variant.latency));
     // A replay starts afresh: no simulated account, latch or deadman carries over.
     ensure!(!dir.exists(), "{} exists: remove it to replay that window again", dir.display());
     let rfc3339 = |us: i64| DateTime::from_timestamp_micros(us).unwrap_or_default().to_rfc3339();
+    let (edge, arb) = (&cfg.maker.edge, &cfg.taker.arb);
+    let gate_source = variant.gate.clone().unwrap_or_else(|| runs_root.join("dry-run").join(format!("opportunities_{market}.jsonl")));
     let mut about = serde_json::json!({"market": market, "from": rfc3339(replay.from_us), "until": rfc3339(replay.until_us),
-        "lead_ms": replay.lead_us / 1_000, "tape": replay.files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>()});
+        "lead_ms": replay.lead_us / 1_000, "tape": replay.files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>(),
+        "commit": COMMIT, "config": variant.config.display().to_string(), "latency_k": variant.latency, "lighter": tier, "seed": seed,
+        "gate_source": gate_source.display().to_string(),
+        "fees": {"aster_maker_bps": edge.aster_maker_fee_bps, "aster_taker_bps": arb.aster_taker_fee_bps,
+            "lighter_maker_bps": if variant.premium { PREMIUM_MAKER_BPS } else { Decimal::ZERO }, "lighter_taker_bps": arb.lighter_taker_fee_bps,
+            "lighter_maker_note": "not charged: the bot rests no order on Lighter",
+            "taker_margin_bps": arb.margin_bps, "taker_required_bps": arb.required_gross_edge_bps(), "xemm_required_bps": edge.required_bps()}});
     let from_us = replay.from_us;
     let dry = cfg.dry_run.as_mut().context("replay needs a [dry_run] table in the config")?;
     // The tape's `from` comes a lead from now on the shifted clock; any free ports, so replays
@@ -153,27 +218,29 @@ pub(crate) async fn replay_with(mut cfg: BotConfig, runs_root: &Path, market: &s
     dry.shift_ms = (crate::dryrun::clock::wall_us() - from_us + replay.lead_us) / 1_000;
     (dry.aster_port, dry.lighter_port, dry.hyperliquid_port, dry.replay) = (0, 0, 0, Some(replay));
     let shift_us = dry.shift_ms * 1_000;
-    std::fs::create_dir_all(dir.join("dry-run"))?;
     about["shift_ms"] = (shift_us / 1_000).into();
-    about["gate_samples"] = seed_gate(&cfg, runs_root, &market, from_us, shift_us, &dir.join("dry-run"))?.into();
+    about["dry_run"] = serde_json::to_value(&*dry)?;
+    std::fs::create_dir_all(dir.join("dry-run"))?;
+    about["gate_samples"] = seed_gate(&cfg, &gate_source, &market, from_us, shift_us, &dir.join("dry-run"))?.into();
     std::fs::write(dir.join("replay.json"), format!("{about:#}\n"))?;
     run_with(cfg, &dir, &market, LiveMode::DryRun, false, false, stop).await
 }
 
-/// Seeds a replay's entry gate (its files in `runs`) with the live dry run's samples of the
-/// history window before `from_us`, moved onto the replay's clock (the live run's own shift, at
-/// most 90 s, stays in). Returns how many.
-fn seed_gate(cfg: &BotConfig, runs_root: &Path, market: &str, from_us: i64, shift_us: i64, runs: &Path) -> Result<usize> {
-    let gate = &cfg.taker.arb.entry_gate;
-    let source = runs_root.join("dry-run").join(format!("opportunities_{market}.jsonl"));
-    let text = match std::fs::read_to_string(&source) {
+/// Seeds a replay's entry gate (its files in `runs`) with the samples in `source` (the live dry
+/// run's) of the history window before `from_us`, moved onto the replay's clock (the live run's
+/// own shift, at most 90 s, stays in). A sample is logged only at the required edge or more, so
+/// those under the replay's (a Premium fee) go. Returns how many.
+fn seed_gate(cfg: &BotConfig, source: &Path, market: &str, from_us: i64, shift_us: i64, runs: &Path) -> Result<usize> {
+    let (gate, required) = (&cfg.taker.arb.entry_gate, cfg.taker.arb.required_gross_edge_bps());
+    let text = match std::fs::read_to_string(source) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("reading {}", source.display())),
     };
     let since_us = from_us - gate.history_window_hours as i64 * 3_600_000_000;
     let (mut rows, mut n) = (String::new(), 0);
-    for mut row in text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()) {
+    let edge = |row: &Value| row["gross_edge_bps"].as_str().and_then(|bps| bps.parse::<Decimal>().ok());
+    for mut row in text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).filter(|row| edge(row).is_some_and(|bps| bps >= required)) {
         let at = row["timestamp"].as_str().and_then(|t| DateTime::parse_from_rfc3339(t).ok()).map(|t| t.timestamp_micros());
         if let Some(moved) = at.filter(|t| (since_us..from_us).contains(t)).and_then(|t| DateTime::from_timestamp_micros(t + shift_us)) {
             row["timestamp"] = moved.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true).into();
@@ -220,6 +287,7 @@ pub(crate) async fn run_with(
     let (taker_markets, maker_markets) = cfg.select(&market)?;
     let live = mode.is_real();
     let replaying = cfg.dry_run.as_ref().is_some_and(|dry| dry.replay.is_some());
+    info!("{market}: {} on commit {COMMIT}", if live { "live" } else if replaying { "replay" } else { "dry run" });
     // Live and dry-run never share a file.
     let runs_dir = if live { runs_root.to_path_buf() } else { runs_root.join("dry-run") };
     let _lock = lock_market(&runs_dir, &market)?;
@@ -540,6 +608,8 @@ mod tests {
         let k = kinds();
         let (yielded, returned, resumed) = (position(&k, "yield").unwrap(), position(&k, "rights_returned").unwrap(), position(&k, "resumed").unwrap());
         assert!(yielded < returned && returned < resumed && !k[yielded..resumed].iter().any(|x| x == "accepted"), "{k:?}");
+        let places: Vec<Value> = std::fs::read_to_string(&journal).unwrap().lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).filter(|row| row["kind"] == "place").collect();
+        assert!(!places.is_empty() && places.iter().all(|row| row["detail"]["hedge_vwap"].is_string()), "each quote keeps the hedge price it was priced from: {places:?}");
         // After its first start-up read, the controller reads XEMM's own snapshot, which has
         // no resting Lighter orders, instead of the venues.
         let state = dir.join("dry-run").join("bot-HYPE.state.json");
@@ -589,6 +659,7 @@ mod tests {
     /// `replay` end to end on a scripted tape: the Lighter book from its snapshot, then 35 s of
     /// the market in which Aster asks 98 under Lighter's 99 bid for 5 s. The gate, seeded from the
     /// live dry run's samples, lets the taker trade it, and the replay drains and ends by itself.
+    /// As a variant: delays doubled, Lighter Premium (its fee charged, its samples' floor), seed 7.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_replay_trades_the_tape_and_stops_by_itself() {
         use crate::dryrun::feed::tests::lighter;
@@ -608,9 +679,10 @@ mod tests {
             tape.push((ms, "L", lighter("update", 1 + i, 2 + i, ms, "[]", "[]")));
         }
         write_tape(&dir.join("data"), &tape);
-        let sample = |ms: i64| format!(r#"{{"timestamp":"{}","market":"HYPE","direction":"SELL_ASTER_BUY_LIGHTER","gross_edge_bps":"5","expected_net_margin_bps":"0","expected_net_usd":"0","qty":"0.1","sell_px":"99","buy_px":"99","ref_px":"99","top_depth_qty":"5","aster_book_age_ms":0,"lighter_book_age_ms":0,"decision":"gated_out","history_sample_count":0}}"#,
+        let sample = |ms: i64, bps: &str| format!(r#"{{"timestamp":"{}","market":"HYPE","direction":"SELL_ASTER_BUY_LIGHTER","gross_edge_bps":"{bps}","expected_net_margin_bps":"0","expected_net_usd":"0","qty":"0.1","sell_px":"99","buy_px":"99","ref_px":"99","top_depth_qty":"5","aster_book_age_ms":0,"lighter_book_age_ms":0,"decision":"gated_out","history_sample_count":0}}"#,
             DateTime::from_timestamp_millis(ms).unwrap().to_rfc3339());
-        let history: String = (1..=70).map(|i| sample(from - 60_000 * i) + "\n").collect();
+        // Standard's 6 bps floor logged the 7s too; Premium's 8.8 would not have.
+        let history: String = (1..=70).map(|i| sample(from - 60_000 * i, "10") + "\n").chain((1..=10).map(|i| sample(from - 60_000 * i - 30_000, "7") + "\n")).collect();
         std::fs::create_dir_all(dir.join("dry-run")).unwrap();
         std::fs::write(dir.join("dry-run").join("opportunities_HYPE.jsonl"), &history).unwrap();
         let mut cfg = crate::dryrun::tests::dry_config(&dir);
@@ -618,16 +690,24 @@ mod tests {
         (cfg.taker.arb.startup_warmup_ms, cfg.taker.arb.book_sanity.enabled) = (0, false);
         let stop = CancellationToken::new();
         let replay = crate::dryrun::tape::Replay::open(&dir.join("data").join("HYPE"), from * 1_000, (from + 25_000) * 1_000, 2_000_000, stop.clone()).unwrap();
-        tokio::time::timeout(Duration::from_secs(120), replay_with(cfg, &dir, "HYPE", replay, stop)).await.expect("the replay ends by itself").expect("a clean stop");
+        let variant = Variant { latency: 2.0, premium: true, seed: Some(7), ..Variant::default() };
+        tokio::time::timeout(Duration::from_secs(120), replay_with(cfg, &dir, "HYPE", replay, &variant, stop)).await.expect("the replay ends by itself").expect("a clean stop");
 
         let runs: Vec<_> = std::fs::read_dir(dir.join("replay")).unwrap().map(|e| e.unwrap().path()).collect();
         assert_eq!(runs.len(), 1, "{runs:?}");
+        assert!(runs[0].to_string_lossy().ends_with("-k2-premium-s7"), "{runs:?}");
         let ledger = std::fs::read_to_string(runs[0].join("dry-run").join("trades_HYPE.jsonl")).expect("a trade");
         let row: crate::taker::pnl::TradeLedgerRow = serde_json::from_str(ledger.lines().next().unwrap()).unwrap();
         assert_eq!((row.economic_status, row.direction.as_str()), (crate::taker::pnl::EconomicStatus::Confirmed, "SELL_LIGHTER_BUY_ASTER"), "{row:?}");
         assert_eq!((row.aster_fill.vwap, row.hedge_fill.vwap), (dec!(98), dec!(99)), "each leg took the top: {row:?}");
+        assert!((row.hedge_fill.fee_usd - row.hedge_fill.notional * dec!(0.00028)).abs() < dec!(0.000001), "Premium's taker fee charged: {row:?}");
         let about: Value = serde_json::from_str(&std::fs::read_to_string(runs[0].join("replay.json")).unwrap()).unwrap();
-        assert_eq!(about["gate_samples"], 60, "the hour before --from: {about}");
+        assert_eq!(about["gate_samples"], 60, "the hour before --from, Premium's floor: {about}");
+        let bps = |key: &str| about["fees"][key].as_str().unwrap().parse::<Decimal>().unwrap();
+        assert_eq!((bps("lighter_taker_bps"), bps("taker_required_bps")), (dec!(2.8), dec!(8.8)), "{about}");
+        assert_eq!((&about["latency_k"], &about["lighter"], &about["seed"]), (&serde_json::json!(2.0), &serde_json::json!("premium"), &serde_json::json!(7)), "{about}");
+        let dry = &about["dry_run"];
+        assert_eq!((&dry["aster_rest_rtt_ms"], &dry["lighter_taker_delay_ms"]), (&serde_json::json!([10.0, 10.0]), &serde_json::json!(140)), "{about}");
         let shift_days = about["shift_ms"].as_f64().unwrap() / 86_400_000.0;
         assert!((1.0 / 24.0..1.1 / 24.0).contains(&shift_days), "the tape's hour ago: {about}");
         let mut written: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();

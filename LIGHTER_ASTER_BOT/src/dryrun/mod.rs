@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -44,7 +44,7 @@ use crate::decimal::parse_dec;
 use crate::lighter::messages::{OrderBookDetail, OrderBooksResponse};
 
 /// `[dry_run]` in bot.toml, where each value cites its source.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DryRunCfg {
     pub shift_ms: i64,
     pub seed: u64,
@@ -85,6 +85,17 @@ impl DryRunCfg {
         );
         let ports = [self.aster_port, self.lighter_port, self.hyperliquid_port];
         ensure!(ports.iter().enumerate().all(|(i, p)| *p == 0 || !ports[..i].contains(p)), "[dry_run] the venues need different ports");
+        Ok(())
+    }
+
+    /// Every network and stream delay `k` times as long (`replay --latency`). Lighter's taker
+    /// delay is the venue's rule, not the network's, and stays.
+    pub fn scale_network(&mut self, k: f64) -> Result<()> {
+        for latency in [&mut self.aster_rest_rtt_ms, &mut self.lighter_rtt_ms, &mut self.hyperliquid_rtt_ms, &mut self.aster_feed_ms,
+            &mut self.lighter_feed_ms, &mut self.hyperliquid_feed_ms, &mut self.aster_user_stream_ms, &mut self.lighter_account_ms]
+        {
+            *latency = latency.scaled(k).map_err(anyhow::Error::msg)?;
+        }
         Ok(())
     }
 

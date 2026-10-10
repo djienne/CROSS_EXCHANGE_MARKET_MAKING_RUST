@@ -123,7 +123,8 @@ pub enum Commands {
 
     /// Backtest: `run --mode dry-run` against the tape `record` made instead of the live market,
     /// from --from to --until at the market's own pace, into a new
-    /// runs/replay/<MARKET>-<from>-<until>/. Aster-Lighter markets only; no credentials, no orders.
+    /// runs/replay/<MARKET>-<from>-<until>-k<latency>-<tier>-s<seed>[-<config>]/ with its settings
+    /// in replay.json. Aster-Lighter markets only; no credentials, no orders.
     Replay {
         #[arg(long)]
         market: String,
@@ -136,6 +137,19 @@ pub enum Commands {
         from: chrono::DateTime<chrono::Utc>,
         #[arg(long)]
         until: chrono::DateTime<chrono::Utc>,
+        /// Every network and stream delay of [dry_run] times this (0: none). Lighter's taker
+        /// delay, the venue's rule, stays.
+        #[arg(long, default_value_t = 1.0)]
+        latency: f64,
+        /// Lighter account type: premium pays 0.4/2.8 bps maker/taker and delays takers 140 ms.
+        #[arg(long, value_parser = ["standard", "premium"], default_value = "standard")]
+        lighter: String,
+        /// Instead of [dry_run] seed.
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Entry-gate samples. Default: the live dry run's runs/dry-run/opportunities_<MARKET>.jsonl.
+        #[arg(long)]
+        gate: Option<PathBuf>,
     },
 }
 
@@ -206,10 +220,11 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Commands::Record { market, out } => {
             crate::dryrun::tape::record(&cli.config, &market, out, crate::controller::stop_on_signals()).await?;
         }
-        Commands::Replay { market, tape, from, until } => {
+        Commands::Replay { market, tape, from, until, latency, lighter, seed, gate } => {
             crate::taker::abort_on_panic();
             let tape = tape.unwrap_or_else(|| crate::dryrun::tape::default_dir(Path::new(""), &market.to_ascii_uppercase(), from.timestamp_micros()));
-            crate::controller::replay(&cli.config, &market, &tape, from, until, crate::controller::stop_on_signals()).await?;
+            let variant = crate::controller::Variant { config: cli.config, latency, premium: lighter == "premium", seed, gate };
+            crate::controller::replay(&market, &tape, from, until, &variant, crate::controller::stop_on_signals()).await?;
         }
     }
     Ok(())
