@@ -7,7 +7,7 @@
 | Host | Tokyo, Ubuntu 22.04 (kernel 5.15.0-198), 1 vCPU, ~1 GB RAM + 2.5 GB swap (`/swapfile2g` + a 0.5 GB partition), 25 GB disk; no snapd |
 | Toolchain | rustup, Rust 1.92 (`. ~/.cargo/env`), build-essential; no Docker |
 | Code | `/root/xemm/LIGHTER_ASTER_BOT` (git-tracked files only; no `*.env`, no credentials) |
-| Service | `xemm-dryrun` (systemd): `run --market HYPE --mode dry-run --ack-breaker`, 512 MB cap, SIGINT stop |
+| Services | `xemm-dryrun`, `xemm-dryrun-hl`, `xemm-dryrun-lh` (systemd): `run --market HYPE` / `HYPE-HL` / `HYPE-LH` `--mode dry-run --ack-breaker` (Aster-Lighter, Aster-Hyperliquid, Lighter-Hyperliquid), 512 MB cap each, SIGINT stop; their simulated venues take free ports (`[dry_run]` ports 0) |
 | Output | `/root/xemm/LIGHTER_ASTER_BOT/runs/dry-run/` |
 | Collectors | `xemm-recorder` (`record --market HYPE`, 256 MB cap) → `LIGHTER_ASTER_BOT/data/HYPE/`; `xemm-screener` (`screener collect`, 400 MB cap) → `SCREENER/data/`; both enabled at boot, niced below the dry run |
 
@@ -15,7 +15,7 @@ Since 2026-10-10 the VPS collects and the Windows PC stores: this PC's route to 
 tens of seconds, which leaves holes in what it records, while the VPS's feeds are clean. Disk use
 is ~0.45 GB/day: the tape ~0.19 (Aster + Lighter 0.15, Hyperliquid ~0.04; estimates until a full
 day is measured), the screener 0.1-0.2, and `runs/dry-run` ~37 MB/day for HYPE (2026-10-10:
-journal 26, book sanity 7.5, diagnostics 2, equity 1.5). That is ~25 days of slack on the free
+journal 26, book sanity 7.5, diagnostics 2, equity 1.5), plus the two Hyperliquid routes (unmeasured). That is ~25 days of slack on the free
 disk if no pull happens. Disk stays bounded, all set up by `sync` and `pull`:
 
 - `python vps.py pull` (the Windows scheduled task "XEMM Tokyo pull" runs it daily at 06:00 local
@@ -30,7 +30,7 @@ disk if no pull happens. Disk stays bounded, all set up by `sync` and `pull`:
   the next `pull` starts them again once there is room.
 
 - The daily timer `xemm-dryrun-archive` (03:30 UTC) acts once those four logs pass 1 GB (about
-  monthly). It stops the dry run, moves them to `runs/archive/<UTC time>/`, restarts the dry run
+  monthly). It stops the dry runs, moves them to `runs/archive/<UTC time>/`, restarts the dry runs
   and gzips them (~10x smaller, ~4 MB/day: years of the 25 GB disk). Nothing is deleted. The bot
   appends to these logs and never reads them back, so they move only while it is stopped.
 - journald is capped at 200 MB, and the cargo build dir at 3 GB (a clean rebuild past that).
@@ -78,7 +78,7 @@ All three venues are a few ms away, consistent with the Tokyo scenario `[dry_run
 ## By hand on the VPS
 
 ```
-systemctl status xemm-dryrun
+systemctl status xemm-dryrun      # -hl, -lh: the Hyperliquid routes
 journalctl -u xemm-dryrun -f
 systemctl stop xemm-dryrun        # SIGINT, graceful
 ```

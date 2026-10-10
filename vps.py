@@ -1,9 +1,9 @@
-"""Run the HYPE dry run and the market-data collectors on the Tokyo VPS; bring their data home.
+"""Run the HYPE dry runs and the market-data collectors on the Tokyo VPS; bring their data home.
 
-  python vps.py sync      # upload tracked files (working tree), build, (re)start dry run + recorder
+  python vps.py sync      # upload tracked files (working tree), build, (re)start dry runs + recorder
   python vps.py latency   # TCP-connect and HTTPS round trips to the venues, from the VPS
   python vps.py status    # services, memory, disk, runs/ and data sizes
-  python vps.py logs [N]  # last N journal lines of the dry run (default 50)
+  python vps.py logs [N] [MARKET]  # last N journal lines of a dry run (default 50, HYPE)
   python vps.py screener  # upload, build and (re)start the pair screener's collector
   python vps.py pull [--dry-run]  # copy closed data files home, verify, prune the VPS's old ones
 
@@ -36,6 +36,9 @@ HOST = dict(l.split("=", 1) for l in (ROOT / "vps.env").read_text().split()
 KEY = Path.home() / ".ssh" / "id_rsa"
 REMOTE = "~/xemm/LIGHTER_ASTER_BOT"
 SERVICE = "xemm-dryrun"
+# Each dry run's unit and market: Aster-Lighter, Aster-Hyperliquid, Lighter-Hyperliquid.
+DRY_RUNS = {SERVICE: "HYPE", f"{SERVICE}-hl": "HYPE-HL", f"{SERVICE}-lh": "HYPE-LH"}
+UNITS = " ".join(DRY_RUNS)
 SCREENER = "xemm-screener"
 RECORDER = "xemm-recorder"
 # Below this much free disk the collectors stop, so the dry run keeps its disk.
@@ -46,14 +49,14 @@ KEEP_DAYS = 7
 PULLS = [("/root/xemm/LIGHTER_ASTER_BOT/data", ROOT / "LIGHTER_ASTER_BOT" / "data-tokyo", "*/*.tape.zst"),
          ("/root/xemm/SCREENER/data", ROOT / "SCREENER" / "data-tokyo", "*.screen.zst")]
 
-UNIT = f"""[Unit]
-Description=XEMM HYPE dry run (simulated venues, no credentials)
+UNIT = """[Unit]
+Description=XEMM {market} dry run (simulated venues, no credentials)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 WorkingDirectory=/root/xemm/LIGHTER_ASTER_BOT
-ExecStart=/root/xemm/LIGHTER_ASTER_BOT/target/release/lighter_aster_bot run --market HYPE --mode dry-run --ack-breaker
+ExecStart=/root/xemm/LIGHTER_ASTER_BOT/target/release/lighter_aster_bot run --market {market} --mode dry-run --ack-breaker
 Restart=always
 RestartSec=10
 KillSignal=SIGINT
@@ -122,9 +125,9 @@ used=$(du -cm $LOGS 2>/dev/null | tail -1 | cut -f1)
 [ "$used" -ge "${{1:-1024}}" ] || exit 0
 dest=../archive/$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -p "$dest"
-systemctl stop {SERVICE}
+systemctl stop {UNITS}
 for f in $LOGS; do if [ -f "$f" ]; then mv "$f" "$dest/"; fi; done
-systemctl start {SERVICE}
+systemctl start {UNITS}
 nice gzip -9 "$dest"/*
 echo "archived $used MB of logs to $dest"
 """
@@ -215,10 +218,14 @@ def sync():
         ssh(f"cat > {path} <<'EOF'\n{text}EOF")
     ssh(f"chmod 755 /usr/local/sbin/{SERVICE}-archive && systemctl daemon-reload"
         f" && systemctl enable -q --now {SERVICE}-archive.timer")
-    ssh(f"cat > /etc/systemd/system/{SERVICE}.service <<'EOF'\n{UNIT}EOF\n"
-        f"cat > /etc/systemd/system/{RECORDER}.service <<'EOF'\n{RECORDER_UNIT}EOF\n"
-        f"systemctl daemon-reload && systemctl enable -q {SERVICE} {RECORDER} && systemctl restart {SERVICE} {RECORDER}"
-        f" && sleep 5 && systemctl --no-pager status {SERVICE} {RECORDER} | grep -E '^. |Active:'")
+    ssh(f"{unit_files()}cat > /etc/systemd/system/{RECORDER}.service <<'EOF'\n{RECORDER_UNIT}EOF\n"
+        f"systemctl daemon-reload && systemctl enable -q {UNITS} {RECORDER} && systemctl restart {UNITS} {RECORDER}"
+        f" && sleep 5 && systemctl --no-pager status {UNITS} {RECORDER} | grep -E '^. |Active:'")
+
+
+def unit_files():
+    """Shell lines that write each dry run's unit file."""
+    return "".join(f"cat > /etc/systemd/system/{u}.service <<'EOF'\n{UNIT.format(market=m)}EOF\n" for u, m in DRY_RUNS.items())
 
 
 def screener():
@@ -307,7 +314,7 @@ def main():
     elif cmd == "latency":
         ssh("python3 -", stdin=LATENCY.encode())
     elif cmd == "status":
-        ssh(f"systemctl --no-pager status {SERVICE} | head -12; free -h; df -h /; du -sh {REMOTE}/runs/*; "
+        ssh(f"systemctl --no-pager status {UNITS} | grep -E '^. |Active:|Memory:'; free -h; df -h /; du -sh {REMOTE}/runs/*; "
             f"systemctl list-timers {SERVICE}-archive.timer --no-pager | head -2; "
             f"echo recorder: $(systemctl is-active {RECORDER}) screener: $(systemctl is-active {SCREENER}); "
             f"du -sh {REMOTE}/data/* ~/xemm/SCREENER/data 2>/dev/null; true")
@@ -317,7 +324,9 @@ def main():
         pull("--dry-run" in sys.argv[2:])
     elif cmd == "logs":
         n = sys.argv[2] if len(sys.argv) > 2 else "50"
-        ssh(f"journalctl -u {SERVICE} --no-pager -n {int(n)}")
+        market = sys.argv[3].upper() if len(sys.argv) > 3 else "HYPE"
+        unit = next(u for u, m in DRY_RUNS.items() if m == market)
+        ssh(f"journalctl -u {unit} --no-pager -n {int(n)}")
     else:
         sys.exit(__doc__)
 

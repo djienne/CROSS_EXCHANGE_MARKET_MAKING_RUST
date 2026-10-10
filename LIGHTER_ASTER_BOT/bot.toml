@@ -274,9 +274,10 @@ lighter_symbol      = "ETH"
 # held requests and the HYPE maker spent the morning frozen; 10 s still left 22 % of frames late.
 shift_ms = 90000
 seed     = 0
-aster_port       = 18081
-lighter_port     = 18082
-hyperliquid_port = 18083
+# 0: any free port, so dry runs share a host (the VPS runs three side by side).
+aster_port       = 0
+lighter_port     = 0
+hyperliquid_port = 0
 aster_balance_usdt   = "200"
 lighter_balance_usdc = "200"
 # A request takes effect at this fraction of its round trip; 0.9 puts most of the latency before
