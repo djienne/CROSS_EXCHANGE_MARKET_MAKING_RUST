@@ -176,9 +176,11 @@ for host, path in hosts:
 '''
 
 
-def ssh(cmd, stdin=None):
-    args = ["ssh", "-i", str(KEY), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", HOST, cmd]
-    return subprocess.run(args, input=stdin, check=True)
+OPTS = ["-i", str(KEY), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes"]
+
+
+def ssh(cmd, stdin=None, capture=False):
+    return subprocess.run(["ssh", *OPTS, HOST, cmd], input=stdin, check=True, capture_output=capture, text=capture)
 
 
 def tracked_tar(folder="LIGHTER_ASTER_BOT"):
@@ -227,11 +229,6 @@ def screener():
         f" && sleep 5 && systemctl --no-pager status {SCREENER} | head -5")
 
 
-def ssh_out(cmd):
-    args = ["ssh", "-i", str(KEY), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", HOST, cmd]
-    return subprocess.run(args, check=True, capture_output=True, text=True).stdout
-
-
 def sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -256,39 +253,34 @@ def pull(dry_run):
     now = datetime.now(timezone.utc)
     print(f"{now:%Y-%m-%d %H:%M:%SZ} pull{' --dry-run' if dry_run else ''}", flush=True)
     for src, dest, pattern in PULLS:
-        listing = ssh_out(f"cd {src} 2>/dev/null && stat -c '%s %n' {pattern} 2>/dev/null; true")
+        listing = ssh(f"cd {src} 2>/dev/null && stat -c '%s %n' {pattern} 2>/dev/null; true", capture=True).stdout
         sizes = {rel: int(size) for size, rel in (line.split(" ", 1) for line in listing.splitlines())}
-        newest = {}
-        for rel in sizes:
-            d = posixpath.dirname(rel)
-            newest[d] = max(newest.get(d, ""), rel)
+        newest = {posixpath.dirname(rel): rel for rel in sorted(sizes)}
         closed = sorted(rel for rel in sizes if rel != newest[posixpath.dirname(rel)] and started(rel))
         manifest_path = dest / "pulled.json"
         manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
         todo = [rel for rel in closed if manifest.get(rel, {}).get("size") != sizes[rel]]
         remote = {}
-        if todo:
-            out = ssh_out(f"cd {src} && nice sha256sum " + " ".join(shlex.quote(r) for r in todo))
+        if todo and not dry_run:
+            out = ssh(f"cd {src} && nice sha256sum " + " ".join(shlex.quote(r) for r in todo), capture=True).stdout
             remote = {rel: digest for digest, rel in (line.split("  ", 1) for line in out.splitlines())}
         copied = failed = 0
         for rel in todo:
-            local = dest / rel
             if dry_run:
                 print(f"  would copy {src}/{rel} ({sizes[rel] / 1e6:.1f} MB)")
                 continue
+            local = dest / rel
             local.parent.mkdir(parents=True, exist_ok=True)
-            if not (local.is_file() and local.stat().st_size == sizes[rel] and sha256(local) == remote[rel]):
-                part = local.with_name(local.name + ".part")
-                # A relative target: scp would read a drive letter (C:) as a host name.
-                got = subprocess.run(["scp", "-q", "-l", "16000", "-i", str(KEY), "-o", "IdentitiesOnly=yes",
-                                      "-o", "BatchMode=yes", f"{HOST}:{src}/{rel}", part.name], cwd=part.parent)
-                if got.returncode != 0 or sha256(part) != remote[rel]:
-                    part.unlink(missing_ok=True)
-                    failed += 1
-                    print(f"  FAILED {rel}: copy or checksum; the next pull retries it")
-                    continue
-                part.replace(local)
-                copied += 1
+            part = local.with_name(local.name + ".part")
+            # A relative target: scp would read a drive letter (C:) as a host name.
+            got = subprocess.run(["scp", "-q", "-l", "16000", *OPTS, f"{HOST}:{src}/{rel}", part.name], cwd=part.parent)
+            if got.returncode != 0 or sha256(part) != remote[rel]:
+                part.unlink(missing_ok=True)
+                failed += 1
+                print(f"  FAILED {rel}: copy or checksum; the next pull retries it")
+                continue
+            part.replace(local)
+            copied += 1
             manifest[rel] = {"size": sizes[rel], "sha256": remote[rel]}
             manifest_path.write_text(json.dumps(manifest, indent=1, sort_keys=True))
         old = [rel for rel in closed if manifest.get(rel, {}).get("size") == sizes[rel]

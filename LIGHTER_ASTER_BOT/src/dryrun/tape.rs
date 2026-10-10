@@ -385,7 +385,7 @@ pub async fn record(config: &Path, market: &str, dir: PathBuf, stop: Cancellatio
     // Ponytail: Hyperliquid's coin is the hedge coin's name (`lighter_symbol`), as in the bot's
     // configs; a coin spelled differently there would need its own field.
     let coin = market.lighter_symbol.to_ascii_uppercase();
-    let hl_url = crate::connectors::hyperliquid::ws_url(cfg.maker.live.hyperliquid.base_url.trim_end_matches('/'));
+    let hl_url = crate::connectors::hyperliquid::ws_url(&cfg.maker.live.hyperliquid.base_url);
     let mut fast = crate::connectors::hyperliquid::subscriptions(&coin).to_vec();
     fast.extend([json!({"type": "trades", "coin": coin}), json!({"type": "activeAssetCtx", "coin": coin})]);
     // The 20-level book on a connection of its own: its frames do not say which mode they are.
