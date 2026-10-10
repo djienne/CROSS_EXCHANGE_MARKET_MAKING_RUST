@@ -232,8 +232,7 @@ impl<E: Engines> Supervisor<E> {
                 self.tasks.push(Task { bot, stop, handle });
             }
         }
-        // The first tick waits a poll: `verify_orders_clear` has just read every account (Lighter
-        // Standard allows 60 REST calls a minute), and a lone taker has published no status yet.
+        // One poll in: `verify_orders_clear` just read every account, and a lone taker has no status yet.
         let mut next_tick = Instant::now() + Duration::from_secs(self.cfg.poll_sec);
         while !self.stopping() {
             self.check_exits().await;

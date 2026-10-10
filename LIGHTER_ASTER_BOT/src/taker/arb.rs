@@ -3627,8 +3627,7 @@ async fn reconcile_margins(aster: &FirstLeg, lighter: &OtherLeg) -> Result<Margi
     })
 }
 
-/// Judged on the start-up account snapshot, which already holds the positions and open
-/// orders: reading them again would double the start's Lighter REST calls.
+/// Judged on the start-up snapshot: reading the accounts again would double the start's Lighter calls.
 fn ensure_clean_start(
     cfg: &Config,
     spec: &MarketSpec,
