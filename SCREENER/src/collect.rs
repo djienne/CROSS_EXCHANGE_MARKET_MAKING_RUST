@@ -13,16 +13,20 @@
 //! - **XEMM.** A trade is recorded, with the states of the second before it (what a resting quote
 //!   was priced from), when it could have filled a quote priced from one of them (`could_fill`).
 //! - After either, every state for two seconds: where latency-delayed orders fill.
+//! - Both select over every mix of the two legs' states within that second, so the record also
+//!   holds the moments other feed delays (the report's scenarios) would trade on.
 //!
 //! Lines, tab-separated, times in ms since the epoch at arrival on this host (never decreasing),
-//! Right-leg prices and sizes in left-leg units (divided and multiplied by the pair's scale):
+//! Right-leg prices and sizes in left-leg units (divided and multiplied by the pair's scale). An
+//! age is the time minus the venue's engine stamp of that leg's state or print (v3):
 //!
 //! | kind | fields |
 //! |---|---|
-//! | `P` | JSON: version 2, the `[collect]` settings, the `Recording`, and the constants below |
+//! | `P` | JSON: version 3, the `[collect]` settings, the `Recording`, and the constants below |
 //! | `U` | JSON: the pairs (`universe::Pair`) |
-//! | `B` | time, qualified pair, left bid, ask, right bid, ask (0 = unknown), `depth_flags` |
-//! | `T` | time, pair, leg `0`/`1` (legacy `A`/`L`), price, size, aggressor `B`/`S`: a trade that could fill a quote |
+//! | `B` | time, qualified pair, left bid, ask, right bid, ask (0 = unknown), `depth_flags`, left age, right age |
+//! | `T` | time, pair, leg `0`/`1` (legacy `A`/`L`), price, size, aggressor `B`/`S`, age: a trade that could fill a quote |
+//! | `R` | time, pair, leg, age: that leg changed then, unrecorded, after a recorded state (unknown until its next `B`) |
 //! | `G` | time, leg `0`/`1`: the run ended (a connection lost mid-run shows as unknown books) |
 //! | `S` | JSON: one pair's 5-minute summary (`Summary::line`), with its gate samples |
 //!
@@ -120,25 +124,24 @@ pub fn best_edge(a: &Bbo, l: &Bbo, depth_usd: f64) -> Option<(bool, f64)> {
     }
 }
 
-/// Could this trade on `venue` have filled a maker quote there priced from `(a, l)`, as the report
-/// prices one (`simulate_xemm`, fees ≥ 0, required edge ≥ `min_bps`)? Only by printing strictly
-/// through the venue's own touch (a quote never betters it) and `min_bps` of the mean mid through
-/// the other venue's price, whose side holds `depth_usd` for the hedge.
-pub fn could_fill(venue: Leg, buy: bool, price: f64, a: &Bbo, l: &Bbo, min_bps: f64, depth_usd: f64) -> bool {
-    let (own, other) = match venue {
+/// Could this trade on `venue` have filled a maker quote there priced from any mix of the states
+/// `(left, right)` in `books`, as the report prices one (`simulate_xemm`, fees ≥ 0, required edge
+/// ≥ `min_bps`)? Only by printing strictly through one of the venue's own touches (a quote never
+/// betters it) and `min_bps` of the lowest mid through one of the other venue's prices, whose side
+/// holds `depth_usd` for the hedge.
+pub fn could_fill<'a>(venue: Leg, buy: bool, price: f64, books: impl Iterator<Item = (&'a Bbo, &'a Bbo)> + Clone, min_bps: f64, depth_usd: f64) -> bool {
+    let sides = move |(a, l): (&'a Bbo, &'a Bbo)| match venue {
         Leg::Left => (a, l),
         Leg::Right => (l, a),
     };
-    if !(own.known() && other.known()) {
-        return false;
-    }
-    let reference = (a.mid() + l.mid()) / 2.0;
-    let min = min_bps / 1e4 * reference;
-    if buy {
-        price > own.ask && price > other.ask + min && other.ask * other.ask_size >= depth_usd
-    } else {
-        price < own.bid && price < other.bid - min && other.bid * other.bid_size >= depth_usd
-    }
+    let low = books.clone().flat_map(|(a, l)| [a, l]).filter(|b| b.known()).map(Bbo::mid).fold(f64::INFINITY, f64::min);
+    let min = min_bps / 1e4 * low;
+    books.clone().map(sides).any(|(own, _)| own.known() && if buy { price > own.ask } else { price < own.bid })
+        && books.map(sides).any(|(_, other)| other.known() && if buy {
+            price > other.ask + min && other.ask * other.ask_size >= depth_usd
+        } else {
+            price < other.bid - min && other.bid * other.bid_size >= depth_usd
+        })
 }
 
 pub fn edge_bin(bps: f64) -> i32 {
@@ -274,10 +277,11 @@ impl Recording {
     }
 }
 
+/// `stamp`: the venue's engine time, ms; 0 if it gave none.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    Book { pair: usize, venue: Leg, bbo: Bbo },
-    Trade { pair: usize, venue: Leg, price: f64, size: f64, buy: bool },
+    Book { pair: usize, venue: Leg, bbo: Bbo, stamp: i64 },
+    Trade { pair: usize, venue: Leg, price: f64, size: f64, buy: bool, stamp: i64 },
 }
 
 /// Time-weighted over the seconds both venues' states were known ("up").
@@ -299,6 +303,8 @@ struct Summary {
     l_usd: f64,
     rows: u64,
     samples: Samples,
+    /// Per leg, the least and most book age (arrival minus venue stamp), ms.
+    lag: [Option<(i64, i64)>; 2],
 }
 
 impl Summary {
@@ -311,7 +317,7 @@ impl Summary {
             "basis": avg(self.basis), "basis_min": (self.up > 0.0).then(|| round(self.basis_min)),
             "basis_max": (self.up > 0.0).then(|| round(self.basis_max)), "thin": avg(self.thin),
             "a_trades": self.a_trades, "a_usd": round(self.a_usd), "l_trades": self.l_trades, "l_usd": round(self.l_usd),
-            "rows": self.rows, "samples": self.samples,
+            "rows": self.rows, "samples": self.samples, "lag": self.lag,
         });
         format!("S\t{json}")
     }
@@ -327,8 +333,13 @@ struct PairState {
     floor: f64,
     a: Bbo,
     l: Bbo,
-    /// States (time, left, right, written?) from the one in force `PREROLL_MS` ago to now.
-    ring: VecDeque<(i64, Bbo, Bbo, bool)>,
+    /// Per leg: its state's venue stamp (never decreasing; an unknown book or a venue without one
+    /// keeps the last age), that age, and whether its next unrecorded change gets an `R` mark.
+    stamp: [i64; 2],
+    age: [i64; 2],
+    armed: [bool; 2],
+    /// States (time, left, right, stamps, written?) from the one in force `PREROLL_MS` ago to now.
+    ring: VecDeque<(i64, Bbo, Bbo, [i64; 2], bool)>,
     /// States are written until then.
     hot_until: i64,
     last_t: i64,
@@ -363,8 +374,11 @@ impl Collector {
                     floor,
                     a: Bbo::default(),
                     l: Bbo::default(),
+                    stamp: [now; 2],
+                    age: [0; 2],
+                    armed: [false; 2],
                     // Unknown since the start: a pre-roll reaching back before it says so.
-                    ring: VecDeque::from([(now, Bbo::default(), Bbo::default(), false)]),
+                    ring: VecDeque::from([(now, Bbo::default(), Bbo::default(), [now; 2], false)]),
                     hot_until: i64::MIN,
                     last_t: now,
                     last_sample: i64::MIN / 2,
@@ -381,16 +395,23 @@ impl Collector {
     pub fn on_event(&mut self, t: i64, event: Event, out: &mut impl FnMut(String)) {
         let t = self.tick(t, out);
         match event {
-            Event::Book { pair, venue, bbo } => {
+            Event::Book { pair, venue, bbo, stamp } => {
                 self.advance(pair, t);
                 let p = &mut self.pairs[pair];
                 match venue {
                     Leg::Left => p.a = bbo,
                     Leg::Right => p.l = bbo,
                 }
-                self.changed(pair, t, out);
+                let k = venue as usize;
+                if stamp > 0 {
+                    let (age, lag) = (t - stamp, &mut p.summary.lag[k]);
+                    *lag = Some(lag.map_or((age, age), |(lo, hi)| (lo.min(age), hi.max(age))));
+                }
+                p.stamp[k] = if stamp > 0 { stamp } else { t - p.age[k] }.max(p.stamp[k]);
+                p.age[k] = t - p.stamp[k];
+                self.changed(pair, venue, t, out);
             }
-            Event::Trade { pair, venue, price, size, buy } => {
+            Event::Trade { pair, venue, price, size, buy, stamp } => {
                 let (min_bps, depth_usd) = (self.rec.xemm_min_bps, self.rec.depth_usd);
                 let p = &mut self.pairs[pair];
                 let (trades, usd) = match venue {
@@ -399,12 +420,13 @@ impl Collector {
                 };
                 *trades += 1;
                 *usd += price * size;
-                if p.ring.iter().any(|(_, a, l, _)| could_fill(venue, buy, price, a, l, min_bps, depth_usd)) {
+                if could_fill(venue, buy, price, p.ring.iter().map(|(_, a, l, ..)| (a, l)), min_bps, depth_usd) {
+                    let age = if stamp > 0 { t - stamp } else { p.age[venue as usize] };
                     self.write_since(pair, t - PREROLL_MS, out);
                     let p = &mut self.pairs[pair];
                     p.hot_until = t + TAIL_MS;
                     let side = if buy { "B" } else { "S" };
-                    out(format!("T\t{t}\t{}\t{}\t{price}\t{size}\t{side}", p.name, venue.code()));
+                    out(format!("T\t{t}\t{}\t{}\t{price}\t{size}\t{side}\t{age}", p.name, venue.code()));
                 }
             }
         }
@@ -415,13 +437,7 @@ impl Collector {
         let t = self.tick(t, out);
         out(format!("G\t{t}\t{}", venue.code()));
         for pair in 0..self.pairs.len() {
-            self.advance(pair, t);
-            let p = &mut self.pairs[pair];
-            match venue {
-                Leg::Left => p.a = Bbo::default(),
-                Leg::Right => p.l = Bbo::default(),
-            }
-            self.changed(pair, t, out);
+            self.on_event(t, Event::Book { pair, venue, bbo: Bbo::default(), stamp: 0 }, out);
         }
     }
 
@@ -497,12 +513,15 @@ impl Collector {
         }
     }
 
-    /// The pair's state changed at `t`: keep it for the pre-roll, sample it for the gate as the bot
-    /// does, and record it if it reaches the trigger or falls in a tail.
-    fn changed(&mut self, pair: usize, t: i64, out: &mut impl FnMut(String)) {
+    /// The pair's `venue` leg changed at `t`: keep the state for the pre-roll, sample it for the
+    /// gate as the bot does, and record it if it falls in a tail, or if the leg, with any of the
+    /// other leg's states in the pre-roll (other feed delays could pair them), reaches the trigger:
+    /// then from the newest state holding the oldest such one. Unrecorded, it marks the leg unknown
+    /// from its stamp (`R`) if the leg was recorded since its last mark.
+    fn changed(&mut self, pair: usize, venue: Leg, t: i64, out: &mut impl FnMut(String)) {
         let (depth_usd, interval) = (self.rec.depth_usd, self.rec.sample_interval_ms);
         let p = &mut self.pairs[pair];
-        p.ring.push_back((t, p.a, p.l, false));
+        p.ring.push_back((t, p.a, p.l, p.stamp, false));
         while p.ring.len() >= 2 && p.ring[1].0 <= t - PREROLL_MS {
             p.ring.pop_front();
         }
@@ -511,35 +530,50 @@ impl Collector {
             *p.summary.samples.entry(edge_bin(e)).or_default() += 1;
             p.last_sample = t;
         }
-        let trigger = edge.is_some_and(|e| e >= p.trigger);
-        if trigger || t <= p.hot_until {
+        // A leg's value and stamp in a ring state.
+        let leg = |s: &(i64, Bbo, Bbo, [i64; 2], bool), k: usize| (if k == 0 { s.1 } else { s.2 }, s.3[k]);
+        let (k, o) = (venue as usize, 1 - venue as usize);
+        let now = leg(p.ring.back().expect("pushed"), k).0;
+        let mut from = None;
+        for (i, s) in p.ring.iter().enumerate().rev() {
+            let other = leg(s, o).0;
+            let (a, l) = if k == 0 { (&now, &other) } else { (&other, &now) };
+            if p.ring.get(i + 1).map_or(true, |next| leg(next, o) != leg(s, o)) && best_edge(a, l, depth_usd).is_some_and(|(_, e)| e >= p.trigger) {
+                from = Some(s.0);
+            }
+        }
+        if let Some(from) = from {
+            self.write_since(pair, from, out);
+            self.pairs[pair].hot_until = t + TAIL_MS;
+        } else if t <= p.hot_until {
             self.write_since(pair, t, out);
         }
-        if trigger {
-            self.pairs[pair].hot_until = t + TAIL_MS;
+        let (p, k) = (&mut self.pairs[pair], venue as usize);
+        if p.armed[k] && !p.ring.back().is_some_and(|s| s.4) {
+            out(format!("R\t{t}\t{}\t{}\t{}", p.name, venue.code(), p.age[k]));
+            p.armed[k] = false;
         }
     }
 
-    /// Writes the pair's states in force at `from` or later that are not written yet. A state
-    /// replaced within its millisecond is skipped: no lookup by time can return it.
+    /// Writes the pair's states in force at `from` or later that are not written yet, from the
+    /// first of `from`'s millisecond: other feed delays can make any of them the state in force.
     fn write_since(&mut self, pair: usize, from: i64, out: &mut impl FnMut(String)) {
         let depth_usd = self.rec.depth_usd;
         let p = &mut self.pairs[pair];
-        let start = p.ring.iter().rposition(|s| s.0 <= from).unwrap_or(0);
-        for i in start..p.ring.len() {
-            let replaced_at_once = p.ring.get(i + 1).is_some_and(|next| next.0 == p.ring[i].0);
-            let (at, a, l, written) = &mut p.ring[i];
-            if !*written && !replaced_at_once {
-                out(state_line(*at, &p.name, a, l, depth_usd));
-                *written = true;
-                p.summary.rows += 1;
-            }
+        let at = p.ring.iter().rev().map(|s| s.0).find(|&at| at <= from).unwrap_or(i64::MIN);
+        let start = p.ring.partition_point(|s| s.0 < at);
+        for s in p.ring.range_mut(start..).filter(|s| !s.4) {
+            out(state_line(s, &p.name, depth_usd));
+            s.4 = true;
+            p.summary.rows += 1;
         }
+        // The state in force is recorded: both legs' next unrecorded changes are marked.
+        p.armed = [true; 2];
     }
 }
 
-fn state_line(t: i64, pair: &str, a: &Bbo, l: &Bbo, depth_usd: f64) -> String {
-    format!("B\t{t}\t{pair}\t{}\t{}\t{}\t{}\t{}", a.bid, a.ask, l.bid, l.ask, depth_flags(a, l, depth_usd))
+fn state_line(&(t, a, l, stamp, _): &(i64, Bbo, Bbo, [i64; 2], bool), pair: &str, depth_usd: f64) -> String {
+    format!("B\t{t}\t{pair}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", a.bid, a.ask, l.bid, l.ask, depth_flags(&a, &l, depth_usd), t - stamp[0], t - stamp[1])
 }
 
 /// The gate history for a run starting at `now`, from the summaries in `dir`: per pair, its gate
@@ -597,23 +631,32 @@ enum AsterData {
         a: String,
         #[serde(rename = "A")]
         ask_size: String,
+        #[serde(rename = "T", default)]
+        stamp: i64,
     },
     #[serde(rename = "aggTrade")]
-    Trade { s: String, p: String, q: String, m: bool },
+    Trade {
+        s: String,
+        p: String,
+        q: String,
+        m: bool,
+        #[serde(rename = "T", default)]
+        stamp: i64,
+    },
 }
 
-/// An Aster combined-stream frame for one of `index`'s symbols.
+/// An Aster combined-stream frame for one of `index`'s symbols, stamped with its transaction time.
 pub fn aster_event(text: &str, index: &HashMap<String, usize>) -> Result<Option<Event>> {
     let frame: AsterFrame = serde_json::from_str(text)?;
     Ok(match frame.data {
-        AsterData::Book { s, b, bid_size, a, ask_size } => index.get(&s).map(|&pair| -> Result<Event> {
+        AsterData::Book { s, b, bid_size, a, ask_size, stamp } => index.get(&s).map(|&pair| -> Result<Event> {
             let bbo = Bbo { bid: b.parse()?, bid_size: bid_size.parse()?, ask: a.parse()?, ask_size: ask_size.parse()? };
-            Ok(Event::Book { pair, venue: Leg::Left, bbo })
+            Ok(Event::Book { pair, venue: Leg::Left, bbo, stamp })
         }),
         // `m`: the buyer was the maker, so the aggressor sold.
-        AsterData::Trade { s, p, q, m } => {
-            index.get(&s).map(|&pair| -> Result<Event> { Ok(Event::Trade { pair, venue: Leg::Left, price: p.parse()?, size: q.parse()?, buy: !m }) })
-        }
+        AsterData::Trade { s, p, q, m, stamp } => index.get(&s).map(|&pair| -> Result<Event> {
+            Ok(Event::Trade { pair, venue: Leg::Left, price: p.parse()?, size: q.parse()?, buy: !m, stamp })
+        }),
     }
     .transpose()?)
 }
@@ -624,6 +667,9 @@ struct LighterFrame {
     kind: String,
     #[serde(default)]
     channel: String,
+    /// ms
+    #[serde(default)]
+    timestamp: i64,
     ticker: Option<LighterTicker>,
     #[serde(default)]
     trades: Vec<LighterTrade>,
@@ -635,6 +681,9 @@ struct LighterFrame {
 struct LighterTicker {
     a: LighterLevel,
     b: LighterLevel,
+    /// µs
+    #[serde(default)]
+    last_updated_at: i64,
 }
 
 #[derive(Deserialize)]
@@ -648,10 +697,14 @@ struct LighterTrade {
     price: String,
     size: String,
     is_maker_ask: bool,
+    /// ms
+    #[serde(default)]
+    timestamp: i64,
 }
 
-/// A Lighter frame's events for `index`'s markets (id -> market). The trades
-/// sent on subscribing are history and are skipped; liquidations fill resting orders like any trade.
+/// A Lighter frame's events for `index`'s markets (id -> market), stamped with the ticker's last
+/// update (else the frame's time) or the trade's time. The trades sent on subscribing are history
+/// and are skipped; liquidations fill resting orders like any trade.
 pub fn lighter_events(text: &str, index: &HashMap<u32, usize>) -> Result<Vec<Event>> {
     let frame: LighterFrame = serde_json::from_str(text)?;
     let Some(&pair) = frame.channel.split_once(':').and_then(|(_, id)| id.parse().ok()).and_then(|id: u32| index.get(&id)) else {
@@ -667,14 +720,15 @@ pub fn lighter_events(text: &str, index: &HashMap<u32, usize>) -> Result<Vec<Eve
                     ask: t.a.price.parse::<f64>()?,
                     ask_size: t.a.size.parse::<f64>()?,
                 };
-                events.push(Event::Book { pair, venue: Leg::Right, bbo });
+                let stamp = if t.last_updated_at > 0 { t.last_updated_at / 1000 } else { frame.timestamp };
+                events.push(Event::Book { pair, venue: Leg::Right, bbo, stamp });
             }
         }
         "update/trade" => {
             for t in frame.trades.iter().chain(&frame.liquidation_trades) {
                 let (price, size) = (t.price.parse::<f64>()?, t.size.parse::<f64>()?);
                 // The maker was the ask, so the aggressor bought.
-                events.push(Event::Trade { pair, venue: Leg::Right, price, size, buy: t.is_maker_ask });
+                events.push(Event::Trade { pair, venue: Leg::Right, price, size, buy: t.is_maker_ask, stamp: t.timestamp });
             }
         }
         _ => {}
@@ -705,7 +759,7 @@ pub async fn run(cfg: Config, dir: PathBuf, stop: CancellationToken) -> Result<(
         let now = wall_ms();
         let gates = tokio::task::block_in_place(|| load_gates(&dir, rec.span_ms(), now));
         tracing::info!("gate history: {} pairs, loaded in {:.1} s", gates.len(), (wall_ms() - now) as f64 / 1e3);
-        let params = json!({ "version": 2, "collect": &cfg.collect, "recording": &rec, "preroll_ms": PREROLL_MS, "tail_ms": TAIL_MS, "window_ms": WINDOW_MS, "edge_bin_bps": EDGE_BIN_BPS,
+        let params = json!({ "version": 3, "stamps": "engine", "collect": &cfg.collect, "recording": &rec, "preroll_ms": PREROLL_MS, "tail_ms": TAIL_MS, "window_ms": WINDOW_MS, "edge_bin_bps": EDGE_BIN_BPS,
             "hyperliquid_source": if std::env::var_os("HL_PUBLIC_WS").is_some() { "central_hub" } else { "direct" }, "receipt_clock": "consumer arrival after local relay" });
         let header = vec![format!("P\t{params}"), format!("U\t{}", serde_json::to_string(&pairs)?)];
         let (store, writer) = Store::open(&dir, header)?;
@@ -760,10 +814,10 @@ fn deliver(collector: &mut Collector, t: i64, event: Event, destinations: &[Vec<
     let market = match event { Event::Book { pair, .. } | Event::Trade { pair, .. } => pair };
     for &(pair, venue, scale) in &destinations[market] {
         let event = match event {
-            Event::Book { bbo, .. } => Event::Book { pair, venue, bbo: Bbo {
+            Event::Book { bbo, stamp, .. } => Event::Book { pair, venue, stamp, bbo: Bbo {
                 bid: bbo.bid / scale, ask: bbo.ask / scale, bid_size: bbo.bid_size * scale, ask_size: bbo.ask_size * scale,
             } },
-            Event::Trade { price, size, buy, .. } => Event::Trade { pair, venue, price: price / scale, size: size * scale, buy },
+            Event::Trade { price, size, buy, stamp, .. } => Event::Trade { pair, venue, price: price / scale, size: size * scale, buy, stamp },
         };
         collector.on_event(t, event, out);
     }
@@ -836,7 +890,7 @@ async fn run_day(mut collector: Collector, pairs: &[Pair], store: &Store, day_en
                     None => {
                         if *venue == Venue::Hyperliquid { hl.reset(); }
                         for &pair in ids {
-                            deliver(&mut collector, t, Event::Book { pair, venue: Leg::Left, bbo: Bbo::default() }, &destinations, &mut out);
+                            deliver(&mut collector, t, Event::Book { pair, venue: Leg::Left, bbo: Bbo::default(), stamp: 0 }, &destinations, &mut out);
                         }
                     }
                 }
@@ -899,11 +953,12 @@ mod tests {
     }
 
     fn book(venue: Leg, bid: f64, ask: f64) -> Event {
-        Event::Book { pair: 0, venue, bbo: bbo(bid, ask) }
+        Event::Book { pair: 0, venue, bbo: bbo(bid, ask), stamp: 0 }
     }
 
-    fn times(lines: &[String]) -> Vec<&str> {
-        lines.iter().map(|l| l.split('\t').nth(1).unwrap()).collect()
+    /// Each line's kind and time, as "B1000".
+    fn times(lines: &[String]) -> Vec<String> {
+        lines.iter().map(|l| l.split('\t').take(2).collect()).collect()
     }
 
     #[test]
@@ -919,62 +974,107 @@ mod tests {
         // Only the Lighter bid ($100.08) is short of a $130 depth: flag 4 is off.
         assert_eq!(depth_flags(&a, &Bbo { bid_size: 1.0, ..l }, 130.0), 0b1011);
 
-        // A 5 bps quote on Aster, priced from these books, bids at most 100.08 - 5 bps of 100.045
-        // (the mean mid) = 100.0300 and never above Aster's 100.00 bid: only a sale below 100.00
+        // A 5 bps quote on Aster, priced from these books, bids at most 100.08 - 5 bps of 100.01
+        // (the lower mid) = 100.0300 and never above Aster's 100.00 bid: only a sale below 100.00
         // could fill it.
-        assert!(!could_fill(Leg::Left, false, 100.0, &a, &l, 5.0, 130.0));
-        assert!(could_fill(Leg::Left, false, 99.99, &a, &l, 5.0, 130.0));
+        let once = || std::iter::once((&a, &l));
+        assert!(!could_fill(Leg::Left, false, 100.0, once(), 5.0, 130.0));
+        assert!(could_fill(Leg::Left, false, 99.99, once(), 5.0, 130.0));
         // A 10 bps quote bids at most 99.98: a sale at 99.99 is not through it.
-        assert!(!could_fill(Leg::Left, false, 99.99, &a, &l, 10.0, 130.0));
+        assert!(!could_fill(Leg::Left, false, 99.99, once(), 10.0, 130.0));
         // On Lighter, a buy must lift its 100.10 ask and clear Aster's 100.02 ask by 5 bps.
-        assert!(could_fill(Leg::Right, true, 100.11, &a, &l, 5.0, 130.0));
-        assert!(!could_fill(Leg::Right, true, 100.06, &a, &l, 1.0, 130.0));
+        assert!(could_fill(Leg::Right, true, 100.11, once(), 5.0, 130.0));
+        assert!(!could_fill(Leg::Right, true, 100.06, once(), 1.0, 130.0));
+        // Over a pre-roll the touch of one state and the hedge of another can make a quote, as
+        // they would with other feed delays: here each state alone has an unknown leg.
+        let unknown = Bbo::default();
+        assert!(could_fill(Leg::Left, false, 99.99, [(&a, &unknown), (&unknown, &l)].into_iter(), 5.0, 130.0));
     }
 
     #[test]
     fn venue_frames_parse_and_lighter_history_is_skipped() {
         let index = HashMap::from([(7u32, 0usize)]);
-        let ticker = r#"{"channel":"ticker:7","ticker":{"s":"1000NOT","a":{"price":"2.5","size":"5"},"b":{"price":"2.25","size":"4"}},"type":"update/ticker"}"#;
-        assert_eq!(
-            lighter_events(ticker, &index).unwrap(),
-            [Event::Book { pair: 0, venue: Leg::Right, bbo: Bbo { bid: 2.25, bid_size: 4.0, ask: 2.5, ask_size: 5.0 } }]
-        );
-        let trade = |kind: &str| format!(r#"{{"channel":"trade:7","trades":[{{"price":"2.25","size":"3","is_maker_ask":true}}],"type":"{kind}"}}"#);
+        // Stamped by the ticker's last update (µs), else the frame's time.
+        let ticker = r#"{"channel":"ticker:7","ticker":{"s":"1000NOT","a":{"price":"2.5","size":"5"},"b":{"price":"2.25","size":"4"},"last_updated_at":1500123},"timestamp":1501,"type":"update/ticker"}"#;
+        let bbo = Bbo { bid: 2.25, bid_size: 4.0, ask: 2.5, ask_size: 5.0 };
+        assert_eq!(lighter_events(ticker, &index).unwrap(), [Event::Book { pair: 0, venue: Leg::Right, bbo, stamp: 1500 }]);
+        let bare = ticker.replace(r#","last_updated_at":1500123"#, "");
+        assert_eq!(lighter_events(&bare, &index).unwrap(), [Event::Book { pair: 0, venue: Leg::Right, bbo, stamp: 1501 }]);
+        let trade = |kind: &str| format!(r#"{{"channel":"trade:7","trades":[{{"price":"2.25","size":"3","is_maker_ask":true,"timestamp":1600}}],"type":"{kind}"}}"#);
         assert_eq!(lighter_events(&trade("subscribed/trade"), &index).unwrap(), []);
         assert_eq!(
             lighter_events(&trade("update/trade"), &index).unwrap(),
-            [Event::Trade { pair: 0, venue: Leg::Right, price: 2.25, size: 3.0, buy: true }]
+            [Event::Trade { pair: 0, venue: Leg::Right, price: 2.25, size: 3.0, buy: true, stamp: 1600 }]
         );
         let aster = HashMap::from([("NOTUSDT".to_string(), 0usize)]);
         let agg = r#"{"stream":"notusdt@aggTrade","data":{"e":"aggTrade","s":"NOTUSDT","p":"0.0021","q":"100","T":1,"m":true}}"#;
-        assert_eq!(aster_event(agg, &aster).unwrap(), Some(Event::Trade { pair: 0, venue: Leg::Left, price: 0.0021, size: 100.0, buy: false }));
+        assert_eq!(aster_event(agg, &aster).unwrap(), Some(Event::Trade { pair: 0, venue: Leg::Left, price: 0.0021, size: 100.0, buy: false, stamp: 1 }));
     }
 
     #[test]
-    fn a_taker_moment_records_itself_and_its_tail_and_an_xemm_one_its_preroll() {
+    fn a_taker_moment_records_itself_and_its_tail_an_xemm_one_its_preroll_and_the_next_change_is_marked() {
         let mut c = Collector::new(&rec(50), &[pair("X")], HashMap::new(), 0);
         let mut lines = Vec::new();
         let mut out = |l: String| lines.push(l);
         c.on_event(0, book(Leg::Left, 100.0, 100.01), &mut out); // cold
         c.on_event(1_000, book(Leg::Right, 100.0, 100.01), &mut out); // cold
         c.on_event(1_500, book(Leg::Left, 99.99, 100.0), &mut out); // cold
-        c.on_event(2_000, book(Leg::Right, 100.07, 100.08), &mut out); // edge 7 bps: in warmup the trigger is the 6 bps floor
+        // Edge 7 bps: in warmup the trigger is the 6 bps floor. With Aster's ask before (100.01)
+        // it is under 6 bps: only this state is needed.
+        c.on_event(2_000, book(Leg::Right, 100.07, 100.08), &mut out);
         c.on_event(2_400, book(Leg::Right, 100.0, 100.01), &mut out); // in the tail
-        // Cold again: two states within a millisecond; the first never is the state in force.
+        // Cold again: Lighter's first change since its last record is marked; then a second state
+        // within that millisecond.
         c.on_event(4_001, book(Leg::Right, 100.0, 100.03), &mut out);
         c.on_event(4_001, book(Leg::Right, 100.0, 100.02), &mut out);
-        // An Aster sale at 99.98, under its 99.99 bid and over 5 bps (of the mean mid) under the
+        // An Aster sale at 99.98, under its 99.99 bid and over 5 bps (of the lower mid) under the
         // 100.05 Lighter bid of 4.5 s: it could fill a quote. The pre-roll (from 3.6 s) writes the
-        // states in force since then not yet written (the second of 4.001 s, and 4.5 s; 2.4 s is),
-        // and the tail runs to 6.6 s.
+        // states not yet written since the one in force then (2.4 s): both of 4.001 s, and 4.5 s.
+        // The tail runs to 6.6 s.
         c.on_event(4_500, book(Leg::Right, 100.05, 100.06), &mut out);
-        c.on_event(4_600, Event::Trade { pair: 0, venue: Leg::Left, price: 99.98, size: 1.0, buy: false }, &mut out);
+        c.on_event(4_600, Event::Trade { pair: 0, venue: Leg::Left, price: 99.98, size: 1.0, buy: false, stamp: 0 }, &mut out);
         c.on_event(6_600, book(Leg::Right, 100.0, 100.01), &mut out);
         c.on_event(6_601, book(Leg::Right, 100.0, 100.02), &mut out);
-        assert_eq!(times(&lines), ["2000", "2400", "4001", "4500", "4600", "6600"]);
-        assert!(lines[2].ends_with("100.02\t15"));
-        assert_eq!(lines[0], "B\t2000\tX\t99.99\t100\t100.07\t100.08\t15");
-        assert_eq!(lines[4], "T\t4600\tX\t0\t99.98\t1\tS");
+        assert_eq!(times(&lines), ["B2000", "B2400", "R4001", "B4001", "B4001", "B4500", "T4600", "B6600", "R6601"]);
+        // Ages: these events carry no stamp, so each leg's is its arrival; Aster last changed at 1.5 s.
+        assert!(lines[3].ends_with("100.03\t15\t2501\t0") && lines[4].ends_with("100.02\t15\t2501\t0"));
+        assert_eq!(lines[0], "B\t2000\tX\t99.99\t100\t100.07\t100.08\t15\t500\t0");
+        assert_eq!(lines[6], "T\t4600\tX\t0\t99.98\t1\tS\t0");
+    }
+
+    #[test]
+    fn lines_carry_venue_ages_and_an_edge_across_arrival_order_triggers() {
+        let mut c = Collector::new(&rec(50), &[pair("X")], HashMap::new(), 0);
+        let mut lines = Vec::new();
+        let mut out = |l: String| lines.push(l);
+        let at = |venue, bid, ask, stamp| Event::Book { pair: 0, venue, bbo: bbo(bid, ask), stamp };
+        // Aster arrives 10 ms after its stamps, Lighter 10 then 300 ms.
+        c.on_event(1_000, at(Leg::Left, 99.99, 100.0, 990), &mut out);
+        c.on_event(1_000, at(Leg::Right, 100.0, 100.01, 990), &mut out);
+        c.on_event(1_100, at(Leg::Left, 100.05, 100.06, 1_090), &mut out); // 4 bps
+        // Lighter's 100.07 bid, stamped before Aster's last change, never met Aster's 100.00 ask
+        // here (1 bps) but did on the venues (7 bps): it triggers, written from the last state
+        // holding that ask (the whole of its millisecond).
+        c.on_event(1_300, at(Leg::Right, 100.07, 100.08, 1_000), &mut out);
+        // A print with its own stamp; its pre-roll (from 0.4 s) adds the start's unknown state.
+        c.on_event(1_400, Event::Trade { pair: 0, venue: Leg::Right, price: 100.09, size: 1.0, buy: true, stamp: 1_050 }, &mut out);
+        // Cold: each leg's first change is marked at its stamp (as an age); the next is not.
+        c.on_event(3_500, at(Leg::Left, 100.05, 100.07, 3_490), &mut out);
+        c.on_event(3_600, at(Leg::Left, 100.05, 100.08, 3_590), &mut out);
+        c.on_event(3_700, at(Leg::Right, 100.07, 100.09, 3_400), &mut out);
+        c.tick(WINDOW_MS, &mut out);
+        assert_eq!(&lines[..8], [
+            "B\t1000\tX\t99.99\t100\t0\t0\t3\t10\t1000",
+            "B\t1000\tX\t99.99\t100\t100\t100.01\t15\t10\t10",
+            "B\t1100\tX\t100.05\t100.06\t100\t100.01\t15\t10\t110",
+            "B\t1300\tX\t100.05\t100.06\t100.07\t100.08\t15\t210\t300",
+            "B\t0\tX\t0\t0\t0\t0\t0\t0\t0",
+            "T\t1400\tX\t1\t100.09\t1\tB\t350",
+            "R\t3500\tX\t0\t10",
+            "R\t3700\tX\t1\t300",
+        ]);
+        let s: serde_json::Value = serde_json::from_str(lines[8].strip_prefix("S\t").unwrap()).unwrap();
+        assert_eq!(s["lag"], json!([[10, 10], [10, 300]]));
     }
 
     #[test]
@@ -995,9 +1095,9 @@ mod tests {
         c.on_event(WINDOW_MS + 10_000, book(Leg::Right, 100.148, 100.2), &mut |l| lines.push(l));
         let s: serde_json::Value = serde_json::from_str(lines[before].strip_prefix("S\t").unwrap()).unwrap();
         assert_eq!(s["samples"], json!({"28": 1, "32": 1, "36": 1, "40": 1, "44": 1, "48": 1, "52": 1, "56": 1, "60": 1, "64": 1}));
-        assert_eq!(lines.len(), before + 1);
+        assert!(!lines[before..].iter().any(|l| l.starts_with('B')));
         c.on_event(WINDOW_MS + 12_000, book(Leg::Right, 100.152, 100.2), &mut |l| lines.push(l));
-        assert_eq!(lines.len(), before + 2);
+        assert!(lines.last().unwrap().starts_with(&format!("B\t{}\tX\t100\t100\t100.152", WINDOW_MS + 12_000)));
     }
 
     #[test]
@@ -1067,7 +1167,7 @@ mod tests {
 
     #[test]
     fn a_run_ends_its_tails_unknown_and_the_next_starts_unknown() {
-        let unknown = |t: i64| format!("B\t{t}\tX\t0\t0\t0\t0\t0");
+        let unknown = |t: i64| format!("B\t{t}\tX\t0\t0\t0\t0\t0\t0\t0");
         let mut c = Collector::new(&rec(50), &[pair("X")], HashMap::new(), 0);
         let mut lines = Vec::new();
         c.on_event(0, book(Leg::Left, 99.99, 100.0), &mut |l| lines.push(l));
@@ -1080,7 +1180,7 @@ mod tests {
         let mut lines = Vec::new();
         c.on_event(1_100, book(Leg::Left, 99.99, 100.0), &mut |l| lines.push(l));
         c.on_event(1_200, book(Leg::Right, 100.05, 100.06), &mut |l| lines.push(l));
-        c.on_event(1_300, Event::Trade { pair: 0, venue: Leg::Left, price: 99.98, size: 1.0, buy: false }, &mut |l| lines.push(l));
+        c.on_event(1_300, Event::Trade { pair: 0, venue: Leg::Left, price: 99.98, size: 1.0, buy: false, stamp: 0 }, &mut |l| lines.push(l));
         assert_eq!(lines[0], unknown(1_000));
     }
 
@@ -1099,16 +1199,16 @@ mod tests {
         let mut c = Collector::new(&rec, &pairs, HashMap::new(), 0);
         for (i, m) in markets.iter().enumerate() {
             let px = if m.venue == Venue::Aster { 0.1 } else { 100.0 };
-            deliver(&mut c, 1, Event::Book { pair: i, venue: Leg::Left, bbo: bbo(px, px) }, &destinations, &mut |_| {});
+            deliver(&mut c, 1, Event::Book { pair: i, venue: Leg::Left, bbo: bbo(px, px), stamp: 0 }, &destinations, &mut |_| {});
         }
         assert_eq!(c.pairs[0].l.bid, 0.1);
         assert_eq!(c.pairs[1].l.bid, 0.1);
         assert_eq!(c.pairs[2].l.bid, 100.0);
         assert_eq!(c.pairs[1].l.top_usd(), c.pairs[2].l.top_usd());
         let hi = markets.iter().position(|m| m.venue == Venue::Hyperliquid).unwrap();
-        deliver(&mut c, 2, Event::Trade { pair: hi, venue: Leg::Left, price: 100.0, size: 2.0, buy: true }, &destinations, &mut |_| {});
+        deliver(&mut c, 2, Event::Trade { pair: hi, venue: Leg::Left, price: 100.0, size: 2.0, buy: true, stamp: 0 }, &destinations, &mut |_| {});
         assert_eq!((c.pairs[1].summary.l_usd, c.pairs[2].summary.l_usd), (200.0, 200.0));
-        deliver(&mut c, 3, Event::Book { pair: hi, venue: Leg::Left, bbo: Bbo::default() }, &destinations, &mut |_| {});
+        deliver(&mut c, 3, Event::Book { pair: hi, venue: Leg::Left, bbo: Bbo::default(), stamp: 0 }, &destinations, &mut |_| {});
         assert!(c.pairs[0].a.known() && c.pairs[0].l.known());
         assert!(!c.pairs[1].l.known() && !c.pairs[2].l.known());
     }

@@ -136,6 +136,10 @@ or when a venue missing at discovery answers).
 Each file is zstd-compressed tab-separated lines, with the formats in `src/collect.rs`.
 Version 2 uses venue-qualified keys and two-second tails. Existing Aster-Lighter files remain
 readable without migration; their one-second tails still limit their own replay settings.
+Version 3 (2026-10-10) adds each leg's age against the venue's engine stamp to `B` and `T` lines,
+and `R` marks where an unrecorded change makes a leg unknown, for replay on venue time. It also
+selects the moments any mix of the two legs' states within the pre-roll could trade, which other
+feed delays than this host's could produce.
 A new run reads the last 72 h of summaries back for its gate.
 
 With Hyperliquid, files take ~60 MB a day for ~155 pairs (18:03–20:07 UTC on 2026-09-26; twice

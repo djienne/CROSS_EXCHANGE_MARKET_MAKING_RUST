@@ -71,7 +71,7 @@ impl Feed {
                         state.newest_trade = t.time;
                         state.seen.retain(|(time, _)| *time >= t.time - 60_000);
                     }
-                    events.push(Event::Trade { pair, venue: Leg::Left, price, size, buy });
+                    events.push(Event::Trade { pair, venue: Leg::Left, price, size, buy, stamp: t.time });
                 }
                 None
             }
@@ -93,7 +93,7 @@ impl Feed {
             else if state.first_book == 0 { state.first_book = time; }
             state.last_book = time;
             state.received = now;
-            events.push(Event::Book { pair, venue: Leg::Left, bbo });
+            events.push(Event::Book { pair, venue: Leg::Left, bbo, stamp: time });
         }
         Ok(events)
     }
@@ -104,7 +104,7 @@ impl Feed {
             if s.received != 0 && now - s.received > 30_000 {
                 s.received = 0;
                 s.first_book = 0;
-                Some(Event::Book { pair, venue: Leg::Left, bbo: Bbo::default() })
+                Some(Event::Book { pair, venue: Leg::Left, bbo: Bbo::default(), stamp: 0 })
             } else { None }
         }).collect()
     }

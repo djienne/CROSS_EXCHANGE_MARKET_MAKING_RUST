@@ -101,7 +101,7 @@ impl Data {
         match f[0] {
             "P" => {
                 let params: Value = serde_json::from_str(f[1])?;
-                ensure!(params["version"].as_u64().unwrap_or(1) <= 2, "{file}: unsupported screener format");
+                ensure!(params["version"].as_u64().unwrap_or(1) <= 3, "{file}: unsupported screener format");
                 let mut rec: Recording = serde_json::from_value(params["recording"].clone()).with_context(|| format!("{file}: not written by this screener version"))?;
                 rec.floors = rec.floors.into_iter().map(|(k, v)| (universe::qualified(&k), v)).collect();
                 self.recordings.push((file.to_string(), rec, history));
@@ -113,7 +113,8 @@ impl Data {
                 }
             }
             "B" if !history => {
-                ensure!(f.len() == 8, "{file}: a B line of {} fields, not 8 (sizes, not depth flags?)", f.len());
+                // v3 adds the legs' ages.
+                ensure!(f.len() == 8 || f.len() == 10, "{file}: a B line of {} fields, not 8 or 10 (sizes, not depth flags?)", f.len());
                 let n: Vec<f64> = f[3..7].iter().map(|x| x.parse()).collect::<Result<_, _>>()?;
                 let flags: u8 = f[7].parse()?;
                 // A side holding the recorded depth (`depth_flags`) gets an infinite size, the
@@ -123,7 +124,7 @@ impl Data {
                 let l = Bbo { bid: n[2], bid_size: size(2), ask: n[3], ask_size: size(3) };
                 self.series.entry(universe::qualified(f[2])).or_default().states.push(State { t: f[1].parse()?, a, l });
             }
-            "T" if !history && f.len() == 7 => {
+            "T" if !history && (f.len() == 7 || f.len() == 8) => {
                 let venue = match f[3] { "A" | "0" => Leg::Left, "L" | "1" => Leg::Right, _ => bail!("{file}: invalid leg {}", f[3]) };
                 let trade = Trade { t: f[1].parse()?, venue, price: f[4].parse()?, size: f[5].parse()?, buy: f[6] == "B" };
                 self.series.entry(universe::qualified(f[2])).or_default().trades.push(trade);
@@ -822,11 +823,11 @@ mod tests {
             let r = rand();
             if r < 0.495 {
                 a = Bbo { bid: mid * (1.0 - 0.5e-4), bid_size: thin(rand()), ask: mid * (1.0 + 0.5e-4), ask_size: thin(rand()) };
-                collector.on_event(t, Event::Book { pair: 0, venue: Leg::Left, bbo: a }, &mut out);
+                collector.on_event(t, Event::Book { pair: 0, venue: Leg::Left, bbo: a, stamp: t - 10 }, &mut out);
             } else if r < 0.99 {
                 let m = mid * (1.0 + basis / 1e4);
                 l = Bbo { bid: m * (1.0 - 0.75e-4), bid_size: thin(rand()), ask: m * (1.0 + 0.75e-4), ask_size: thin(rand()) };
-                collector.on_event(t, Event::Book { pair: 0, venue: Leg::Right, bbo: l }, &mut out);
+                collector.on_event(t, Event::Book { pair: 0, venue: Leg::Right, bbo: l, stamp: t - 300 }, &mut out);
             } else if r < 0.9905 {
                 l = Bbo::default();
                 collector.closed(Leg::Right, t, &mut out);
@@ -837,7 +838,7 @@ mod tests {
                 if book.known() {
                     let price = if buy { book.ask * through } else { book.bid / through };
                     full.trades.push(Trade { t, venue, price, size: 0.5, buy });
-                    collector.on_event(t, Event::Trade { pair: 0, venue, price, size: 0.5, buy }, &mut out);
+                    collector.on_event(t, Event::Trade { pair: 0, venue, price, size: 0.5, buy, stamp: t - 150 }, &mut out);
                 }
                 continue;
             }
@@ -853,7 +854,9 @@ mod tests {
         let data = data.sorted();
         let recorded = &data.series[&pair.name];
         (full.summaries, full.windows) = (recorded.summaries.clone(), recorded.windows.clone());
-        assert!(recorded.states.len() * 2 < full.states.len(), "{} of {} states recorded", recorded.states.len(), full.states.len());
+        // Selective even in this busy market: 55% (41% selecting on this host's arrival order only;
+        // the mixes other feed delays could trade add the rest).
+        assert!(recorded.states.len() * 5 < full.states.len() * 3, "{} of {} states recorded", recorded.states.len(), full.states.len());
 
         // Scenarios stay within the actual recording coverage, including HL maker quote age.
         for (tier, latency, percentile) in [("standard", 0.5, 90.0), ("standard", 1.0, 90.0), ("premium", 1.0, 90.0), ("standard", 2.0, 90.0), ("standard", 1.0, 95.0)] {
@@ -906,9 +909,13 @@ mod tests {
         data.add("new", &format!("P\t{}", serde_json::json!({"version":2,"recording":Recording::new(&cfg,&pairs)})), false).unwrap();
         data.add("new", &format!("U\t{}", serde_json::to_string(&pairs).unwrap()), false).unwrap();
         data.add("new", "B\t3\tA-H:X\t100\t101\t100\t101\t15", false).unwrap();
+        // v3 lines add the ages.
+        data.add("new", "B\t5\tA-H:X\t100\t101\t100\t101\t15\t3\t250", false).unwrap();
+        data.add("new", "T\t6\tA-H:X\t1\t101\t1\tB\t150", false).unwrap();
+        assert!(data.add("new", "B\t7\tA-H:X\t100\t101\t100\t101\t15\t3", false).is_err());
         assert_eq!(data.pairs.len(), 2);
         assert_eq!(data.series["A-L:X"].states.len(), 1);
-        assert_eq!(data.series["A-H:X"].states.len(), 1);
+        assert_eq!((data.series["A-H:X"].states.len(), data.series["A-H:X"].trades.len()), (2, 1));
         assert_eq!(data.recordings[0].1.tail_ms, 1000);
         assert_eq!(data.recordings[1].1.tail_ms, 2000);
         assert!(data.recordings[0].1.check_latency(&cfg, &pairs[0], 2.0).is_err());
