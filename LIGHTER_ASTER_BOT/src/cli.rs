@@ -1,6 +1,7 @@
 //! Command-line interface: `run` (the bot: one market) and the XEMM
 //! subcommands `live-report`, `probe`, `status`, `fetch-specs`, plus `close` (the operator's exit)
-//! and `record` (the market-data tape for backtests). The taker engine has its own CLI under `taker`.
+//! `record` (the market-data tape) and `replay` (a backtest on it). The taker engine has its own CLI
+//! under `taker`.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -118,6 +119,22 @@ pub enum Commands {
         #[arg(long, default_value = "data")]
         out: PathBuf,
     },
+
+    /// Backtest: `run --mode dry-run` against the tape `record` made instead of the live market,
+    /// from --from to --until at the market's own pace, into a new
+    /// runs/replay/<MARKET>-<from>-<until>/. Aster-Lighter markets only; no credentials, no orders.
+    Replay {
+        #[arg(long)]
+        market: String,
+        /// The market's tape. Default: data/<MARKET>.
+        #[arg(long)]
+        tape: Option<PathBuf>,
+        /// Venue time, RFC 3339 (2026-09-28T06:00:00Z).
+        #[arg(long)]
+        from: chrono::DateTime<chrono::Utc>,
+        #[arg(long)]
+        until: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 /// Parse a `--mode` string into a [`crate::config::LiveMode`].
@@ -186,6 +203,11 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         }
         Commands::Record { market, out } => {
             crate::dryrun::tape::record(&cli.config, &market, out, crate::controller::stop_on_signals()).await?;
+        }
+        Commands::Replay { market, tape, from, until } => {
+            crate::taker::abort_on_panic();
+            let tape = tape.unwrap_or_else(|| PathBuf::from("data").join(market.to_ascii_uppercase()));
+            crate::controller::replay(&cli.config, &market, &tape, from, until, crate::controller::stop_on_signals()).await?;
         }
     }
     Ok(())

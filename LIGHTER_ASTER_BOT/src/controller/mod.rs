@@ -127,6 +127,67 @@ pub async fn run(config: &Path, market: &str, mode: LiveMode, ack_breaker: bool,
     run_with(cfg, Path::new(RUNS_DIR), market, mode, ack_breaker, reset_baseline, stop).await
 }
 
+/// `replay`: `run --mode dry-run` against the tape in `tape` (`data/<M>`) from `from` to `until`
+/// (venue time) instead of the live market, in a new `runs/replay/<M>-<from>-<until>/`. It ends
+/// with the bot's drain once the tape passes `until`.
+pub async fn replay(config: &Path, market: &str, tape: &Path, from: DateTime<Utc>, until: DateTime<Utc>, stop: CancellationToken) -> Result<()> {
+    let cfg = BotConfig::load(config)?;
+    let replay = crate::dryrun::tape::Replay::open(tape, from.timestamp_micros(), until.timestamp_micros(), crate::dryrun::tape::LEAD_US, stop.clone())?;
+    replay_with(cfg, Path::new(RUNS_DIR), market, replay, stop).await
+}
+
+/// [`replay`] with the tape opened and the runs directory given.
+pub(crate) async fn replay_with(mut cfg: BotConfig, runs_root: &Path, market: &str, replay: crate::dryrun::tape::Replay, stop: CancellationToken) -> Result<()> {
+    let market = market.to_ascii_uppercase();
+    let stamp = |us: i64| DateTime::from_timestamp_micros(us).unwrap_or_default().format("%Y%m%dT%H%M%SZ").to_string();
+    let dir = runs_root.join("replay").join(format!("{market}-{}-{}", stamp(replay.from_us), stamp(replay.until_us)));
+    // A replay starts afresh: no simulated account, latch or deadman carries over.
+    ensure!(!dir.exists(), "{} exists: remove it to replay that window again", dir.display());
+    let rfc3339 = |us: i64| DateTime::from_timestamp_micros(us).unwrap_or_default().to_rfc3339();
+    let mut about = serde_json::json!({"market": market, "from": rfc3339(replay.from_us), "until": rfc3339(replay.until_us),
+        "lead_ms": replay.lead_us / 1_000, "tape": replay.files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>()});
+    let from_us = replay.from_us;
+    let dry = cfg.dry_run.as_mut().context("replay needs a [dry_run] table in the config")?;
+    // The tape's `from` comes a lead from now on the shifted clock; any free ports, so replays
+    // run side by side.
+    dry.shift_ms = (crate::dryrun::clock::wall_us() - from_us + replay.lead_us) / 1_000;
+    (dry.aster_port, dry.lighter_port, dry.hyperliquid_port, dry.replay) = (0, 0, 0, Some(replay));
+    let shift_us = dry.shift_ms * 1_000;
+    std::fs::create_dir_all(dir.join("dry-run"))?;
+    about["shift_ms"] = (shift_us / 1_000).into();
+    about["gate_samples"] = seed_gate(&cfg, runs_root, &market, from_us, shift_us, &dir.join("dry-run"))?.into();
+    std::fs::write(dir.join("replay.json"), format!("{about:#}\n"))?;
+    run_with(cfg, &dir, &market, LiveMode::DryRun, false, false, stop).await
+}
+
+/// Seeds a replay's entry gate (its files in `runs`) with the live dry run's samples of the
+/// history window before `from_us`, moved onto the replay's clock (the live run's own shift, at
+/// most 90 s, stays in). Returns how many.
+fn seed_gate(cfg: &BotConfig, runs_root: &Path, market: &str, from_us: i64, shift_us: i64, runs: &Path) -> Result<usize> {
+    let gate = &cfg.taker.arb.entry_gate;
+    let source = runs_root.join("dry-run").join(format!("opportunities_{market}.jsonl"));
+    let text = match std::fs::read_to_string(&source) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", source.display())),
+    };
+    let since_us = from_us - gate.history_window_hours as i64 * 3_600_000_000;
+    let (mut rows, mut n) = (String::new(), 0);
+    for mut row in text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()) {
+        let at = row["timestamp"].as_str().and_then(|t| DateTime::parse_from_rfc3339(t).ok()).map(|t| t.timestamp_micros());
+        if let Some(moved) = at.filter(|t| (since_us..from_us).contains(t)).and_then(|t| DateTime::from_timestamp_micros(t + shift_us)) {
+            row["timestamp"] = moved.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true).into();
+            rows.push_str(&format!("{row}\n"));
+            n += 1;
+        }
+    }
+    if n < gate.min_history_samples {
+        warn!("replay: {n} entry-gate samples in {} before --from; the taker waits for {}", source.display(), gate.min_history_samples);
+    }
+    std::fs::write(runs.join(format!("opportunities_{market}.jsonl")), rows)?;
+    Ok(n)
+}
+
 /// A market's two legs as `<VENUE>-<symbol>` lock names: markets sharing a leg share its one-way
 /// position there, so each leg has one live writer (HYPE-LH and HYPE both trade Lighter HYPE).
 pub fn legs(market: &crate::taker::config::MarketCfg) -> [String; 2] {
@@ -158,6 +219,7 @@ pub(crate) async fn run_with(
     let market = market.to_ascii_uppercase();
     let (taker_markets, maker_markets) = cfg.select(&market)?;
     let live = mode.is_real();
+    let replaying = cfg.dry_run.as_ref().is_some_and(|dry| dry.replay.is_some());
     // Live and dry-run never share a file.
     let runs_dir = if live { runs_root.to_path_buf() } else { runs_root.join("dry-run") };
     let _lock = lock_market(&runs_dir, &market)?;
@@ -193,10 +255,10 @@ pub(crate) async fn run_with(
     }
     .await;
     if let Some(sim) = sim {
-        if let Err(error) = &result {
+        if let (Err(error), false) = (&result, replaying) {
             // Once the venues are up, a dry run parks on any halt, a refused start included:
             // exiting would let a restart policy resume it unreviewed (or loop), and a
-            // deliberate restart is the review.
+            // deliberate restart is the review. A replay ends: nothing restarts it.
             warn!("dry run halted, parked until stopped: {error:#}");
             parked.cancelled().await;
         }
@@ -521,6 +583,57 @@ mod tests {
             .any(|entry| entry.file_name().to_string_lossy().starts_with("active_session_HYPE.json.unclean."));
         assert!(!marker.exists() && archived, "the unclean-session marker is archived");
         fresh.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `replay` end to end on a scripted tape: the Lighter book from its snapshot, then 35 s of
+    /// the market in which Aster asks 98 under Lighter's 99 bid for 5 s. The gate, seeded from the
+    /// live dry run's samples, lets the taker trade it, and the replay drains and ends by itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_replay_trades_the_tape_and_stops_by_itself() {
+        use crate::dryrun::feed::tests::lighter;
+        use crate::dryrun::tape::tests::{aster_depth, write_tape};
+        use crate::dryrun::tests::{ASTER_EXCHANGE_INFO, ORDER_BOOKS};
+        use rust_decimal_macros::dec;
+        use std::time::Duration;
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let dir = crate::dryrun::tests::temp_dir("replay-e2e");
+        let from = crate::dryrun::clock::wall_us() / 1_000 - 3_600_000;
+        let book = lighter("subscribed", 0, 1, from - 1_000, r#"[{"price":"99","size":"5"}]"#, r#"[{"price":"101","size":"5"}]"#);
+        let mut tape = vec![(from - 2_000, "X", ASTER_EXCHANGE_INFO.to_string()), (from - 2_000, "O", ORDER_BOOKS.to_string()), (from - 1_000, "L", book)];
+        for i in 0..350 {
+            let ms = from + 100 * i;
+            let (bid, ask) = if (150..200).contains(&i) { ("97", "98") } else { ("99", "101") };
+            tape.push((ms, "A", aster_depth(ms, bid, ask)));
+            tape.push((ms, "L", lighter("update", 1 + i, 2 + i, ms, "[]", "[]")));
+        }
+        write_tape(&dir.join("data"), &tape);
+        let sample = |ms: i64| format!(r#"{{"timestamp":"{}","market":"HYPE","direction":"SELL_ASTER_BUY_LIGHTER","gross_edge_bps":"5","expected_net_margin_bps":"0","expected_net_usd":"0","qty":"0.1","sell_px":"99","buy_px":"99","ref_px":"99","top_depth_qty":"5","aster_book_age_ms":0,"lighter_book_age_ms":0,"decision":"gated_out","history_sample_count":0}}"#,
+            DateTime::from_timestamp_millis(ms).unwrap().to_rfc3339());
+        let history: String = (1..=70).map(|i| sample(from - 60_000 * i) + "\n").collect();
+        std::fs::create_dir_all(dir.join("dry-run")).unwrap();
+        std::fs::write(dir.join("dry-run").join("opportunities_HYPE.jsonl"), &history).unwrap();
+        let mut cfg = crate::dryrun::tests::dry_config(&dir);
+        cfg.taker.arb.entry_gate.history_window_hours = 1;
+        (cfg.taker.arb.startup_warmup_ms, cfg.taker.arb.book_sanity.enabled) = (0, false);
+        let stop = CancellationToken::new();
+        let replay = crate::dryrun::tape::Replay::open(&dir.join("data").join("HYPE"), from * 1_000, (from + 25_000) * 1_000, 2_000_000, stop.clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(120), replay_with(cfg, &dir, "HYPE", replay, stop)).await.expect("the replay ends by itself").expect("a clean stop");
+
+        let runs: Vec<_> = std::fs::read_dir(dir.join("replay")).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        let ledger = std::fs::read_to_string(runs[0].join("dry-run").join("trades_HYPE.jsonl")).expect("a trade");
+        let row: crate::taker::pnl::TradeLedgerRow = serde_json::from_str(ledger.lines().next().unwrap()).unwrap();
+        assert_eq!((row.economic_status, row.direction.as_str()), (crate::taker::pnl::EconomicStatus::Confirmed, "SELL_LIGHTER_BUY_ASTER"), "{row:?}");
+        assert_eq!((row.aster_fill.vwap, row.hedge_fill.vwap), (dec!(98), dec!(99)), "each leg took the top: {row:?}");
+        let about: Value = serde_json::from_str(&std::fs::read_to_string(runs[0].join("replay.json")).unwrap()).unwrap();
+        assert_eq!(about["gate_samples"], 60, "the hour before --from: {about}");
+        let shift_days = about["shift_ms"].as_f64().unwrap() / 86_400_000.0;
+        assert!((1.0 / 24.0..1.1 / 24.0).contains(&shift_days), "the tape's hour ago: {about}");
+        let mut written: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        written.sort();
+        assert_eq!(written, ["bot.toml", "data", "dry-run", "replay"], "a replay writes in its own directory only");
+        assert_eq!(std::fs::read_to_string(dir.join("dry-run").join("opportunities_HYPE.jsonl")).unwrap(), history);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

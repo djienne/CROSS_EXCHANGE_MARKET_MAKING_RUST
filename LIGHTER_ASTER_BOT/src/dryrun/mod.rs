@@ -6,7 +6,8 @@
 //! the replica each market trades against; `account` settles the money; `clock` draws the
 //! latencies; `feed` brings the real market in; `server` speaks HTTP and WebSocket on
 //! loopback, and `aster`, `lighter` and `hyperliquid` speak each venue's protocol on top of
-//! it. `tape` records the same feeds to disk for backtests (`record`).
+//! it. `tape` records the same feeds to disk (`record`) and replays them (`replay`): a dry run
+//! whose world is the tape's, its shift the days since.
 
 pub mod account;
 pub mod aster;
@@ -63,6 +64,9 @@ pub struct DryRunCfg {
     pub hyperliquid_rtt_ms: Latency,
     pub hyperliquid_feed_ms: Latency,
     pub hidden_queue_multiplier: Decimal,
+    /// Set by `replay`: the venues follow this tape instead of the live market.
+    #[serde(skip)]
+    pub replay: Option<tape::Replay>,
 }
 
 impl DryRunCfg {
@@ -131,19 +135,40 @@ struct Listing {
 }
 
 impl Listing {
-    /// Fetches `symbol`'s listing on `venue` from the real API `cfg` points at. Its fees are the
-    /// bot's own keys (circular by construction); the bot makes only on Aster.
+    /// Fetches `symbol`'s listing on `venue` from the real API `cfg` points at.
     async fn fetch(venue: Venue, symbol: &str, cfg: &BotConfig, http: &reqwest::Client) -> Result<Self> {
-        let (live, edge, arb) = (&cfg.maker.live, &cfg.maker.edge, &cfg.taker.arb);
-        let rate = |bps: Decimal| bps / Decimal::from(10_000);
         let get = |url: String| {
             let request = http.get(url);
             async move { request.send().await?.error_for_status()?.text().await }
         };
+        let base = Self::base(venue, cfg);
+        let meta = match venue {
+            Venue::Aster => get(format!("{base}/fapi/v3/exchangeInfo")).await.context("fetching Aster exchangeInfo")?,
+            Venue::Lighter => get(format!("{base}/api/v1/orderBooks")).await.context("fetching Lighter orderBooks")?,
+            Venue::Hyperliquid => http.post(format!("{base}/info")).json(&json!({"type": "meta"})).send().await
+                .and_then(|r| r.error_for_status()).context("fetching Hyperliquid meta")?.text().await?,
+        };
+        Self::parse(venue, symbol, cfg, meta)
+    }
+
+    fn base(venue: Venue, cfg: &BotConfig) -> String {
+        let live = &cfg.maker.live;
+        let base = match venue {
+            Venue::Aster => &live.aster.base_url,
+            Venue::Lighter => &live.lighter.base_url,
+            Venue::Hyperliquid => &live.hyperliquid.base_url,
+        };
+        base.trim_end_matches('/').to_string()
+    }
+
+    /// `symbol`'s listing on `venue` from its API's listing of all markets, `meta`. Its fees are
+    /// the bot's own keys (circular by construction); the bot makes only on Aster.
+    fn parse(venue: Venue, symbol: &str, cfg: &BotConfig, meta: String) -> Result<Self> {
+        let (edge, arb) = (&cfg.maker.edge, &cfg.taker.arb);
+        let rate = |bps: Decimal| bps / Decimal::from(10_000);
+        let base = Self::base(venue, cfg);
         match venue {
             Venue::Aster => {
-                let base = live.aster.base_url.trim_end_matches('/').to_string();
-                let meta = get(format!("{base}/fapi/v3/exchangeInfo")).await.context("fetching Aster exchangeInfo")?;
                 let market = symbol.to_ascii_uppercase();
                 let aster = crate::connectors::rest_specs::parse_aster_exchange_info(&meta)?
                     .remove(&market)
@@ -160,8 +185,6 @@ impl Listing {
                 Ok(Self { venue, base, market, filters, fees, meta, lighter: None })
             }
             Venue::Lighter => {
-                let base = live.lighter.base_url.trim_end_matches('/').to_string();
-                let meta = get(format!("{base}/api/v1/orderBooks")).await.context("fetching Lighter orderBooks")?;
                 let detail = serde_json::from_str::<OrderBooksResponse>(&meta)
                     .context("parsing Lighter orderBooks")?
                     .order_books
@@ -185,9 +208,6 @@ impl Listing {
                 Ok(Self { venue, base, market: detail.market_id.to_string(), filters, fees, meta, lighter: Some(detail) })
             }
             Venue::Hyperliquid => {
-                let base = live.hyperliquid.base_url.trim_end_matches('/').to_string();
-                let meta = http.post(format!("{base}/info")).json(&json!({"type": "meta"})).send().await
-                    .and_then(|r| r.error_for_status()).context("fetching Hyperliquid meta")?.text().await?;
                 let asset = crate::hyperliquid::client::asset_in(&serde_json::from_str(&meta).context("parsing Hyperliquid meta")?, symbol)?;
                 // At most 6 - szDecimals decimals and 5 significant figures; $10 at the limit price;
                 // no price over 80% from the reference.
@@ -212,10 +232,10 @@ impl Listing {
 }
 
 /// Starts the simulated venues of `market`'s two legs on loopback, fed by the live market data
-/// of the venues `cfg` points at, then points both engines at them: every venue URL (one not
-/// simulated resolves nowhere), the dry-run identity, and the taker's files under `runs_dir`.
-/// The venues take up the state a previous run saved there. Returns once both replicas hold a
-/// book.
+/// of the venues `cfg` points at (or by `dry.replay`'s tape), then points both engines at them:
+/// every venue URL (one not simulated resolves nowhere), the dry-run identity, and the taker's
+/// files under `runs_dir`. The venues take up the state a previous run saved there. Returns once
+/// both replicas hold a book.
 pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::config::MarketCfg, runs_dir: &Path) -> Result<Venues> {
     let http = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
     let hedge = match market.hedge_venue {
@@ -226,10 +246,14 @@ pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::
         FirstVenue::Aster => (Venue::Aster, &market.aster_symbol),
         FirstVenue::Lighter => (Venue::Lighter, &market.lighter_symbol),
     };
-    let legs = [
-        Listing::fetch(first, symbol, cfg, &http).await?,
-        Listing::fetch(hedge, &market.lighter_symbol, cfg, &http).await?,
-    ];
+    let legs = match &dry.replay {
+        Some(replay) => {
+            ensure!(first == Venue::Aster && hedge == Venue::Lighter, "a tape holds Aster and Lighter feeds only");
+            let [aster, lighter] = replay.specs.clone();
+            [Listing::parse(first, symbol, cfg, aster)?, Listing::parse(hedge, &market.lighter_symbol, cfg, lighter)?]
+        }
+        None => [Listing::fetch(first, symbol, cfg, &http).await?, Listing::fetch(hedge, &market.lighter_symbol, cfg, &http).await?],
+    };
     let (pair, keys) = (legs.each_ref().map(|leg| leg.venue), legs.each_ref().map(|leg| leg.market.clone()));
     let leverage = cfg.maker.capital.leverage;
     let mut core = Exchange::new(dry.sim_params(legs.each_ref().map(|leg| leg.fees.clone()), leverage, pair), wall_us());
@@ -258,26 +282,27 @@ pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::
     });
     let (inputs, feed_rx) = mpsc::unbounded_channel();
     let venues = Venues::start(core, feed_rx, hubs.clone(), feed_ms, dry.seed, Some(files));
-    let mut urls = HashMap::new();
+    let (mut urls, mut taped) = (HashMap::new(), Vec::new());
     for (leg, hub) in legs.into_iter().zip(hubs) {
-        let (base, markets, inputs) = (leg.base, vec![leg.market], inputs.clone());
+        let markets = vec![leg.market];
+        let upstream = feed::Upstream::new(leg.venue, markets.clone(), shift, hub, inputs.clone());
         let url = match leg.venue {
-            Venue::Aster => {
-                tokio::spawn(feed::aster_upstream(crate::connectors::aster::ws_root(&base), markets.clone(), shift, hub, inputs.clone()));
-                tokio::spawn(feed::aster_funding_poll(base, markets.clone(), inputs));
-                serve(dry.aster_port, aster::Aster::new(venues.clone(), leg.meta, markets, leverage)).await?
-            }
+            Venue::Aster => serve(dry.aster_port, aster::Aster::new(venues.clone(), leg.meta, markets, leverage)).await?,
             Venue::Lighter => {
-                tokio::spawn(feed::lighter_upstream(crate::lighter::ws::stream_url(&base), markets, shift, hub, inputs));
                 let fees = [leg.fees.maker, leg.fees.taker];
                 serve(dry.lighter_port, lighter::Lighter::new(venues.clone(), leg.meta, leg.lighter.into_iter().collect(), fees, leverage)).await?
             }
-            Venue::Hyperliquid => {
-                tokio::spawn(feed::hyperliquid_upstream(crate::connectors::hyperliquid::ws_url(&base), markets, shift, hub, inputs));
-                serve(dry.hyperliquid_port, hyperliquid::Hyperliquid::new(venues.clone(), &leg.meta, leverage)?).await?
-            }
+            Venue::Hyperliquid => serve(dry.hyperliquid_port, hyperliquid::Hyperliquid::new(venues.clone(), &leg.meta, leverage)?).await?,
         };
+        match dry.replay {
+            Some(_) => taped.push(upstream),
+            None => upstream.follow(&leg.base),
+        }
         urls.insert(leg.venue, url);
+    }
+    if let Some(replay) = &dry.replay {
+        let [aster, lighter] = <[_; 2]>::try_from(taped).ok().expect("two legs");
+        replay.spawn(shift, aster, lighter, inputs)?.await.context("the tape ends before --from")?;
     }
     // RFC 2606: `.invalid` never resolves.
     let url = |venue| urls.get(&venue).cloned().unwrap_or_else(|| "http://unsimulated.invalid".to_string());
@@ -289,7 +314,9 @@ pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::
     cfg.taker.pnl.persist_dir = runs_dir.to_string_lossy().into_owned();
 
     let markets = [(pair[0], keys[0].as_str()), (pair[1], keys[1].as_str())];
-    let warm = Duration::from_millis(dry.shift_ms as u64) + WARM_TIMEOUT;
+    // The first frames reach the replicas a shift (or a replay's lead) after they reach the venues.
+    let ahead = dry.replay.as_ref().map_or(dry.shift_ms, |replay| replay.lead_us / 1_000);
+    let warm = Duration::from_millis(ahead as u64) + WARM_TIMEOUT;
     tokio::time::timeout(warm, venues.warm(&markets)).await.with_context(|| format!("the live market data gave no book within {} s", warm.as_secs()))?;
     // The first books have filled what the market crossed while the venues were down; now
     // the deadmen that ran out meanwhile cancel the rest.
@@ -612,11 +639,11 @@ pub(crate) mod tests {
     /// Frames are stamped one shift in the past, so the core applies them at once.
     const SHIFT_MS: i64 = 50;
     /// Lighter's `orderBooks`, cut to HYPE (minimum sizes as live on 2026-09-24).
-    const ORDER_BOOKS: &str = r#"{"code":200,"order_books":[{"symbol":"HYPE","market_id":24,"status":"active","taker_fee":"0.0000","maker_fee":"0.0000","min_base_amount":"0.07","min_quote_amount":"10.000000","supported_size_decimals":2,"supported_price_decimals":4,"supported_quote_decimals":6}]}"#;
+    pub(crate) const ORDER_BOOKS: &str = r#"{"code":200,"order_books":[{"symbol":"HYPE","market_id":24,"status":"active","taker_fee":"0.0000","maker_fee":"0.0000","min_base_amount":"0.07","min_quote_amount":"10.000000","supported_size_decimals":2,"supported_price_decimals":4,"supported_quote_decimals":6}]}"#;
     /// Hyperliquid's `meta`, cut to BTC and HYPE (HYPE is asset 159 live).
     const HYPERLIQUID_META: &str = r#"{"universe":[{"name":"BTC","szDecimals":5},{"name":"HYPE","szDecimals":2}]}"#;
     /// Aster's `exchangeInfo` in the documented v3 shape, cut to HYPEUSDT.
-    const ASTER_EXCHANGE_INFO: &str = r#"{"timezone":"UTC","serverTime":1790235498000,"rateLimits":[{"rateLimitType":"REQUEST_WEIGHT","interval":"MINUTE","intervalNum":1,"limit":2400},{"rateLimitType":"ORDERS","interval":"MINUTE","intervalNum":1,"limit":1200}],"assets":[],"symbols":[{"symbol":"HYPEUSDT","pair":"HYPEUSDT","contractType":"PERPETUAL","status":"TRADING","baseAsset":"HYPE","quoteAsset":"USDT","marginAsset":"USDT","pricePrecision":3,"quantityPrecision":2,"filters":[{"filterType":"PRICE_FILTER","minPrice":"0.001","maxPrice":"100000","tickSize":"0.001"},{"filterType":"LOT_SIZE","stepSize":"0.01","maxQty":"100000","minQty":"0.01"},{"filterType":"MIN_NOTIONAL","notional":"5"},{"filterType":"PERCENT_PRICE","multiplierUp":"1.0500","multiplierDown":"0.9500","multiplierDecimal":4}],"orderTypes":["LIMIT","MARKET"],"timeInForce":["GTC","IOC","FOK","GTX","HIDDEN"]}]}"#;
+    pub(crate) const ASTER_EXCHANGE_INFO: &str = r#"{"timezone":"UTC","serverTime":1790235498000,"rateLimits":[{"rateLimitType":"REQUEST_WEIGHT","interval":"MINUTE","intervalNum":1,"limit":2400},{"rateLimitType":"ORDERS","interval":"MINUTE","intervalNum":1,"limit":1200}],"assets":[],"symbols":[{"symbol":"HYPEUSDT","pair":"HYPEUSDT","contractType":"PERPETUAL","status":"TRADING","baseAsset":"HYPE","quoteAsset":"USDT","marginAsset":"USDT","pricePrecision":3,"quantityPrecision":2,"filters":[{"filterType":"PRICE_FILTER","minPrice":"0.001","maxPrice":"100000","tickSize":"0.001"},{"filterType":"LOT_SIZE","stepSize":"0.01","maxQty":"100000","minQty":"0.01"},{"filterType":"MIN_NOTIONAL","notional":"5"},{"filterType":"PERCENT_PRICE","multiplierUp":"1.0500","multiplierDown":"0.9500","multiplierDecimal":4}],"orderTypes":["LIMIT","MARKET"],"timeInForce":["GTC","IOC","FOK","GTX","HIDDEN"]}]}"#;
 
     /// Two simulated venues on loopback standing in for mainnet: HYPE quoted 99 / 101 with 5 on
     /// each, 1000 of collateral on each, a few milliseconds away.
@@ -793,8 +820,7 @@ pub(crate) mod tests {
 
     /// The shipped bot.toml with `market` standing in for mainnet, and fast fixed latencies.
     pub(crate) fn shipped_config(market: &World, dir: &Path) -> BotConfig {
-        std::fs::write(dir.join("bot.toml"), include_str!("../../bot.toml")).unwrap();
-        let mut cfg = BotConfig::load(&dir.join("bot.toml")).unwrap();
+        let mut cfg = dry_config(dir);
         let live = &mut cfg.maker.live;
         for (venue, url) in market.pair.into_iter().zip([&market.aster, &market.hedge]) {
             match venue {
@@ -803,6 +829,13 @@ pub(crate) mod tests {
                 Venue::Hyperliquid => live.hyperliquid.base_url = url.clone(),
             }
         }
+        cfg
+    }
+
+    /// The shipped bot.toml with fast fixed latencies.
+    pub(crate) fn dry_config(dir: &Path) -> BotConfig {
+        std::fs::write(dir.join("bot.toml"), include_str!("../../bot.toml")).unwrap();
+        let mut cfg = BotConfig::load(&dir.join("bot.toml")).unwrap();
         let fixed = |ms: f64| Latency::try_from([ms, ms]).unwrap();
         cfg.dry_run = Some(DryRunCfg {
             shift_ms: 300,
@@ -823,6 +856,7 @@ pub(crate) mod tests {
             hyperliquid_rtt_ms: fixed(3.0),
             hyperliquid_feed_ms: fixed(1.0),
             hidden_queue_multiplier: dec!(0.5),
+            replay: None,
         });
         cfg
     }

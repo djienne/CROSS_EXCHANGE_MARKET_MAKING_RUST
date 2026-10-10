@@ -586,87 +586,130 @@ async fn aster_session(url: &str, on: &mut impl FnMut(Wire<'_>)) -> Result<()> {
     }
 }
 
-/// Follows the real Aster streams of `symbols` from `ws_root` into the core and the bot's streams.
-pub async fn aster_upstream(ws_root: String, symbols: Vec<String>, shift_us: i64, hub: Arc<Mutex<Hub>>, inputs: mpsc::UnboundedSender<Input>) {
-    let markets: Vec<String> = symbols.iter().map(|s| s.to_uppercase()).collect();
-    let mut last_us = None;
-    aster_stream(aster_url(&ws_root, &symbols), "dry-run upstream Aster", |wire| match wire {
-        Wire::Text(text) => match aster_frame(text, shift_us) {
+/// One venue's upstream on its way into the core and the bot's streams: what the live connections
+/// and a tape replay (`tape::Replay`) hand each frame and each break to.
+pub struct Upstream {
+    venue: Venue,
+    /// The core's keys of the markets it carries.
+    markets: Vec<String>,
+    shift_us: i64,
+    hub: Arc<Mutex<Hub>>,
+    inputs: mpsc::UnboundedSender<Input>,
+    /// The latest engine time handed on since the last break.
+    last_us: Option<i64>,
+    sequences: HashMap<String, Sequence>,
+    /// Each Lighter market's last settlement: `market_stats` repeats it.
+    settled: HashMap<String, i64>,
+}
+
+impl Upstream {
+    pub fn new(venue: Venue, markets: Vec<String>, shift_us: i64, hub: Arc<Mutex<Hub>>, inputs: mpsc::UnboundedSender<Input>) -> Self {
+        Self { venue, markets, shift_us, hub, inputs, last_us: None, sequences: HashMap::new(), settled: HashMap::new() }
+    }
+
+    fn pass(&mut self, frame: Result<Option<Frame>>) {
+        match frame {
             Ok(Some(frame)) => {
                 // The latest, not the last: an aggTrade's stamp runs ~190 ms behind the books'.
-                last_us = last_us.max(Some(frame.engine_us));
-                forward(frame, &hub, &inputs);
+                self.last_us = self.last_us.max(Some(frame.engine_us));
+                forward(frame, &self.hub, &self.inputs);
             }
             Ok(None) => {}
-            Err(e) => tracing::warn!("dry-run upstream Aster: unreadable frame: {e:#}"),
-        },
-        Wire::Closed => {
-            if let Some(last_us) = last_us.take() {
-                gap(Venue::Aster, &markets, last_us, &hub, &inputs);
+            Err(e) => tracing::warn!("dry-run upstream {:?}: unreadable frame: {e:#}", self.venue),
+        }
+    }
+
+    /// An Aster combined-stream frame.
+    pub fn aster(&mut self, text: &str) {
+        self.pass(aster_frame(text, self.shift_us));
+    }
+
+    /// A Lighter message: funding, or an order book in its sequence. False on a gap in it, which
+    /// needs a fresh snapshot.
+    pub fn lighter(&mut self, text: &str) -> bool {
+        if let Some((market, exch_us, rate)) = lighter_funding(text) {
+            if self.settled.insert(market.clone(), exch_us) != Some(exch_us) {
+                let _ = self.inputs.send(Input::Funding { venue: Venue::Lighter, market, exch_us, rate });
+            }
+            return true;
+        }
+        let frame = match lighter_frame(text, self.shift_us) {
+            Ok(Some(frame)) => frame,
+            other => {
+                self.pass(other);
+                return true;
+            }
+        };
+        let seq = frame.seq.expect("Lighter frames carry their sequence");
+        match self.sequences.entry(frame.market.clone()).or_default().follow(&seq) {
+            BookUpdateContiguity::Apply => self.pass(Ok(Some(frame))),
+            BookUpdateContiguity::SkipStale => {}
+            BookUpdateContiguity::Gap => {
+                // Until the next snapshot every delta is one: warn once.
+                if self.last_us.is_some() {
+                    tracing::warn!("dry-run upstream Lighter: sequence gap on {}", frame.stream);
+                }
+                return false;
             }
         }
+        true
+    }
+
+    /// A Hyperliquid message.
+    pub fn hyperliquid(&mut self, text: &str) {
+        self.pass(hyperliquid_frame(text, self.shift_us));
+    }
+
+    /// The connection ended: the core stops matching its markets until their next snapshot, and
+    /// the bot's streams close.
+    pub fn closed(&mut self) {
+        if let Some(last_us) = self.last_us.take() {
+            gap(self.venue, &self.markets, last_us, &self.hub, &self.inputs);
+        }
+        self.sequences.clear();
+    }
+
+    /// Follows the venue's real feeds under the API `base`, reconnecting forever (and Aster's
+    /// funding estimate).
+    pub fn follow(self, base: &str) {
+        match self.venue {
+            Venue::Aster => {
+                tokio::spawn(aster_funding_poll(base.to_string(), self.markets.clone(), self.inputs.clone()));
+                tokio::spawn(aster_upstream(crate::connectors::aster::ws_root(base), self));
+            }
+            Venue::Lighter => drop(tokio::spawn(lighter_upstream(crate::lighter::ws::stream_url(base), self))),
+            Venue::Hyperliquid => drop(tokio::spawn(hyperliquid_upstream(crate::connectors::hyperliquid::ws_url(base), self))),
+        }
+    }
+}
+
+async fn aster_upstream(ws_root: String, mut up: Upstream) {
+    aster_stream(aster_url(&ws_root, &up.markets), "dry-run upstream Aster", |wire| match wire {
+        Wire::Text(text) => up.aster(text),
+        Wire::Closed => up.closed(),
     })
     .await
 }
 
-/// Follows the real Lighter order books of `markets` (indices) and their funding, reconnecting
-/// forever. A sequence gap drops the connection for a fresh snapshot, as the bot's own client does.
-pub async fn lighter_upstream(url: String, markets: Vec<String>, shift_us: i64, hub: Arc<Mutex<Hub>>, inputs: mpsc::UnboundedSender<Input>) {
-    #[derive(Default)]
-    struct Session {
-        sequences: HashMap<String, Sequence>,
-        last_us: Option<i64>,
-        settled: HashMap<String, i64>,
-    }
-    let channels = markets.iter().flat_map(|m| [format!("order_book/{m}"), format!("market_stats/{m}")]).collect();
+/// The Lighter order books and funding of `up`'s markets (indices). A sequence gap drops the
+/// connection for a fresh snapshot, as the bot's own client does.
+async fn lighter_upstream(url: String, up: Upstream) {
+    let channels = up.markets.iter().flat_map(|m| [format!("order_book/{m}"), format!("market_stats/{m}")]).collect();
     let mut opts = SubscribeOptions::new(&url, "dry-run upstream Lighter", channels);
     opts.reconnect_base = 0.5;
     opts.reconnect_max = UPSTREAM_BACKOFF_MAX.as_secs_f64();
     let reconnect = Arc::new(Notify::new());
-    let session = Arc::new(Mutex::new(Session::default()));
-    let (on_gap, closing) = (reconnect.clone(), session.clone());
-    let (hub_on_close, inputs_on_close) = (hub.clone(), inputs.clone());
+    let up = Arc::new(Mutex::new(up));
+    let (on_gap, closing) = (reconnect.clone(), up.clone());
     subscribe_loop(
         opts,
         Some(reconnect),
         move |msg: &LighterFrame<'_>| {
-            let mut st = session.lock().expect("upstream state poisoned");
-            if msg.msg_type.as_deref().is_some_and(|t| t.ends_with("market_stats")) {
-                if let Some((market, exch_us, rate)) = lighter_funding(msg.raw) {
-                    if st.settled.insert(market.clone(), exch_us) != Some(exch_us) {
-                        let _ = inputs.send(Input::Funding { venue: Venue::Lighter, market, exch_us, rate });
-                    }
-                }
-                return;
-            }
-            let frame = match lighter_frame(msg.raw, shift_us) {
-                Ok(Some(frame)) => frame,
-                Ok(None) => return,
-                Err(e) => {
-                    tracing::warn!("dry-run upstream Lighter: unreadable frame: {e:#}");
-                    return;
-                }
-            };
-            let seq = frame.seq.expect("Lighter frames carry their sequence");
-            match st.sequences.entry(frame.market.clone()).or_default().follow(&seq) {
-                BookUpdateContiguity::Apply => {
-                    st.last_us = Some(frame.engine_us);
-                    forward(frame, &hub, &inputs);
-                }
-                BookUpdateContiguity::SkipStale => {}
-                BookUpdateContiguity::Gap => {
-                    tracing::warn!("dry-run upstream Lighter: sequence gap on {}; resubscribing", frame.stream);
-                    on_gap.notify_one();
-                }
+            if !up.lock().expect("upstream state poisoned").lighter(msg.raw) {
+                on_gap.notify_one();
             }
         },
-        move || {
-            let mut st = closing.lock().expect("upstream state poisoned");
-            if let Some(last_us) = st.last_us.take() {
-                gap(Venue::Lighter, &markets, last_us, &hub_on_close, &inputs_on_close);
-            }
-            st.sequences.clear();
-        },
+        move || closing.lock().expect("upstream state poisoned").closed(),
     )
     .await;
 }
@@ -674,21 +717,17 @@ pub async fn lighter_upstream(url: String, markets: Vec<String>, shift_us: i64, 
 /// Hyperliquid closes a connection that sent nothing for 60 s; its ping is an app message.
 const HYPERLIQUID_PING: Duration = Duration::from_secs(20);
 
-/// Follows the real Hyperliquid `l2Book` and `bbo` of `coins` into the core and the bot's streams,
-/// reconnecting forever. Ponytail: no funding, so a simulated Hyperliquid position pays none
+/// The Hyperliquid `l2Book` and `bbo` of `up`'s coins. Ponytail: no funding, so a simulated Hyperliquid position pays none
 /// (hourly on the venue; about $0.001 an hour on a $60 hedge at 11 % a year). Add it from
 /// `activeAssetCtx` if positions grow.
-pub async fn hyperliquid_upstream(ws_url: String, coins: Vec<String>, shift_us: i64, hub: Arc<Mutex<Hub>>, inputs: mpsc::UnboundedSender<Input>) {
+async fn hyperliquid_upstream(ws_url: String, mut up: Upstream) {
     let mut backoff = Duration::from_secs(1);
     loop {
         let started = Instant::now();
-        let mut last_us = None;
-        if let Err(e) = hyperliquid_session(&ws_url, &coins, shift_us, &hub, &inputs, &mut last_us).await {
+        if let Err(e) = hyperliquid_session(&ws_url, &mut up).await {
             tracing::warn!("dry-run upstream Hyperliquid: {e:#}");
         }
-        if let Some(last_us) = last_us {
-            gap(Venue::Hyperliquid, &coins, last_us, &hub, &inputs);
-        }
+        up.closed();
         if started.elapsed() >= Duration::from_secs(60) {
             backoff = Duration::from_secs(1);
         }
@@ -697,17 +736,10 @@ pub async fn hyperliquid_upstream(ws_url: String, coins: Vec<String>, shift_us: 
     }
 }
 
-async fn hyperliquid_session(
-    url: &str,
-    coins: &[String],
-    shift_us: i64,
-    hub: &Mutex<Hub>,
-    inputs: &mpsc::UnboundedSender<Input>,
-    last_us: &mut Option<i64>,
-) -> Result<()> {
+async fn hyperliquid_session(url: &str, up: &mut Upstream) -> Result<()> {
     let (ws, _) = tokio_tungstenite::connect_async(url).await.context("connect")?;
     let (mut write, mut read) = ws.split();
-    for coin in coins {
+    for coin in &up.markets {
         for subscription in crate::connectors::hyperliquid::subscriptions(coin) {
             let subscribe = json!({"method": "subscribe", "subscription": subscription});
             crate::connectors::send_guarded(&mut write, Message::Text(subscribe.to_string())).await?;
@@ -720,14 +752,7 @@ async fn hyperliquid_session(
             msg = read.next() => {
                 deadline = tokio::time::Instant::now() + UPSTREAM_IDLE;
                 match msg.context("the upstream closed")?? {
-                    Message::Text(text) => match hyperliquid_frame(&text, shift_us) {
-                        Ok(Some(frame)) => {
-                            *last_us = (*last_us).max(Some(frame.engine_us));
-                            forward(frame, hub, inputs);
-                        }
-                        Ok(None) => {}
-                        Err(e) => tracing::warn!("dry-run upstream Hyperliquid: unreadable frame: {e:#}"),
-                    },
+                    Message::Text(text) => up.hyperliquid(&text),
                     Message::Ping(p) => crate::connectors::send_guarded(&mut write, Message::Pong(p)).await?,
                     Message::Close(_) => return Ok(()),
                     _ => {}
@@ -760,19 +785,23 @@ pub async fn aster_premium_poll(rest_base: String, symbols: Vec<String>, label: 
     }
 }
 
-/// Hands the core each Aster symbol's next settlement and its estimated rate, forever.
-pub async fn aster_funding_poll(rest_base: String, symbols: Vec<String>, inputs: mpsc::UnboundedSender<Input>) {
-    aster_premium_poll(rest_base, symbols, "dry-run funding poll", |body| match aster_funding(body) {
+/// Hands the core an Aster `premiumIndex` response: its symbol's next settlement and estimated rate.
+pub fn aster_premium(body: &str, inputs: &mpsc::UnboundedSender<Input>) {
+    match aster_funding(body) {
         Ok((market, exch_us, rate)) => {
             let _ = inputs.send(Input::Funding { venue: Venue::Aster, market, exch_us, rate });
         }
-        Err(e) => tracing::warn!("dry-run funding poll: {e:#}"),
-    })
-    .await
+        Err(e) => tracing::warn!("dry-run funding: {e:#}"),
+    }
+}
+
+/// Hands the core each Aster symbol's next settlement and its estimated rate, forever.
+async fn aster_funding_poll(rest_base: String, symbols: Vec<String>, inputs: mpsc::UnboundedSender<Input>) {
+    aster_premium_poll(rest_base, symbols, "dry-run funding poll", |body| aster_premium(body, &inputs)).await
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use futures_util::SinkExt;
     use rust_decimal_macros::dec;
@@ -811,7 +840,8 @@ mod tests {
     }
 
     /// A Lighter order-book message in the venue's shape (a snapshot's `begin_nonce` is 0).
-    fn lighter(kind: &str, begin: i64, nonce: i64, publish_ms: i64, bids: &str, asks: &str) -> String {
+    /// A Lighter `order_book` message, `subscribed` or `update`, published at `publish_ms`.
+    pub(crate) fn lighter(kind: &str, begin: i64, nonce: i64, publish_ms: i64, bids: &str, asks: &str) -> String {
         let offset = nonce * 10;
         let engine = publish_ms * 1_000 - 11_400;
         format!(
@@ -976,7 +1006,7 @@ mod tests {
         let url = fake_lighter(vec![snap, delta, LIGHTER_STATS.into(), LIGHTER_STATS.into()], vec![gapped], wait).await;
         let hub = Arc::new(Mutex::new(Hub::new(SHIFT_MS * 1_000, ["order_book/24".to_string()])));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(lighter_upstream(url, vec!["24".into()], SHIFT_MS * 1_000, hub.clone(), tx));
+        let task = tokio::spawn(lighter_upstream(url, Upstream::new(Venue::Lighter, vec!["24".into()], SHIFT_MS * 1_000, hub.clone(), tx)));
 
         let mut exch = Vec::new();
         while exch.len() < 2 {

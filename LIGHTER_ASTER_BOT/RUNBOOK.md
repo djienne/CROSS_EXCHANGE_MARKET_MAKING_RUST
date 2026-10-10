@@ -261,14 +261,14 @@ Windows bind mount as mode 777: on this host, put `XEMM_ENV_MODE_CHECK=off` in t
 ## Market data tape
 
 The `recorder` service (container `lighter-aster-recorder`, `record --market HYPE`) records
-HYPE's Aster/Lighter public feeds for later replay. `record` currently supports only this venue combination:
+HYPE's Aster/Lighter public feeds for [backtests](#backtest). `record` currently supports only this venue combination:
 
 - **Aster:** `depth20@100ms` (20 levels), `bookTicker` and `aggTrade`.
 - **Lighter:** `order_book` (a snapshot, then deltas: the whole book), `trade` and `market_stats`.
 - **REST:** Aster `premiumIndex` every minute; `exchangeInfo` and `orderBooks` hourly.
 
-Every line carries its arrival time on this host, so a replay can reproduce the feed latency
-the dry run saw. The recorder is its own process, so the bot never waits on it. Rebuilding the
+Every line carries its arrival time on this host beside the venues' own stamps, so the tape
+holds this host's feed latency too. The recorder is its own process, so the bot never waits on it. Rebuilding the
 dry run does not interrupt it; `docker compose up -d --build recorder` restarts it.
 
 **Files.** `data/HYPE/<YYYY-MM-DD>T<HHMMSS>Z.tape.zst`, one per UTC day and per recorder start,
@@ -279,6 +279,37 @@ kinds listed in `src/dryrun/tape.rs`. Read a day with `zstd -dc data/HYPE/<day>T
   connection and subscription time add to the recovery delay.
 - Aster has no order-book history to download again, and the fleet backup skips files over
   100 MB (MAKE_BACKUP.py), so copy the tapes elsewhere if they must survive a disk loss.
+
+## Backtest
+
+`replay` is the dry run fed by the tape instead of the live market: the same bot, simulator and
+`[dry_run]` latency model, with the world shifted by the days since `--from`. Each line goes in
+2 minutes ahead of its venue time (the tape's worst feed stalls were 75 s), so this host's stalls
+on the day do not reach the bot. The `replay` service has no network at all and no credentials.
+
+```bash
+docker compose run -d --name replay-0928 replay replay --market HYPE --from 2026-09-28T00:00:00Z --until 2026-09-29T00:00:00Z
+docker logs -f replay-0928
+python ../dryrun_summary.py --runs LIGHTER_ASTER_BOT/runs/replay/HYPE-20260928T000000Z-20260929T000000Z
+```
+
+- **Pace.** It runs at the market's own pace (a day takes a day, after ~2 minutes of warm-up),
+  at ~30 MB and a few % of a core; windows run side by side on free ports. Its start reads the
+  tape up to `--from` and replays the Lighter book from its last snapshot (2026-09-28 06:00: 9.7
+  hours of updates, a minute). It ends by itself: the bot drains once its clock passes `--until`
+  while the tape keeps feeding, or once the tape ends, two minutes of market ahead of the bot.
+- **Files.** Each window gets a new `runs/replay/<M>-<from>-<until>/` (an existing one is
+  refused): no simulated account, latch or deadman carries over. `replay.json` holds the
+  window, shift, tape files and gate seed; the bot's files are in its `dry-run/`.
+- **Gate.** The entry gate starts from the live dry run's samples of the 72 h before `--from`
+  (`runs/dry-run/opportunities_<M>.jsonl`, read-only); below 50 the taker stays in warm-up. The
+  live sampler was frozen 2026-10-02 to 10-09, so replay that week as one window, not per day.
+- **Limits.** HYPE Aster-Lighter only: the tape has no Hyperliquid. A recorder restart without
+  `A-`/`L-` freezes the feeds (the replay warns about silences over 30 s), and a Lighter sequence
+  break (a dropped line) closes the book until the next snapshot, which the tape has only after a
+  reconnect. The simulator's `lag_ms` and the first window's `late_frames` measure the shift and
+  the catch-up, not feed health. Latencies are drawn with the seed but the bot runs on this
+  host's scheduler, so two runs of a window differ: compare them as distributions.
 
 ## Runtime files (`runs/`)
 

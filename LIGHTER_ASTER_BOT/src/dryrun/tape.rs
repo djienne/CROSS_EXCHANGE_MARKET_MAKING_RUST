@@ -1,5 +1,5 @@
-//! The market-data tape: one Aster/Lighter market's raw public feeds,
-//! recorded by `record` for backtests. A file per UTC day and per recorder start,
+//! The market-data tape: one Aster/Lighter market's raw public feeds, recorded by `record` and
+//! replayed by `replay` (a backtest: [`Replay`]). A file per UTC day and per recorder start,
 //! `<dir>/<MARKET>/<YYYY-MM-DD>T<HHMMSS>Z.tape.zst` after its first line's arrival (UTC), of
 //! tab-separated lines `<arrival µs since the epoch>\t<kind>\t<payload>`:
 //!
@@ -30,11 +30,12 @@ use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryS
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::clock::wall_us;
-use super::feed::{self, Wire};
+use super::feed::{self, Input, Upstream, Wire};
 use crate::lighter::messages::OrderBooksResponse;
 use crate::lighter::ws::{stream_url, subscribe_loop, SubscribeOptions};
 
@@ -137,17 +138,163 @@ fn flush(dir: &Path, file: Option<&str>, buffer: &mut Vec<u8>) -> Result<()> {
 }
 
 /// A tape file's lines as (arrival µs, kind, payload). A frame cut short ends it.
-pub fn read(path: &Path) -> Result<Vec<(i64, String, String)>> {
-    let mut lines = Vec::new();
-    for line in BufReader::new(zstd::stream::read::Decoder::new(File::open(path)?)?).lines() {
-        let Ok(line) = line else { break };
+pub fn lines(path: &Path) -> Result<impl Iterator<Item = Result<(i64, String, String)>>> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let path = path.to_path_buf();
+    let lines = BufReader::new(zstd::stream::read::Decoder::new(file)?).lines().map_while(Result::ok);
+    Ok(lines.enumerate().map(move |(n, line)| {
         let mut parts = line.splitn(3, '\t');
         let (Some(at), Some(kind), Some(payload)) = (parts.next(), parts.next(), parts.next()) else {
-            return Err(anyhow!("{}: malformed line {}", path.display(), lines.len() + 1));
+            return Err(anyhow!("{}: malformed line {}", path.display(), n + 1));
         };
-        lines.push((at.parse()?, kind.to_string(), payload.to_string()));
+        Ok((at.parse()?, kind.to_string(), payload.to_string()))
+    }))
+}
+
+/// How far ahead of its arrival on the shifted clock a replay feeds each line: more than the worst
+/// feed lag the tape recorded (2026-10-10: Aster 75 s, Lighter 59 s), so a frame reaches the
+/// simulator before its venue time and this host's stalls vanish.
+pub const LEAD_US: i64 = 120_000_000;
+/// Nothing on the tape for this long (the recorder down, or a longer stall) freezes the bot's feeds.
+const SILENCE_US: i64 = 30_000_000;
+/// A Lighter connection starts with its book whole.
+const SNAPSHOT: &str = "\"subscribed/order_book\"";
+
+/// A replay of a market's tape from `from_us` to `until_us` (µs, venue time): a dry run whose
+/// world is the tape's, shifted by the days since. Ponytail: it runs at the market's own pace;
+/// a faster one would need every clock the bot reads to follow one virtual clock.
+#[derive(Debug, Clone)]
+pub struct Replay {
+    /// The files to read, in order: the first from the line of the last Lighter snapshot at or
+    /// before `from_us`.
+    pub files: Vec<PathBuf>,
+    first_line: usize,
+    pub from_us: i64,
+    pub until_us: i64,
+    pub lead_us: i64,
+    /// The Aster `exchangeInfo` and Lighter `orderBooks` recorded last by `from_us`.
+    pub specs: [String; 2],
+    /// Cancelled once the bot's clock passes `until_us` or the tape ends: the bot drains.
+    pub stop: CancellationToken,
+}
+
+impl Replay {
+    /// Finds where in `dir` (`data/<MARKET>`) a replay from `from_us` starts.
+    pub fn open(dir: &Path, from_us: i64, until_us: i64, lead_us: i64, stop: CancellationToken) -> Result<Self> {
+        ensure!(from_us < until_us, "--from must come before --until");
+        let start_of = |path: &Path| {
+            let name = path.file_name()?.to_str()?.strip_suffix(".tape.zst")?;
+            Some(chrono::NaiveDateTime::parse_from_str(name, "%Y-%m-%dT%H%M%SZ").ok()?.and_utc().timestamp_micros())
+        };
+        let mut files: Vec<(i64, PathBuf)> = std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter_map(|path| Some((start_of(&path)?, path)))
+            // A file is named after its first line: one started after `until_us` is not needed.
+            .filter(|(start, _)| *start <= until_us)
+            .collect();
+        files.sort();
+        let last = files.iter().rposition(|(start, _)| *start <= from_us).with_context(|| format!("no tape in {} starts by --from", dir.display()))?;
+        let (mut snapshot, mut specs) = (None, [None, None]);
+        for i in (0..=last).rev() {
+            let (mut found, mut listed) = (None, [None, None]);
+            for (n, line) in lines(&files[i].1)?.enumerate() {
+                let (at, kind, payload) = line?;
+                if at > from_us {
+                    break;
+                }
+                match kind.as_str() {
+                    "L" if payload.contains(SNAPSHOT) => found = Some((i, n)),
+                    "X" => listed[0] = Some(payload),
+                    "O" => listed[1] = Some(payload),
+                    _ => {}
+                }
+            }
+            snapshot = snapshot.or(found);
+            for (spec, line) in specs.iter_mut().zip(listed) {
+                *spec = spec.take().or(line);
+            }
+            if snapshot.is_some() && specs.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        let (Some((first, first_line)), [Some(aster), Some(lighter)]) = (snapshot, specs) else {
+            bail!("the tape in {} has no Lighter snapshot or no listings by --from", dir.display());
+        };
+        let files = files.into_iter().skip(first).map(|(_, path)| path).collect();
+        Ok(Self { files, first_line, from_us, until_us, lead_us, specs: [aster, lighter], stop })
     }
-    Ok(lines)
+
+    /// Feeds the tape to the venues' upstreams on a thread of its own: the Lighter book from its
+    /// snapshot at once, then each line `lead_us` before its arrival on the clock shifted by
+    /// `shift_us`. The receiver resolves when the tape reaches `from_us`, before any bot
+    /// connection follows the feed (the catch-up burst would overflow it). The feed goes on after
+    /// `stop`, so the drain still meets a market.
+    pub fn spawn(&self, shift_us: i64, mut aster: Upstream, mut lighter: Upstream, inputs: mpsc::UnboundedSender<Input>) -> Result<oneshot::Receiver<()>> {
+        let (caught_up, rx) = oneshot::channel();
+        let replay = self.clone();
+        std::thread::Builder::new().name("replay".into()).spawn(move || {
+            if let Err(e) = replay.run(shift_us, &mut aster, &mut lighter, &inputs, caught_up) {
+                tracing::error!("replay: {e:#}");
+            }
+            replay.stop.cancel();
+        })?;
+        Ok(rx)
+    }
+
+    fn run(&self, shift_us: i64, aster: &mut Upstream, lighter: &mut Upstream, inputs: &mpsc::UnboundedSender<Input>, caught_up: oneshot::Sender<()>) -> Result<()> {
+        let (mut caught_up, mut last) = (Some(caught_up), self.from_us);
+        for (i, file) in self.files.iter().enumerate() {
+            for line in lines(file)?.skip(if i == 0 { self.first_line } else { 0 }) {
+                let (at, kind, payload) = line?;
+                if inputs.is_closed() {
+                    return Ok(());
+                }
+                if at >= self.from_us {
+                    if let Some(tx) = caught_up.take() {
+                        let _ = tx.send(());
+                    }
+                    if at - last > SILENCE_US {
+                        tracing::warn!("replay: nothing on the tape for {} s before {}", (at - last) / 1_000_000, time(at));
+                    }
+                    last = last.max(at);
+                    let wait = at + shift_us - self.lead_us - wall_us();
+                    if wait > 0 {
+                        std::thread::sleep(Duration::from_micros(wait as u64));
+                    }
+                    if at - self.lead_us >= self.until_us && !self.stop.is_cancelled() {
+                        tracing::info!("replay: the bot's clock passed --until; draining");
+                        self.stop.cancel();
+                    }
+                } else if !kind.starts_with('L') {
+                    // Before `from_us` only the Lighter book matters: Aster's streams are whole.
+                    continue;
+                }
+                match kind.as_str() {
+                    "A" => aster.aster(&payload),
+                    "A-" => aster.closed(),
+                    "L" => {
+                        // A snapshot starts a connection: a recorder restart ends the last one unmarked.
+                        if payload.contains(SNAPSHOT) {
+                            lighter.closed();
+                        }
+                        if !lighter.lighter(&payload) {
+                            lighter.closed();
+                        }
+                    }
+                    "L-" => lighter.closed(),
+                    "F" => feed::aster_premium(&payload, inputs),
+                    _ => {}
+                }
+            }
+        }
+        ensure!(caught_up.is_none(), "the tape ends before --from");
+        tracing::warn!("replay: the tape ends at {}", time(last));
+        Ok(())
+    }
+}
+
+fn time(us: i64) -> String {
+    chrono::DateTime::from_timestamp_micros(us).map_or_else(|| us.to_string(), |t| t.to_rfc3339())
 }
 
 /// `record`: tapes `market`'s public feeds from the venues in `config` into `dir` until a stop
@@ -236,8 +383,79 @@ pub async fn record(config: &Path, market: &str, dir: PathBuf, stop: Cancellatio
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+    use crate::dryrun::feed::{tests::lighter, Hub};
+    use crate::dryrun::matching::{FeedEvent, Venue};
+
+    /// An Aster depth20 frame arriving at `at_ms`, 20 ms after its engine stamp.
+    pub(crate) fn aster_depth(at_ms: i64, bid: &str, ask: &str) -> String {
+        let t = at_ms - 20;
+        format!(r#"{{"stream":"hypeusdt@depth20@100ms","data":{{"e":"depthUpdate","E":{t},"T":{t},"s":"HYPEUSDT","U":1,"u":2,"pu":0,"b":[["{bid}","5"]],"a":[["{ask}","5"]]}}}}"#)
+    }
+
+    /// Tapes `lines` (arrival ms, kind, payload) into `dir/HYPE` as the recorder does.
+    pub(crate) fn write_tape(dir: &Path, lines: &[(i64, &'static str, String)]) {
+        let (tape, writer) = Tape::open(dir, "HYPE").unwrap();
+        for (at_ms, kind, payload) in lines {
+            tape.record_at(at_ms * 1_000, kind, payload);
+        }
+        tape.stop();
+        writer.join().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_replay_starts_at_the_lighter_snapshot_paces_the_tape_ahead_and_stops_past_until() {
+        let dir = crate::dryrun::tests::temp_dir("replay");
+        let t0 = wall_us() / 1_000 - 60_000;
+        let (top, delta) = (|at| lighter("subscribed", 0, 10, at, r#"[{"price":"99","size":"5"}]"#, r#"[{"price":"101","size":"5"}]"#), |n, at| lighter("update", n, n + 1, at, "[]", "[]"));
+        write_tape(&dir, &[
+            (t0 - 5_000, "X", "{}".into()),
+            (t0 - 4_000, "O", "{}".into()),
+            (t0 - 3_000, "L", top(t0 - 3_000)),
+            (t0 - 2_000, "L", top(t0 - 2_000)),
+            (t0 - 1_000, "L", delta(10, t0 - 1_000)),
+            (t0 - 500, "A", aster_depth(t0 - 500, "99", "101")),
+            (t0 + 100, "A", aster_depth(t0 + 100, "99", "101")),
+            (t0 + 200, "L", delta(12, t0 + 200)),
+            (t0 + 300, "L", delta(13, t0 + 300)),
+            (t0 + 400, "L", top(t0 + 400)),
+            (t0 + 900, "A", aster_depth(t0 + 900, "99", "101")),
+            (t0 + 2_000, "A-", String::new()),
+        ]);
+        let (stop, lead) = (CancellationToken::new(), 300_000);
+        let replay = Replay::open(&dir.join("HYPE"), t0 * 1_000, (t0 + 500) * 1_000, lead, stop.clone()).unwrap();
+        let shift = wall_us() - t0 * 1_000 + lead;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let up = |venue, market: &str, stream: &str| Upstream::new(venue, vec![market.into()], shift, Arc::new(Mutex::new(Hub::new(shift, [stream.to_string()]))), tx.clone());
+        let (aster, book) = (up(Venue::Aster, "HYPEUSDT", "hypeusdt@depth20@100ms"), up(Venue::Lighter, "24", "order_book/24"));
+        replay.spawn(shift, aster, book, tx).unwrap().await.expect("caught up");
+        // The thread drops the senders at the end of the tape.
+        let mut seen = Vec::new();
+        while let Some(Input::Frame { venue, exch_us, event, .. }) = rx.recv().await {
+            // Ahead of its time on the shifted clock, for a frame from `from` on (a gap carries the time of the frame before it).
+            let gap = matches!(event, FeedEvent::Gap);
+            let ahead = gap || exch_us < t0 * 1_000 || wall_us() < exch_us + shift;
+            seen.push((venue, exch_us, gap, ahead, stop.is_cancelled()));
+        }
+        let (lighter_us, aster_us) = (|at: i64| at * 1_000 - 11_400, |at: i64| (at - 20) * 1_000);
+        assert_eq!(seen, [
+            // The last snapshot by `from` and what follows it, at once; no Aster before `from`.
+            (Venue::Lighter, lighter_us(t0 - 2_000), false, true, false),
+            (Venue::Lighter, lighter_us(t0 - 1_000), false, true, false),
+            // Then each frame ahead of its time.
+            (Venue::Aster, aster_us(t0 + 100), false, true, false),
+            // A break in the sequence closes the book once, until the next snapshot.
+            (Venue::Lighter, lighter_us(t0 - 1_000) + 1, true, true, false),
+            (Venue::Lighter, lighter_us(t0 + 400), false, true, false),
+            // The bot's clock (a lead behind) passed --until: the bot drains, the feed goes on.
+            (Venue::Aster, aster_us(t0 + 900), false, true, true),
+            (Venue::Aster, aster_us(t0 + 900) + 1, true, true, true),
+        ]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_new_utc_day_or_a_restart_starts_a_file() {
@@ -258,8 +476,15 @@ mod tests {
         let mut names: Vec<_> = std::fs::read_dir(&files).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         names.sort();
         assert_eq!(names, ["2026-09-24T235959Z.tape.zst", "2026-09-25T000000Z.tape.zst", "2026-09-25T000101Z.tape.zst"]);
-        assert_eq!(read(&files.join(&names[0])).unwrap(), vec![(day - 1, "A".into(), r#"{"stream":"x"}"#.into())]);
-        assert_eq!(read(&files.join(&names[1])).unwrap(), vec![(day, "L".into(), "{\"a\": 1}".into()), (day + 1, "L-".into(), String::new())]);
-        assert_eq!(read(&files.join(&names[2])).unwrap(), vec![(day + 61_000_000, "A-".into(), String::new())]);
+        let read = |name: &str| lines(&files.join(name)).unwrap().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(read(&names[0]), vec![(day - 1, "A".into(), r#"{"stream":"x"}"#.into())]);
+        assert_eq!(read(&names[1]), vec![(day, "L".into(), "{\"a\": 1}".into()), (day + 1, "L-".into(), String::new())]);
+        // A frame cut short ends its file.
+        let path = files.join(&names[2]);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(&zstd::bulk::compress(b"1\tA\t{}\n", LEVEL).unwrap()[..9]);
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(read(&names[2]), vec![(day + 61_000_000, "A-".into(), String::new())]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

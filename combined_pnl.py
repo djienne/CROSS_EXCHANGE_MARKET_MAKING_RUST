@@ -472,6 +472,7 @@ def parse_args() -> argparse.Namespace:
     stack_root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="Combined execution economics report for taker arb + XEMM.")
     parser.add_argument("--dry-run", action="store_true", help="Report the dry run (LIGHTER_ASTER_BOT/runs/dry-run/) instead of live.")
+    parser.add_argument("--runs", type=Path, default=None, help="Read this runs directory (a replay's: runs/replay/<run>/dry-run, with --dry-run) instead.")
     parser.add_argument("--since", default=None, help=f"UTC/RFC3339 start time. Default: {DEFAULT_SINCE}; with --dry-run, the dry run's first start.")
     parser.add_argument("--now", default=None, help="Override report end time. Defaults to current UTC time.")
     parser.add_argument("--market", default="HYPE")
@@ -488,7 +489,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--bot-state", "--orchestrator-state", dest="orchestrator_state", type=Path, default=None, help="Controller state file. Default: `run`'s, else the retired orchestrator's.")
     args = parser.parse_args()
-    roots = report_roots(stack_root, args.dry_run)
+    roots = (args.runs, args.runs) if args.runs else report_roots(stack_root, args.dry_run)
     legacy_runs, bot_runs = roots
     args.since = args.since or default_since(bot_runs, args.market, args.dry_run)
     explicit_xemm_journals = bool(args.xemm_journal)
