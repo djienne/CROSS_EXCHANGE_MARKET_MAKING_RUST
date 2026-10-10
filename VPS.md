@@ -11,7 +11,17 @@
 | Output | `/root/xemm/LIGHTER_ASTER_BOT/runs/dry-run/` |
 
 Only the dry run runs here: no recorder tape and no other bulk data collection. `runs/dry-run`
-grows ~40 MB/day for HYPE (mostly the journal); journald is capped at 200 MB.
+grows ~37 MB/day for HYPE (2026-10-10: journal 26, book sanity 7.5, diagnostics 2, equity 1.5).
+Disk stays bounded, all set up by `sync`:
+
+- The daily timer `xemm-dryrun-archive` (03:30 UTC) acts once those four logs pass 1 GB (about
+  monthly). It stops the dry run, moves them to `runs/archive/<UTC time>/`, restarts the dry run
+  and gzips them (~10x smaller, ~4 MB/day: years of the 25 GB disk). Nothing is deleted. The bot
+  appends to these logs and never reads them back, so they move only while it is stopped.
+- journald is capped at 200 MB, and the cargo build dir at 3 GB (a clean rebuild past that).
+- The apt cache is cleared.
+
+`/usr/local/sbin/xemm-dryrun-archive 1` archives now (the argument is the threshold in MB).
 
 ## Sync after code changes
 

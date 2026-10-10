@@ -2,13 +2,15 @@
 
   python vps.py sync      # upload tracked files (working tree), build, (re)start the dry run
   python vps.py latency   # TCP-connect and HTTPS round trips to the venues, from the VPS
-  python vps.py status    # service state, memory, disk
+  python vps.py status    # service state, memory, disk, runs/ and archive size
   python vps.py logs [N]  # last N journal lines (default 50)
 
 Only git-tracked files of LIGHTER_ASTER_BOT go up (uncommitted edits included, untracked files
 and *.env never), so no credentials or runs/ leave this machine. The VPS runs the dry run only:
-no recorder, no tape. Ponytail: files deleted locally stay on the VPS; if that ever matters, wipe
-~/xemm/LIGHTER_ASTER_BOT/src before extracting.
+no recorder, no tape. Disk stays bounded: journald 200 MB, the build dir <= 3 GB, and a daily
+timer gzips the dry run's growing logs into runs/archive (~10x smaller) past 1 GB. Ponytail:
+files deleted locally stay on the VPS; if that ever matters, wipe ~/xemm/LIGHTER_ASTER_BOT/src
+before extracting.
 """
 import io
 import subprocess
@@ -40,6 +42,46 @@ MemoryMax=512M
 
 [Install]
 WantedBy=multi-user.target
+"""
+
+# The dry run's append-only logs (~37 MB/day for HYPE, mostly the journal). The bot appends to them
+# without reopening and reads none back at startup (the risk monitor starts at the session start),
+# so they move only while it is stopped: copy-and-truncate could drop a line written in between,
+# such as a fill. Runs daily; acts only past 1 GB of logs (or the MB given as its argument), about
+# monthly, at the cost of one restart (drain, then the shift's warm-up). The archive grows
+# ~4 MB/day, which the 25 GB disk holds for years; nothing is deleted.
+ARCHIVE = f"""#!/bin/sh
+set -eu
+cd /root/xemm/LIGHTER_ASTER_BOT/runs/dry-run
+LOGS="bot-*-journal.jsonl book_sanity_*.jsonl bot-*.equity.jsonl sim-*.diag.jsonl"
+used=$(du -cm $LOGS 2>/dev/null | tail -1 | cut -f1)
+[ "$used" -ge "${{1:-1024}}" ] || exit 0
+dest=../archive/$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$dest"
+systemctl stop {SERVICE}
+for f in $LOGS; do if [ -f "$f" ]; then mv "$f" "$dest/"; fi; done
+systemctl start {SERVICE}
+nice gzip -9 "$dest"/*
+echo "archived $used MB of logs to $dest"
+"""
+
+ARCHIVE_SERVICE = f"""[Unit]
+Description=Archive the XEMM dry run's logs
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/{SERVICE}-archive
+"""
+
+ARCHIVE_TIMER = """[Unit]
+Description=Archive the XEMM dry run's logs past 1 GB
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
 """
 
 LATENCY = r'''
@@ -89,11 +131,21 @@ def tracked_tar():
 
 def sync():
     ssh("mkdir -p ~/xemm && tar -x -C ~/xemm", stdin=tracked_tar())
+    # Ponytail: cargo never drops artifacts that a toolchain or dependency update orphans; past
+    # 3 GB start clean (a full build takes ~30 min on the 1 CPU). The apt cache is not needed.
+    ssh(f"apt-get clean; cd {REMOTE} && [ $(du -sm target 2>/dev/null | cut -f1) -lt 3072 ]"
+        " || (. ~/.cargo/env && cargo clean --release)")
     # One job: the VPS has 1 CPU and ~1 GB RAM (plus 4 GB swap for the thin-LTO link).
     ssh(f". ~/.cargo/env && cd {REMOTE} && CARGO_BUILD_JOBS=1 cargo build --release")
     # The bot logs to stdout -> journald; cap it so the small disk only grows by runs/dry-run.
     ssh("mkdir -p /etc/systemd/journald.conf.d && printf '[Journal]\\nSystemMaxUse=200M\\n'"
         " > /etc/systemd/journald.conf.d/size.conf && systemctl restart systemd-journald")
+    for path, text in ((f"/usr/local/sbin/{SERVICE}-archive", ARCHIVE),
+                       (f"/etc/systemd/system/{SERVICE}-archive.service", ARCHIVE_SERVICE),
+                       (f"/etc/systemd/system/{SERVICE}-archive.timer", ARCHIVE_TIMER)):
+        ssh(f"cat > {path} <<'EOF'\n{text}EOF")
+    ssh(f"chmod 755 /usr/local/sbin/{SERVICE}-archive && systemctl daemon-reload"
+        f" && systemctl enable -q --now {SERVICE}-archive.timer")
     ssh(f"cat > /etc/systemd/system/{SERVICE}.service <<'EOF'\n{UNIT}EOF\n"
         f"systemctl daemon-reload && systemctl enable -q {SERVICE} && systemctl restart {SERVICE}"
         f" && sleep 5 && systemctl --no-pager status {SERVICE} | head -5")
@@ -106,7 +158,8 @@ def main():
     elif cmd == "latency":
         ssh("python3 -", stdin=LATENCY.encode())
     elif cmd == "status":
-        ssh(f"systemctl --no-pager status {SERVICE} | head -12; free -h; df -h /; du -sh {REMOTE}/runs; true")
+        ssh(f"systemctl --no-pager status {SERVICE} | head -12; free -h; df -h /; du -sh {REMOTE}/runs/*; "
+            f"systemctl list-timers {SERVICE}-archive.timer --no-pager | head -2; true")
     elif cmd == "logs":
         n = sys.argv[2] if len(sys.argv) > 2 else "50"
         ssh(f"journalctl -u {SERVICE} --no-pager -n {int(n)}")
