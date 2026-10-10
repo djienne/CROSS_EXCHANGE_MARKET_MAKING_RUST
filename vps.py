@@ -4,6 +4,8 @@
   python vps.py latency   # TCP-connect and HTTPS round trips to the venues, from the VPS
   python vps.py status    # service state, memory, disk, runs/ and archive size
   python vps.py logs [N]  # last N journal lines (default 50)
+  python vps.py screener  # upload, build and run the pair screener's collector for 3 days
+  python vps.py screener-pull  # copy its data files to SCREENER/data-tokyo/
 
 Only git-tracked files of LIGHTER_ASTER_BOT go up (uncommitted edits included, untracked files
 and *.env never), so no credentials or runs/ leave this machine. The VPS runs the dry run only:
@@ -11,6 +13,10 @@ no recorder, no tape. Disk stays bounded: journald 200 MB, the build dir <= 3 GB
 timer gzips the dry run's growing logs into runs/archive (~10x smaller) past 1 GB. Ponytail:
 files deleted locally stay on the VPS; if that ever matters, wipe ~/xemm/LIGHTER_ASTER_BOT/src
 before extracting.
+
+The screener run is a bounded ground truth (2026-10-10, approved for 3 days): the same collector
+as the local one, on Tokyo's clean feeds, ~200 MB/day. A transient timer stops it after 3 days and
+it is not enabled at boot, so it never outlives that.
 """
 import io
 import subprocess
@@ -25,6 +31,7 @@ HOST = dict(l.split("=", 1) for l in (ROOT / "vps.env").read_text().split()
 KEY = Path.home() / ".ssh" / "id_rsa"
 REMOTE = "~/xemm/LIGHTER_ASTER_BOT"
 SERVICE = "xemm-dryrun"
+SCREENER = "xemm-screener"
 
 UNIT = f"""[Unit]
 Description=XEMM HYPE dry run (simulated venues, no credentials)
@@ -42,6 +49,23 @@ MemoryMax=512M
 
 [Install]
 WantedBy=multi-user.target
+"""
+
+SCREENER_UNIT = """[Unit]
+Description=Pair screener collector (public data; a 3-day ground truth)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/root/xemm/SCREENER
+ExecStart=/root/xemm/SCREENER/target/release/screener collect
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGINT
+MemoryMax=400M
+# Below the dry run, whose timing matters more.
+Nice=10
+CPUWeight=20
 """
 
 # The dry run's append-only logs (~37 MB/day for HYPE, mostly the journal). The bot appends to them
@@ -117,8 +141,8 @@ def ssh(cmd, stdin=None):
     return subprocess.run(args, input=stdin, check=True)
 
 
-def tracked_tar():
-    files = subprocess.run(["git", "ls-files", "-z", "LIGHTER_ASTER_BOT"], cwd=ROOT, check=True,
+def tracked_tar(folder="LIGHTER_ASTER_BOT"):
+    files = subprocess.run(["git", "ls-files", "-z", folder], cwd=ROOT, check=True,
                            capture_output=True).stdout.decode().split("\0")
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
@@ -151,6 +175,17 @@ def sync():
         f" && sleep 5 && systemctl --no-pager status {SERVICE} | head -5")
 
 
+def screener():
+    ssh("mkdir -p ~/xemm && tar -x -C ~/xemm", stdin=tracked_tar("SCREENER"))
+    ssh(". ~/.cargo/env && cd ~/xemm/SCREENER && CARGO_BUILD_JOBS=1 nice cargo build --release")
+    stop = f"{SCREENER}-stop"
+    ssh(f"cat > /etc/systemd/system/{SCREENER}.service <<'EOF'\n{SCREENER_UNIT}EOF\n"
+        f"systemctl daemon-reload && systemctl restart {SCREENER}"
+        f" && (systemctl stop {stop}.timer {stop}.service; systemctl reset-failed {stop}.timer {stop}.service) 2>/dev/null;"
+        f" systemd-run -q --on-active=3d --unit={stop} systemctl stop {SCREENER}"
+        f" && sleep 5 && systemctl --no-pager status {SCREENER} | head -5")
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "sync":
@@ -159,7 +194,15 @@ def main():
         ssh("python3 -", stdin=LATENCY.encode())
     elif cmd == "status":
         ssh(f"systemctl --no-pager status {SERVICE} | head -12; free -h; df -h /; du -sh {REMOTE}/runs/*; "
-            f"systemctl list-timers {SERVICE}-archive.timer --no-pager | head -2; true")
+            f"systemctl list-timers {SERVICE}-archive.timer {SCREENER}-stop.timer --no-pager | head -3; "
+            f"echo screener: $(systemctl is-active {SCREENER}); du -sh ~/xemm/SCREENER/data 2>/dev/null; true")
+    elif cmd == "screener":
+        screener()
+    elif cmd == "screener-pull":
+        local = ROOT / "SCREENER" / "data-tokyo"
+        local.mkdir(exist_ok=True)
+        subprocess.run(["scp", "-q", "-i", str(KEY), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+                        f"{HOST}:/root/xemm/SCREENER/data/*.screen.zst", str(local)], check=True)
     elif cmd == "logs":
         n = sys.argv[2] if len(sys.argv) > 2 else "50"
         ssh(f"journalctl -u {SERVICE} --no-pager -n {int(n)}")

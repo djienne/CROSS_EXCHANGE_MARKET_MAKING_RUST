@@ -10,7 +10,8 @@
 | Service | `xemm-dryrun` (systemd): `run --market HYPE --mode dry-run --ack-breaker`, 512 MB cap, SIGINT stop |
 | Output | `/root/xemm/LIGHTER_ASTER_BOT/runs/dry-run/` |
 
-Only the dry run runs here: no recorder tape and no other bulk data collection. `runs/dry-run`
+Only the dry run runs here: no recorder tape and no other bulk data collection, except the
+3-day screener run below. `runs/dry-run`
 grows ~37 MB/day for HYPE (2026-10-10: journal 26, book sanity 7.5, diagnostics 2, equity 1.5).
 Disk stays bounded, all set up by `sync`:
 
@@ -36,6 +37,16 @@ python vps.py latency   # TCP and HTTPS round trips to Aster, Lighter, Hyperliqu
 
 The release build (thin LTO, one job) takes a while on one CPU and leans on swap; the running dry
 run keeps going until the restart, but its timing is noisier while cargo runs.
+
+## Screener ground truth (3 days from 2026-10-10)
+
+`python vps.py screener` uploads the tracked `SCREENER/` files, builds them and runs the pair
+screener's collector as `xemm-screener`: 400 MB cap, niced below the dry run, not enabled at boot.
+A transient timer, `xemm-screener-stop`, stops it 3 days after the last `screener` call. It writes
+~200 MB/day to `/root/xemm/SCREENER/data`; `python vps.py screener-pull` copies the files to
+`SCREENER/data-tokyo/` (git-ignored). They give `[report.scenario.tokyo]` its delays (the report
+prints them) and the comparison of `report --scenario host` on them with `--scenario tokyo` on the
+local data. Delete the VPS data dir once pulled.
 
 ## Latency from the VPS (2026-10-10)
 
