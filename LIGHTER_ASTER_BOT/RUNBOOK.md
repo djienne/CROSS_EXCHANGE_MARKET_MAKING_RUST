@@ -298,6 +298,11 @@ python ../dryrun_summary.py --runs LIGHTER_ASTER_BOT/runs/replay/HYPE-20260928T0
   tape up to `--from` and replays the Lighter book from its last snapshot (2026-09-28 06:00: 9.7
   hours of updates, a minute). It ends by itself: the bot drains once its clock passes `--until`
   while the tape keeps feeding, or once the tape ends, two minutes of market ahead of the bot.
+  It runs on wall time, so a busy host delays the simulated venues as it delays the bot: the
+  summary's `scheduler` line should read a few ms (2026-10-10: 0.2-1.6 s p99 while heavy jobs
+  shared the CPU, 2 ms after). Faster than real time does not work: libfaketime at x10 (one core
+  per run) changed the bot's behavior (Aster orders 35/min vs 47, rejects 4/min vs 0.2, Lighter
+  rate-limited, half the minutes over 0.5 s late), so speed comes from running windows side by side.
 - **Files.** Each window gets a new `runs/replay/<M>-<from>-<until>/` (an existing one is
   refused): no simulated account, latch or deadman carries over. `replay.json` holds the
   window, shift, tape files and gate seed; the bot's files are in its `dry-run/`.

@@ -53,6 +53,9 @@ def summary(runs: Path, market: str, since: str | None, now: str | None) -> None
     print(f"  xemm quotes/min {q['per_min']}, refresh round trip p50 {dist(q['refresh_round_trip_ms'])} ms, "
           f"resting {q['uptime_pct']}%")
     print(f"  halts: {len(c['halts'])}{' (last ' + c['halts'][-1] + ')' if c['halts'] else ''}, network paused {c['network_paused_s']} s")
+    if sim:  # a busy host makes the simulated venues late too: a replay needs these near zero
+        print(f"  scheduler: lateness p99 {sim['scheduler_lateness_p99_ms']} ms (median minute), "
+              f"{sim['host_frozen_windows']} of {sim['minutes']:.0f} minutes over 500 ms late")
     for venue in ("aster", "lighter", "hyperliquid"):
         if venue in sim:
             v = sim[venue]
