@@ -111,7 +111,8 @@ impl DryRunCfg {
 
 /// Aster's stream carries 20 levels a side, Hyperliquid's fast l2Book 5; Lighter's book is whole.
 const DEPTH: usize = 20;
-/// How long the live market data may take to give both replicas a book.
+/// How long the live market data may take to give both replicas a book, beyond the shift
+/// (a frame reaches its replica only at its venue time plus the shift).
 const WARM_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One simulated venue as its real API lists it: what the core, the feed and the venue's
@@ -288,7 +289,8 @@ pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::
     cfg.taker.pnl.persist_dir = runs_dir.to_string_lossy().into_owned();
 
     let markets = [(pair[0], keys[0].as_str()), (pair[1], keys[1].as_str())];
-    tokio::time::timeout(WARM_TIMEOUT, venues.warm(&markets)).await.context("the live market data gave no book within 60 s")?;
+    let warm = Duration::from_millis(dry.shift_ms as u64) + WARM_TIMEOUT;
+    tokio::time::timeout(warm, venues.warm(&markets)).await.with_context(|| format!("the live market data gave no book within {} s", warm.as_secs()))?;
     // The first books have filled what the market crossed while the venues were down; now
     // the deadmen that ran out meanwhile cancel the rest.
     venues.resume();

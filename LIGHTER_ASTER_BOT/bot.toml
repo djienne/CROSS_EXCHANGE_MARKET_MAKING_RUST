@@ -264,12 +264,15 @@ lighter_symbol      = "ETH"
 # under shift_ms minus the 250 ms lookahead that matches takers against the worse of the two book
 # states around them; a request still waiting for a late frame is answered 503 after 2 s, which
 # the bot must treat as an unknown outcome (the maker then freezes for 70 s+). The shift itself is
-# invisible to the bot (timestamps move with it), so it is sized to the worst lag, not the median.
-# Measured here in Docker 2026-10-09/10 (sim-<M>.diag.jsonl `lag_ms`, 10 h, per-minute max book
-# lag): over 0.75 s in 86-89 % of minutes (Aster, Lighter), over 2.75 s in 51-57 %, over 9.75 s in
-# 9-10 %, over 29.75 s in 1-2 %; the Hyperliquid hub is worse (13 % over 9.75 s). With 1000 ms,
-# 2/3 of the minutes from 06:00 UTC held requests and the HYPE maker spent the morning frozen.
-shift_ms = 10000
+# invisible to the bot (timestamps move with it), so it is sized to the worst lag, not the median:
+# it costs only buffered frames (~10 MB), and as much warm-up and lost market per restart.
+# This host's path to Tokyo stalls for tens of seconds (2026-10-10: 61 % ping loss to a Tokyo VPS,
+# native and Docker probes stalling together; the VPS itself had no late frame in 616k). Share of
+# minutes whose max book lag passed S - 0.25 s over 24 h (sim-<M>.diag.jsonl `lag_ms`), Aster /
+# Lighter / Hyperliquid hub: S = 10 s 7.5 / 6.6 / 10.7 %, 30 s 1.4 / 0.8 / 5.0 %, 60 s 0.2 / 0 /
+# 2.2 %, 90 s 0 / 0 / 1.3 % (worst 75 / 59 / 234 s). With 1 s, 2/3 of the minutes from 06:00 UTC
+# held requests and the HYPE maker spent the morning frozen; 10 s still left 22 % of frames late.
+shift_ms = 90000
 seed     = 0
 aster_port       = 18081
 lighter_port     = 18082
