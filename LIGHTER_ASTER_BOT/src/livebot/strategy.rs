@@ -928,9 +928,8 @@ impl Strategy {
     /// idle pace: resting quotes alone wait on nothing, their fills arrive on the user stream.
     fn publish_read_pace(&self, now_ns: i64) {
         let recent = |t: i64| now_ns.saturating_sub(t) < FAST_READS_AFTER_NS;
-        self.account.set_hot(self.frozen || self.sweep_pending.is_some() || self.heal_confirm.is_some()
+        self.account.set_hot(self.frozen || self.sweep_pending.is_some() || matches!(self.yield_state, Yield::Resuming { .. })
             || !self.uncertain_makers.is_empty() || !self.correction_needed.is_empty() || !self.orphan_seen.is_empty()
-            || !self.account.maker_queries().is_empty() || matches!(self.yield_state, Yield::Resuming { .. })
             || self.hedges.values().any(|h| h.unresolved() || h.terminal_ns.is_some_and(recent))
             || self.last_hot_action_ns.values().any(|&t| recent(t)));
     }
