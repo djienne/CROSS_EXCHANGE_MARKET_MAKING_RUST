@@ -22,6 +22,7 @@ import io
 import subprocess
 import sys
 import tarfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -179,10 +180,12 @@ def screener():
     ssh("mkdir -p ~/xemm && tar -x -C ~/xemm", stdin=tracked_tar("SCREENER"))
     ssh(". ~/.cargo/env && cd ~/xemm/SCREENER && CARGO_BUILD_JOBS=1 nice cargo build --release")
     stop = f"{SCREENER}-stop"
+    # An absolute time: a relative one restarts at every daemon-reload, which `sync` runs.
+    end = (datetime.now(timezone.utc) + timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S UTC")
     ssh(f"cat > /etc/systemd/system/{SCREENER}.service <<'EOF'\n{SCREENER_UNIT}EOF\n"
         f"systemctl daemon-reload && systemctl restart {SCREENER}"
         f" && (systemctl stop {stop}.timer {stop}.service; systemctl reset-failed {stop}.timer {stop}.service) 2>/dev/null;"
-        f" systemd-run -q --on-active=3d --unit={stop} systemctl stop {SCREENER}"
+        f" systemd-run -q --on-calendar='{end}' --unit={stop} systemctl stop {SCREENER}"
         f" && sleep 5 && systemctl --no-pager status {SCREENER} | head -5")
 
 
