@@ -57,6 +57,7 @@ docker compose run --rm screener universe           # today's pairs, with their 
 docker compose run --rm report                      # the ranking, from all the data
 docker compose run --rm report --since 2026-09-27 --lighter premium --json
 docker compose run --rm report --latency 2          # sensitivity: every latency doubled
+docker compose run --rm report --since 2026-10-11 --scenario tokyo   # on the venues' clocks (v3 days)
 ```
 
 `report` is its own service (profile `report`, never started by `up`): it holds every recorded
@@ -70,7 +71,7 @@ that fits under the 8 GB cap varies with market activity.
   `0` is the left venue, `1` the right. `xf0` means maker on 0, hedge on 1; `xf1` reverses them.
 - **Units / coverage.** $/day at one $13 clip, divided by the time both books were known.
   `days` and `down%` show coverage; `unres` counts fixed-strategy fills with an unknown delayed
-  book, whose PnL cannot be estimated. JSON includes each leg's fees/delays and daily results.
+  book or one not recorded, whose PnL cannot be estimated. JSON includes each leg's fees/delays and daily results.
 - **`tk`.** The existing gated taker, requiring 50 opportunity samples before leaving warmup.
   `kept` is realized/expected gross edge after latency.
 - **Fixed ranking.** `xf0` / `xf1` use the 18.5 bps required edge and 18–50 bps distance gate.
@@ -107,18 +108,28 @@ or trading connector is imported.
   bot samples only outside its cooldown and when it could size a trade, so it misses the peaks it
   trades on: on busy pairs its gate sits lower (2026-09-26: TAO 7.25 vs 9.05 bps, WLD 11.4 vs 14.7)
   and the report trades less often than it would.
-- **Arrival times.** Replay uses arrival times on this host (Europe), not synchronized exchange
-  event times. Venue/feed delays need not cancel; neither ping RTT nor an old local model
+- **Arrival times.** By default the replay uses arrival times on this host (Europe), not the
+  venues' clocks. Venue/feed delays need not cancel; neither ping RTT nor an old local model
   establishes order execution latency. Measured 2026-09-27, venue timestamp to arrival (median /
-  p99): Aster book 145 / 239 ms, Lighter trades 214 / 568 ms, Hyperliquid bbo 361 / 682 ms. So a
-  Hyperliquid BBO arrived ~0.2 s later than Aster's book in that host's sample; exchange clock
-  differences also enter this comparison. Two connections can
-  receive the same Hyperliquid frame up to seconds apart. Small Hyperliquid taker edges may be
-  partly this lag. The fills at the latency charge for it only in part. Aster also sends each trade
-  ~150 ms after the book change it made (Lighter and Hyperliquid send them together), so the
-  report moves Aster prints back by `aster_print_delay_ms` before pricing and hedging XEMM fills.
-  That is a median: the delay varies by print (aggTrade E − T is 186 ms at the median, 25–50 ms
-  for ~13%), so some prints are moved back too far.
+  p99): Aster book 145 / 239 ms, Lighter trades 214 / 568 ms, Hyperliquid bbo 361 / 682 ms, and
+  this host's path to Tokyo stalls for tens of seconds now and then (2026-10-10). Such lag can make
+  or hide edges, small Hyperliquid taker ones especially; two connections can receive the same
+  Hyperliquid frame up to seconds apart. Aster also sends each trade ~150 ms after the book change
+  it made (Lighter and Hyperliquid send them together), so arrival replay moves Aster prints back
+  by `aster_print_delay_ms`, a median (aggTrade E − T is 186 ms at the median, 25–50 ms for ~13%).
+- **Venue clocks (v4 data, 2026-10-10 on).** `--scenario <name>` replays on the venues' engine
+  stamps: the bot sees each venue a constant `[report.scenario.<name>]` delay after its stamp, its
+  orders and hedges meet the venues' own books, and a print sits at its stamp. `--scenario host`
+  rebuilds this host's own delays from the stamps: the arrival result, a check. Every report prints
+  this host's feed delays per venue (books, prints). A scenario leaves out, and counts, the time
+  around a stall here (a book change over 0.7 s late, plus the 1 s pre-roll either side: 2026-10-10
+  a single one somewhere in two thirds of the 5-minute pair windows), and refuses delays more than
+  0.3 s apart; a quote older than the pre-roll before its print arrived meets an
+  unrecorded book, an `unres` fill (the Hyperliquid quote age at `--latency 2`). Delays are
+  constants: jitter is second order. Exchange clocks may differ by a few ms. The gate's samples
+  stay those counted at arrival here.
+- **Run starts.** A new run (daily at UTC midnight, or a restart) does not see the states before
+  it: XEMM fills in its first second priced from them are not recorded.
 - **XEMM scope.** The bot makes only on Aster. Reverse-maker and Lighter/Hyperliquid maker
   rankings are exploratory models.
 - **XEMM fills.** XEMM ignores queue position (a fill needs a trade *through* the quote) and our
@@ -136,10 +147,11 @@ or when a venue missing at discovery answers).
 Each file is zstd-compressed tab-separated lines, with the formats in `src/collect.rs`.
 Version 2 uses venue-qualified keys and two-second tails. Existing Aster-Lighter files remain
 readable without migration; their one-second tails still limit their own replay settings.
-Version 3 (2026-10-10) adds each leg's age against the venue's engine stamp to `B` and `T` lines,
-and `R` marks where an unrecorded change makes a leg unknown, for replay on venue time. It also
-selects the moments any mix of the two legs' states within the pre-roll could trade, which other
-feed delays than this host's could produce.
+Version 3 (2026-10-10 11:41Z) adds each leg's age against the venue's engine stamp to `B` and `T`
+lines, and `R` marks where an unrecorded change makes a leg unknown, for replay on venue time. It
+also selects the moments any mix of the two legs' states within the pre-roll could trade, which
+other feed delays than this host's could produce. Version 4 (the same day) adds each summary's
+stall spans; scenarios need it.
 A new run reads the last 72 h of summaries back for its gate.
 
 With Hyperliquid, files take ~60 MB a day for ~155 pairs (18:03–20:07 UTC on 2026-09-26; twice

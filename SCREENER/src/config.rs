@@ -1,5 +1,6 @@
 //! `screener.toml` (the values and their sources are documented there).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{ensure, Context, Result};
@@ -39,6 +40,29 @@ pub struct Report {
     pub hyperliquid: Hyperliquid,
     pub taker: Taker,
     pub xemm: Xemm,
+    /// Feed-delay scenarios for `report --scenario <name>`.
+    #[serde(default)]
+    pub scenario: BTreeMap<String, Scenario>,
+}
+
+/// Each venue's delay from its engine stamp to the bot's view, ms: a constant (jitter is second
+/// order, and keeps replays of the recording and of every state alike).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Scenario {
+    pub aster_ms: f64,
+    pub lighter_ms: f64,
+    pub hyperliquid_ms: f64,
+}
+
+impl Scenario {
+    pub fn ms(&self, venue: Venue) -> f64 {
+        match venue {
+            Venue::Aster => self.aster_ms,
+            Venue::Lighter => self.lighter_ms,
+            Venue::Hyperliquid => self.hyperliquid_ms,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -134,7 +158,9 @@ impl Report {
             self.lighter.standard.taker_bps, self.lighter.standard.taker_delay_ms, self.lighter.premium.maker_bps,
             self.lighter.premium.taker_bps, self.lighter.premium.taker_delay_ms, h.maker_bps, h.taker_bps,
             h.taker_ms, h.fill_notice_ms, h.quote_age_ms, self.taker.margin_bps, self.xemm.required_bps, self.xemm.min_hedge_usd];
-        ensure!(values.iter().chain(&self.xemm.sweep_bps).all(|x| x.is_finite() && *x >= 0.0), "fees, latencies and thresholds must be finite and nonnegative (rebates require a different recording floor)");
+        let delays = self.scenario.values().flat_map(|s| [s.aster_ms, s.lighter_ms, s.hyperliquid_ms]);
+        ensure!(values.iter().copied().chain(self.xemm.sweep_bps.iter().copied()).chain(delays).all(|x| x.is_finite() && x >= 0.0), "fees, latencies, delays and thresholds must be finite and nonnegative (rebates require a different recording floor)");
+        ensure!(!self.scenario.contains_key("host"), "`host` is the built-in scenario of this host's delays");
         ensure!(self.clip_usd > 0.0 && self.depth_multiple > 0.0 && self.xemm.quote_age_ms >= 0 && self.xemm.pending_age_ms >= 0, "invalid clip, depth, quote or pending age");
         Ok(())
     }

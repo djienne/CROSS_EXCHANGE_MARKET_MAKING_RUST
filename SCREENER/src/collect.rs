@@ -22,7 +22,7 @@
 //!
 //! | kind | fields |
 //! |---|---|
-//! | `P` | JSON: version 3, the `[collect]` settings, the `Recording`, and the constants below |
+//! | `P` | JSON: version 4, the `[collect]` settings, the `Recording`, and the constants below |
 //! | `U` | JSON: the pairs (`universe::Pair`) |
 //! | `B` | time, qualified pair, left bid, ask, right bid, ask (0 = unknown), `depth_flags`, left age, right age |
 //! | `T` | time, pair, leg `0`/`1` (legacy `A`/`L`), price, size, aggressor `B`/`S`, age: a trade that could fill a quote |
@@ -48,6 +48,9 @@ use crate::store::{self, Store};
 use crate::universe::{self, Market, Pair, Venue};
 
 pub const PREROLL_MS: i64 = 1_000;
+/// A book change arriving this much after its venue stamp is a stall: the moments that other feed
+/// delays could pair it into may not be recorded (`Summary::stalls`).
+pub const STALL_MS: i64 = 700;
 pub const TAIL_MS: i64 = 2_000;
 pub const WINDOW_MS: i64 = 300_000;
 const DAY_MS: i64 = 86_400_000;
@@ -303,8 +306,8 @@ struct Summary {
     l_usd: f64,
     rows: u64,
     samples: Samples,
-    /// Per leg, the least and most book age (arrival minus venue stamp), ms.
-    lag: [Option<(i64, i64)>; 2],
+    /// From stamp to arrival, the book changes that arrived over `STALL_MS` late, merged.
+    stalls: Vec<(i64, i64)>,
 }
 
 impl Summary {
@@ -317,7 +320,7 @@ impl Summary {
             "basis": avg(self.basis), "basis_min": (self.up > 0.0).then(|| round(self.basis_min)),
             "basis_max": (self.up > 0.0).then(|| round(self.basis_max)), "thin": avg(self.thin),
             "a_trades": self.a_trades, "a_usd": round(self.a_usd), "l_trades": self.l_trades, "l_usd": round(self.l_usd),
-            "rows": self.rows, "samples": self.samples, "lag": self.lag,
+            "rows": self.rows, "samples": self.samples, "stalls": self.stalls,
         });
         format!("S\t{json}")
     }
@@ -392,22 +395,33 @@ impl Collector {
         Collector { rec: rec.clone(), pairs, window_start: now - now.rem_euclid(WINDOW_MS), now }
     }
 
+    /// The pair's legs' venue stamps now.
+    #[cfg(test)]
+    pub fn stamps(&self, pair: usize) -> [i64; 2] {
+        self.pairs[pair].stamp
+    }
+
     pub fn on_event(&mut self, t: i64, event: Event, out: &mut impl FnMut(String)) {
         let t = self.tick(t, out);
         match event {
             Event::Book { pair, venue, bbo, stamp } => {
                 self.advance(pair, t);
                 let p = &mut self.pairs[pair];
-                match venue {
-                    Leg::Left => p.a = bbo,
-                    Leg::Right => p.l = bbo,
-                }
+                let old = match venue {
+                    Leg::Left => std::mem::replace(&mut p.a, bbo),
+                    Leg::Right => std::mem::replace(&mut p.l, bbo),
+                };
                 let k = venue as usize;
-                if stamp > 0 {
-                    let (age, lag) = (t - stamp, &mut p.summary.lag[k]);
-                    *lag = Some(lag.map_or((age, age), |(lo, hi)| (lo.min(age), hi.max(age))));
+                if stamp > 0 && t - stamp > STALL_MS {
+                    match p.summary.stalls.last_mut() {
+                        Some(last) if stamp <= last.1 => *last = (last.0.min(stamp), t),
+                        _ => p.summary.stalls.push((stamp, t)),
+                    }
                 }
-                p.stamp[k] = if stamp > 0 { stamp } else { t - p.age[k] }.max(p.stamp[k]);
+                // A book becoming unknown follows the known one, never ties with it (an `R` mark
+                // and a `B` line of one stamp and time are one state, the `B` written later).
+                let floor = p.stamp[k] + (old.known() && !bbo.known()) as i64;
+                p.stamp[k] = if stamp > 0 { stamp } else { t - p.age[k] }.max(floor);
                 p.age[k] = t - p.stamp[k];
                 self.changed(pair, venue, t, out);
             }
@@ -759,7 +773,7 @@ pub async fn run(cfg: Config, dir: PathBuf, stop: CancellationToken) -> Result<(
         let now = wall_ms();
         let gates = tokio::task::block_in_place(|| load_gates(&dir, rec.span_ms(), now));
         tracing::info!("gate history: {} pairs, loaded in {:.1} s", gates.len(), (wall_ms() - now) as f64 / 1e3);
-        let params = json!({ "version": 3, "stamps": "engine", "collect": &cfg.collect, "recording": &rec, "preroll_ms": PREROLL_MS, "tail_ms": TAIL_MS, "window_ms": WINDOW_MS, "edge_bin_bps": EDGE_BIN_BPS,
+        let params = json!({ "version": 4, "stamps": "engine", "collect": &cfg.collect, "recording": &rec, "preroll_ms": PREROLL_MS, "stall_ms": STALL_MS, "tail_ms": TAIL_MS, "window_ms": WINDOW_MS, "edge_bin_bps": EDGE_BIN_BPS,
             "hyperliquid_source": if std::env::var_os("HL_PUBLIC_WS").is_some() { "central_hub" } else { "direct" }, "receipt_clock": "consumer arrival after local relay" });
         let header = vec![format!("P\t{params}"), format!("U\t{}", serde_json::to_string(&pairs)?)];
         let (store, writer) = Store::open(&dir, header)?;
@@ -1048,7 +1062,7 @@ mod tests {
         let mut lines = Vec::new();
         let mut out = |l: String| lines.push(l);
         let at = |venue, bid, ask, stamp| Event::Book { pair: 0, venue, bbo: bbo(bid, ask), stamp };
-        // Aster arrives 10 ms after its stamps, Lighter 10 then 300 ms.
+        // Aster arrives 10 ms after its stamps, Lighter 10 then 300 ms, then once 900 ms (a stall).
         c.on_event(1_000, at(Leg::Left, 99.99, 100.0, 990), &mut out);
         c.on_event(1_000, at(Leg::Right, 100.0, 100.01, 990), &mut out);
         c.on_event(1_100, at(Leg::Left, 100.05, 100.06, 1_090), &mut out); // 4 bps
@@ -1062,6 +1076,7 @@ mod tests {
         c.on_event(3_500, at(Leg::Left, 100.05, 100.07, 3_490), &mut out);
         c.on_event(3_600, at(Leg::Left, 100.05, 100.08, 3_590), &mut out);
         c.on_event(3_700, at(Leg::Right, 100.07, 100.09, 3_400), &mut out);
+        c.on_event(4_000, at(Leg::Right, 100.07, 100.08, 3_100), &mut out);
         c.tick(WINDOW_MS, &mut out);
         assert_eq!(&lines[..8], [
             "B\t1000\tX\t99.99\t100\t0\t0\t3\t10\t1000",
@@ -1074,7 +1089,7 @@ mod tests {
             "R\t3700\tX\t1\t300",
         ]);
         let s: serde_json::Value = serde_json::from_str(lines[8].strip_prefix("S\t").unwrap()).unwrap();
-        assert_eq!(s["lag"], json!([[10, 10], [10, 300]]));
+        assert_eq!(s["stalls"], json!([[3100, 4000]]));
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub const HYPERLIQUID_INFO: &str = "https://api.hyperliquid.xyz/info";
 /// ~7.9M-fold: different assets).
 const MAX_PRICE_MISMATCH: f64 = 0.02;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Venue { Aster, Lighter, Hyperliquid }
 
