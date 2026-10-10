@@ -1,11 +1,12 @@
 //! Live account state: capital + positions + open orders, reconciled from both venues.
 //! Published atomically for the strategy and cold diagnostics.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use rust_decimal::Decimal;
+use tokio::sync::Notify;
 
 use crate::types::{MarketId, Side};
 
@@ -134,6 +135,9 @@ pub struct AccountState {
     generation: Arc<AtomicU64>,
     pending_exec: Arc<ArcSwap<Vec<super::fills::HedgeIntent>>>,
     maker_queries: Arc<ArcSwap<Vec<MakerQuery>>>,
+    /// Set by the strategy while it waits on a venue read; the reconciler then reads fast.
+    hot: Arc<AtomicBool>,
+    wake: Arc<Notify>,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +155,8 @@ impl Default for AccountState {
             generation: Arc::new(AtomicU64::new(0)),
             pending_exec: Arc::new(ArcSwap::from_pointee(Vec::new())),
             maker_queries: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            hot: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new(Notify::new()),
         }
     }
 
@@ -173,6 +179,13 @@ impl AccountState {
 
     pub fn publish_maker_queries(&self, queries: Vec<MakerQuery>) { self.maker_queries.store(Arc::new(queries)); }
     pub fn maker_queries(&self) -> Arc<Vec<MakerQuery>> { self.maker_queries.load_full() }
+
+    /// Turning hot wakes the reconciler at once, so a wait starts with a read, not an idle gap.
+    pub fn set_hot(&self, hot: bool) {
+        if !self.hot.swap(hot, Ordering::AcqRel) && hot { self.wake.notify_one(); }
+    }
+    pub fn is_hot(&self) -> bool { self.hot.load(Ordering::Acquire) }
+    pub async fn turned_hot(&self) { self.wake.notified().await }
 
     /// Lock-free read of the current snapshot.
     pub fn load(&self) -> Arc<AccountSnapshot> {

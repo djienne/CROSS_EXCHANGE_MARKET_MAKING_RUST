@@ -251,6 +251,12 @@ pub async fn run(
         cfg, &specs, &account, exec_rx, exec_prio_rx, hedge_rx, events_tx, maker_fill_tx, feeds_shutdown.clone(), &mut aux_tasks, &journal,
     )
     .await?;
+    // A user stream that has not connected yet reads as stale, and the strategy's first tick
+    // would sweep for it: give it until the staleness limit to connect.
+    let connect_by = tokio::time::Instant::now() + Duration::from_millis(cfg.live.max_user_stream_staleness_ms.max(0) as u64);
+    while stream_liveness.age_ms(mono_now_ns()) == i64::MAX && tokio::time::Instant::now() < connect_by {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     // --- strategy ---
     let session = SessionId::random();
@@ -680,9 +686,10 @@ async fn setup_live_planes(
         snap.aster_available_usd, snap.hl_withdrawable_usd, snap.aster_positions.len(), snap.hl_positions.len(), snap.open_orders.len()
     );
 
-    // Cold reconcile loop: refresh well inside `max_account_snapshot_age_ms`.
-    let interval = Duration::from_millis((cfg.live.max_account_snapshot_age_ms / 2).clamp(500, 2000) as u64);
-    aux.push(tokio::spawn(recon.run(account.clone(), shutdown.clone(), interval, events_tx)));
+    // Cold reconcile loop: at half `max_account_snapshot_age_ms`, or every 2 s while the strategy
+    // waits on a read (each read is one of Lighter Standard's 60 REST calls a minute).
+    let idle = Duration::from_millis((cfg.live.max_account_snapshot_age_ms / 2).max(500) as u64);
+    aux.push(tokio::spawn(recon.run(account.clone(), shutdown.clone(), idle.min(Duration::from_secs(2)), idle, events_tx)));
 
     // Aster user (fill) stream → maker-fill channel. Keep a clone of the liveness stamp to hand
     // to the strategy so it can freeze quoting if the stream silently dies.

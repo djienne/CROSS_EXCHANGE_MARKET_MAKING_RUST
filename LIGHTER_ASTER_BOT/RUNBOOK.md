@@ -29,9 +29,10 @@ On Aster routes, both engines run for the whole session; one that exits halts th
 each hand-over (`yield`, `yield_withdrawn`, `rights_returned`, `resumed`), and `bot_stats.py`
 summarizes them. The `[controller]` table of `bot.toml` holds the status poll and the
 cross-engine loss stop. The controller reads the accounts from XEMM's own snapshot, which XEMM
-refreshes every 2 s with the shipped settings; it reads the venues only at start-up.
-The HYPE route's idle Lighter reads total about 46/min: XEMM accounts 30, taker accounts 8,
-book checks 8. A start adds about 15, each account read once. Standard's shared REST/transaction cap is 60/min; executions and other clients
+refreshes every 6 s with the shipped settings, every 2 s while a fill, hedge, sweep or hand-over
+settles; it reads the venues only at start-up. The HYPE route's idle Lighter reads total about
+20/min: XEMM accounts 10, the taker's 2 while it waits for XEMM's lease, book checks 8. A start
+adds about 15, each account read once. Standard's shared REST/transaction cap is 60/min; executions and other clients
 consume the remaining allowance ([rate limits](https://apidocs.lighter.xyz/docs/rate-limits)).
 
 ## Build, secrets, configuration

@@ -59,6 +59,8 @@ pub struct Rights {
 
 /// How long a grant lets the taker start an execution; one already started runs to its end.
 const GRANT_TTL_MS: i64 = 3_000;
+/// The account reads stay fast this long after a fill, hedge or correction (`publish_read_pace`).
+const FAST_READS_AFTER_NS: i64 = 10_000_000_000;
 
 /// XEMM's turn in `run`, one regime at a time (Hummingbot's XEMM with the taker's arbitrage
 /// in between): quote (`Idle`); on the taker's request cancel both sides and wait until
@@ -920,6 +922,17 @@ impl Strategy {
     fn publish_execution_queries(&self) {
         self.account.publish_pending_exec(self.hedges.values()
             .filter(|h| h.venue == Venue::Aster && h.unresolved()).cloned().collect());
+    }
+
+    /// The reconciler reads every 2 s while something here waits on an account read, else at its
+    /// idle pace: resting quotes alone wait on nothing, their fills arrive on the user stream.
+    fn publish_read_pace(&self, now_ns: i64) {
+        let recent = |t: i64| now_ns.saturating_sub(t) < FAST_READS_AFTER_NS;
+        self.account.set_hot(self.frozen || self.sweep_pending.is_some() || self.heal_confirm.is_some()
+            || !self.uncertain_makers.is_empty() || !self.correction_needed.is_empty() || !self.orphan_seen.is_empty()
+            || !self.account.maker_queries().is_empty() || matches!(self.yield_state, Yield::Resuming { .. })
+            || self.hedges.values().any(|h| h.unresolved() || h.terminal_ns.is_some_and(recent))
+            || self.last_hot_action_ns.values().any(|&t| recent(t)));
     }
 
     /// Wire the shared dirty-market bitset (set by the registry builder in `run.rs`).
@@ -2764,6 +2777,7 @@ impl Strategy {
         // position mismatch here; `drive_yield` re-reads the positions instead.
         if matches!(self.yield_state, Yield::Idle | Yield::Yielding { .. }) { self.recover_orphans(now_ns); }
         self.publish_execution_queries();
+        self.publish_read_pace(now_ns);
         if self.cfg.live.aster.deadman_enabled && !self.draining {
             for m in self.markets.clone() {
                 if self.ctx.get(&m).is_some_and(|c| c.eligible) {
@@ -4821,6 +4835,16 @@ lighter_symbol = "BTC"
             account.publish(funded_snapshot(t,dec!(0),dec!(0))); strat.drive_safety_sweep(t+1); strat.recover_orphans(t+1);
         }
         assert!(!strat.frozen && strat.orders.live_slots().is_empty(), "XEMM quotes again");
+    }
+
+    #[tokio::test]
+    async fn account_reads_go_fast_after_a_fill_and_idle_again_once_it_settles() {
+        let account=AccountState::default(); let (etx,_erx)=tokio::sync::mpsc::channel(16); let (htx,_hrx)=tokio::sync::mpsc::channel(16);
+        let mut strat=live_strat(etx,htx,account.clone()); let now=crate::hotpath::clock::mono_now_ns();
+        strat.publish_read_pace(now); assert!(!account.is_hot(), "nothing waits on a read");
+        strat.last_hot_action_ns.insert("BTC".into(),now); strat.publish_read_pace(now);
+        tokio::time::timeout(std::time::Duration::from_millis(100), account.turned_hot()).await.expect("turning hot wakes the reconciler");
+        strat.publish_read_pace(now+FAST_READS_AFTER_NS); assert!(!account.is_hot(), "idle again once the fill is 10 s old");
     }
 
     #[tokio::test]

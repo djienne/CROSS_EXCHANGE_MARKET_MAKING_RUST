@@ -553,24 +553,28 @@ impl Reconciler {
         Ok(snap)
     }
 
-    /// Cold reconcile loop: publish a fresh snapshot every `interval`, until cancelled. A failed
-    /// read keeps the prior snapshot (the strategy's `account_fresh` gate then closes quoting if
-    /// it ages out — fail-safe). The snapshot must refresh well within
-    /// `max_account_snapshot_age_ms`, so `interval` should be a fraction of it.
-    pub async fn run(self, account: AccountState, shutdown: CancellationToken, interval: Duration, events: tokio::sync::mpsc::Sender<super::exec::command::ExecEvent>) {
-        info!("account reconciler started (interval {:?})", interval);
+    /// Cold reconcile loop: publish a fresh snapshot every `hot` while the strategy waits on a
+    /// read (`AccountState::is_hot`), else every `idle`, until cancelled. A failed read keeps the
+    /// prior snapshot (the strategy's `account_fresh` gate then closes quoting if it ages out —
+    /// fail-safe). The snapshot must refresh well within `max_account_snapshot_age_ms`, so `idle`
+    /// should be a fraction of it.
+    pub async fn run(self, account: AccountState, shutdown: CancellationToken, hot: Duration, idle: Duration, events: tokio::sync::mpsc::Sender<super::exec::command::ExecEvent>) {
+        info!("account reconciler started (every {idle:?}, {hot:?} while hot)");
         // A single reconcile must NEVER wedge the loop. It awaits venue REST reads; a
         // black-holed connection (no response AND no error) would otherwise hang the await forever —
         // the snapshot then ages out, which SILENTLY closes the maker gate (`account_fresh`) AND
         // disables the orphan-recovery backstop (which early-returns on a stale snapshot). Bounding
         // each cycle drops a hung read so the loop keeps retrying and a transient black-hole self-heals.
-        let budget = (interval * 3).max(Duration::from_secs(5));
+        let budget = (hot * 3).max(Duration::from_secs(5));
         let mut consecutive_stalls: u32 = 0;
-        let mut tick = tokio::time::interval_at(Instant::now() + interval, interval);
+        let mut last = Instant::now();
+        let mut next = last + hot;
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
-                _ = tick.tick() => {
+                _ = account.turned_hot() => next = next.min(last + hot),
+                _ = tokio::time::sleep_until(next) => {
+                    last = Instant::now();
                     let _ = tokio::time::timeout(budget, self.resolve_aster_attempts(&account, &events)).await;
                     let _ = tokio::time::timeout(budget, self.backfill_maker_orders(&account, &events)).await;
                     match tokio::time::timeout(budget, self.reconcile_and_publish(&account)).await {
@@ -594,11 +598,11 @@ impl Reconciler {
                     // Make that LOUD so the operator sees it instead of discovering a dead bot hours later.
                     if consecutive_stalls == 3 {
                         error!(
-                            "account reconciler STALLED {consecutive_stalls} cycles (~{:?}): snapshot going stale — \
-                             maker quoting will freeze (ACCOUNT_SNAPSHOT_STALE) and orphan recovery is paused until reads recover",
-                            interval * consecutive_stalls
+                            "account reconciler STALLED {consecutive_stalls} cycles: snapshot going stale — \
+                             maker quoting will freeze (ACCOUNT_SNAPSHOT_STALE) and orphan recovery is paused until reads recover"
                         );
                     }
+                    next = last + if account.is_hot() { hot } else { idle };
                 }
             }
         }
