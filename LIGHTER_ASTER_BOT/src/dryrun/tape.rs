@@ -14,6 +14,7 @@
 //! | `H-`, `HS-` | that Hyperliquid connection ended, or a reconnect failed (empty) |
 //! | `F` | an Aster `premiumIndex` response (funding), every minute |
 //! | `X`, `O` | the Aster `exchangeInfo` and Lighter `orderBooks` responses (filters), hourly |
+//! | `DA`, `DL` | the Aster `depth` (100 levels) and Lighter `orderBookOrders` (250 orders) responses, every minute: the books past the streams' 20 levels, which reach ~5 bps on Aster (Lighter's 100 orders reached 20-26 bps, 250 ~230 bps, on 2026-10-10) |
 //!
 //! `replay` reads the Aster and Lighter kinds only (tapes before 2026-10-10 have no `H`).
 //! Lines are in the order they arrived, which a reader keeps. Their times are the recording host's
@@ -51,6 +52,7 @@ const FLUSH: Duration = Duration::from_secs(10);
 const MAX_BUFFER: usize = 8 << 20;
 const LEVEL: i32 = 9;
 const SPECS_EVERY: Duration = Duration::from_secs(3_600);
+const DEPTH_EVERY: Duration = Duration::from_secs(60);
 
 enum Msg {
     Line(i64, &'static str, String),
@@ -347,11 +349,16 @@ pub async fn record(config: &Path, market: &str, dir: PathBuf, stop: Cancellatio
         .market_id;
 
     let (tape, writer) = Tape::open(&dir, &market.id().0)?;
-    let specs = [("X", format!("{aster_base}/fapi/v3/exchangeInfo")), ("O", format!("{lighter_base}/api/v1/orderBooks"))];
-    tokio::spawn({
-        let tape = tape.clone();
-        async move {
-            let mut tick = tokio::time::interval(SPECS_EVERY);
+    let polls = [
+        (SPECS_EVERY, [("X", format!("{aster_base}/fapi/v3/exchangeInfo")), ("O", format!("{lighter_base}/api/v1/orderBooks"))]),
+        (DEPTH_EVERY, [("DA", format!("{aster_base}/fapi/v1/depth?symbol={symbol}&limit=100")),
+            ("DL", format!("{lighter_base}/api/v1/orderBookOrders?market_id={index}&limit=250"))]),
+    ];
+    for (every, specs) in polls {
+        let (tape, get) = (tape.clone(), get.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
                 for &(kind, ref url) in &specs {
@@ -361,8 +368,8 @@ pub async fn record(config: &Path, market: &str, dir: PathBuf, stop: Cancellatio
                     }
                 }
             }
-        }
-    });
+        });
+    }
     let aster_url = feed::aster_url(&crate::connectors::aster::ws_root(&aster_base), &[symbol.clone()]);
     tokio::spawn({
         let tape = tape.clone();
@@ -445,7 +452,7 @@ pub(crate) mod tests {
         let dir = crate::dryrun::tests::temp_dir("replay");
         let t0 = wall_us() / 1_000 - 60_000;
         let (top, delta) = (|at| lighter("subscribed", 0, 10, at, r#"[{"price":"99","size":"5"}]"#, r#"[{"price":"101","size":"5"}]"#), |n, at| lighter("update", n, n + 1, at, "[]", "[]"));
-        // Hyperliquid lines (2026-10-10 on) leave an Aster-Lighter replay as it was.
+        // Hyperliquid and REST depth lines (2026-10-10 on) leave an Aster-Lighter replay as it was.
         let hl = |at: i64| format!(r#"{{"channel":"l2Book","data":{{"coin":"HYPE","time":{at},"levels":[[{{"px":"99","sz":"1","n":1}}],[{{"px":"101","sz":"1","n":1}}]]}}}}"#);
         write_tape(&dir, &[
             (t0 - 5_000, "X", "{}".into()),
@@ -454,6 +461,7 @@ pub(crate) mod tests {
             (t0 - 2_000, "L", top(t0 - 2_000)),
             (t0 - 1_000, "L", delta(10, t0 - 1_000)),
             (t0 - 700, "H", hl(t0 - 700)),
+            (t0 - 650, "DA", r#"{"bids":[["99","5"]],"asks":[["101","5"]]}"#.into()),
             (t0 - 600, "HS", hl(t0 - 600)),
             (t0 - 500, "A", aster_depth(t0 - 500, "99", "101")),
             (t0 + 100, "A", aster_depth(t0 + 100, "99", "101")),
