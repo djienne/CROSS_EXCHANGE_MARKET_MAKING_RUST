@@ -4,7 +4,7 @@
 |---|---|
 | Connect | `ssh -i ~/.ssh/id_rsa root@<VPS_IP>`; the address is in the local, git-ignored `vps.env` (`VPS_HOST=root@<ip>`), which `vps.py` reads |
 | Key | `~/.ssh/id_rsa` on the Windows box (never commit it) |
-| Host | Tokyo, Ubuntu 22.04, 1 vCPU, ~1 GB RAM + 4 GB swap, 25 GB disk |
+| Host | Tokyo, Ubuntu 22.04 (kernel 5.15.0-198), 1 vCPU, ~1 GB RAM + 2.5 GB swap (`/swapfile2g` + a 0.5 GB partition), 25 GB disk; no snapd |
 | Toolchain | rustup, Rust 1.92 (`. ~/.cargo/env`), build-essential; no Docker |
 | Code | `/root/xemm/LIGHTER_ASTER_BOT` (git-tracked files only; no `*.env`, no credentials) |
 | Service | `xemm-dryrun` (systemd): `run --market HYPE --mode dry-run --ack-breaker`, 512 MB cap, SIGINT stop |

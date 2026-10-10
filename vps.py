@@ -201,7 +201,8 @@ def sync():
     # 3 GB start clean (a full build takes ~30 min on the 1 CPU). The apt cache is not needed.
     ssh(f"apt-get clean; cd {REMOTE} && [ $(du -sm target 2>/dev/null | cut -f1) -lt 3072 ]"
         " || (. ~/.cargo/env && cargo clean --release)")
-    # One job: the VPS has 1 CPU and ~1 GB RAM (plus 4 GB swap for the thin-LTO link).
+    # One job: the VPS has 1 CPU and ~1 GB RAM. Only the build needs swap: the thin-LTO link
+    # peaked at 1.27 of its 2.5 GB (2026-10-10); the running services use < 100 MB together.
     ssh(f". ~/.cargo/env && cd {REMOTE} && CARGO_BUILD_JOBS=1 cargo build --release")
     # The bot logs to stdout -> journald; cap it so the small disk only grows by runs/dry-run.
     ssh("mkdir -p /etc/systemd/journald.conf.d && printf '[Journal]\\nSystemMaxUse=200M\\n'"
