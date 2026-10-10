@@ -18,8 +18,9 @@ day is measured), the screener 0.1-0.2, and `runs/dry-run` ~37 MB/day for HYPE (
 journal 26, book sanity 7.5, diagnostics 2, equity 1.5). That is ~25 days of slack on the free
 disk if no pull happens. Disk stays bounded, all set up by `sync` and `pull`:
 
-- `python vps.py pull` (a Windows scheduled task, "XEMM Tokyo pull", runs it daily at 04:00 UTC
-  and appends to `LIGHTER_ASTER_BOT/data-tokyo/pull.log`) copies every closed file (all but the
+- `python vps.py pull` (the Windows scheduled task "XEMM Tokyo pull" runs it daily at 06:00 local
+  time, i.e. 04:00 UTC in summer and 05:00 in winter: after the 00:00 UTC rotations and outside the
+  06-09 UTC stall window; output appended to `LIGHTER_ASTER_BOT/data-tokyo/pull.log`) copies every closed file (all but the
   newest of each directory) to `LIGHTER_ASTER_BOT/data-tokyo/` and `SCREENER/data-tokyo/` at
   ~2 MB/s, file by file, and accepts a copy only when its SHA-256 equals the VPS's
   (`pulled.json` beside them lists the verified files). It deletes a VPS file only once verified
