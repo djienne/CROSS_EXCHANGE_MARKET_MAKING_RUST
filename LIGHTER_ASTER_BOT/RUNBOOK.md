@@ -136,8 +136,9 @@ venue, so a request that escaped to mainnet could not trade. Its files live in
 The venue model targets AWS Tokyo timings, with estimates where measurements are unavailable
 (`[dry_run]` in `bot.toml` cites each value's source):
 
-- **Time shift.** The simulated world is the live one `shift_ms` (1000) late, timestamps
-  included, to absorb this host's feed delay before serving books. A frame
+- **Time shift.** The simulated world is the live one `shift_ms` (10000) late, timestamps
+  included, to absorb this host's feed delay before serving books (sized to its multi-second
+  stalls, not its median; see `bot.toml`). A frame
   that reaches this host later than that is applied on arrival and counted as late. Orders,
   cancels and deadmen wait until the feed has caught up with their time, so a cancel cannot
   beat prints that were late; one that waits over 2 s is answered as unavailable.

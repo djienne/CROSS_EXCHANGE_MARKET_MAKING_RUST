@@ -262,9 +262,14 @@ lighter_symbol      = "ETH"
 [dry_run]
 # The simulated world is the real one delayed by shift_ms. Every frame must reach this host in
 # under shift_ms minus the 250 ms lookahead that matches takers against the worse of the two book
-# states around them. Measured here in Docker on 2026-09-24 (sim-<M>.diag.jsonl `lag_ms`): book
-# p50 ~200 ms, p99 ~390 ms; trades p99 up to ~620 ms. The shift itself is invisible to the bot.
-shift_ms = 1000
+# states around them; a request still waiting for a late frame is answered 503 after 2 s, which
+# the bot must treat as an unknown outcome (the maker then freezes for 70 s+). The shift itself is
+# invisible to the bot (timestamps move with it), so it is sized to the worst lag, not the median.
+# Measured here in Docker 2026-10-09/10 (sim-<M>.diag.jsonl `lag_ms`, 10 h, per-minute max book
+# lag): over 0.75 s in 86-89 % of minutes (Aster, Lighter), over 2.75 s in 51-57 %, over 9.75 s in
+# 9-10 %, over 29.75 s in 1-2 %; the Hyperliquid hub is worse (13 % over 9.75 s). With 1000 ms,
+# 2/3 of the minutes from 06:00 UTC held requests and the HYPE maker spent the morning frozen.
+shift_ms = 10000
 seed     = 0
 aster_port       = 18081
 lighter_port     = 18082
@@ -290,7 +295,11 @@ lighter_account_ms   = [5, 30]
 # Windows IOCs measured 942-973 ms on 2026-09-30, including network and API-to-node forwarding;
 # an info ping removes only the client-to-API trip, so those calls do not set the Tokyo median.
 hyperliquid_rtt_ms  = [200, 900]
-hyperliquid_feed_ms = [5, 30]
+# Hyperliquid's `time` is the block time and its API publishes ~250 ms later even in Tokyo:
+# l2Book (fast) arrival - time on a Tokyo VPS, 2026-10-10, p50 246 / p90 285 / p99 314 ms (Europe
+# 380 ms). Aster and Lighter stamp near their send time (Tokyo p50 6.5 and 0.8 ms), so their
+# [5, 30] above stands.
+hyperliquid_feed_ms = [246, 314]
 # Hidden size ahead of us at our price, as a multiple of the visible size (Aster offers a HIDDEN
 # time in force); calibrate from the prints the visible book cannot explain.
 hidden_queue_multiplier = "0.5"
