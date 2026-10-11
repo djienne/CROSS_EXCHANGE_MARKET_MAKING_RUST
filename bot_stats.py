@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from combined_pnl import copy_end, default_since, iso, iter_jsonl, parse_dt, replay_window, report_roots, utc_now
+from combined_pnl import copy_end, default_since, iso, iter_jsonl, parse_dt, replay_json, replay_window, report_roots, utc_now
 from economics import parse_timestamp, xemm_journal
 
 
@@ -249,6 +249,10 @@ def simulator(runs: Path, market: str, since: datetime, now: datetime) -> dict[s
     if not diag:
         return None
     minutes = sum(r["window_s"] for r in diag) / 60
+    # A replay feeds each tape line `lead_ms` ahead of its arrival on a clock `shift_ms` ahead of
+    # the tape's (tape.rs LEAD_US): less that, its feed lag is the recorder's own, as taped.
+    about = json.loads(found.read_text(encoding="utf-8")) if (found := replay_json(runs)) else None
+    fed_early_ms = about["shift_ms"] - about["lead_ms"] if about else 0
     # A window whose scheduler ran >500 ms late is a host freeze (sleep, VM pause), not the model.
     frozen = {r["ts_ms"] for r in diag if (r["lateness_ms"].get("max") or 0) > 500}
     out: dict[str, Any] = {"minutes": round(minutes, 1), "host_frozen_windows": len(frozen),
@@ -265,7 +269,7 @@ def simulator(runs: Path, market: str, since: datetime, now: datetime) -> dict[s
         out[venue] = {
             "late_frames_pct": round(100 * late / max(frames, 1), 3), "late_frames_pct_unfrozen": round(100 * late_clean, 3),
             "gaps": sum(x["gaps"] for x in v),
-            "book_lag_p99_ms": pct([x["lag_ms"]["book"]["p99"] for x in v if x["lag_ms"].get("book", {}).get("n")], 0.5),
+            "book_lag_p99_ms": pct([round(x["lag_ms"]["book"]["p99"] - fed_early_ms, 2) for x in v if x["lag_ms"].get("book", {}).get("n")], 0.5),
             "rtt_p50_ms": per_window("rtt_ms", "p50"), "rtt_p99_ms": per_window("rtt_ms", "p99"),
             "requests_per_min": round(sum(x["requests"] for x in v) / minutes, 1),
             "orders": sum(x["orders"] for x in v), "rejects": dict(rejects),

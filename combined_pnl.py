@@ -91,15 +91,24 @@ def by_day(trades: list[tuple[datetime | None, Decimal | None]], shift_ms: int) 
     return dict(sorted(days.items()))
 
 
+def replay_json(runs: Path) -> Path | None:
+    """A replay's replay.json, beside its `dry-run/` (`runs`) or in `runs`."""
+    return next((p for p in (runs.parent / "replay.json", runs / "replay.json") if p.exists()), None)
+
+
 def replay_window(runs: Path) -> tuple[str, str, int] | None:
-    """A replay's window on its own clock (`from`/`until` + `shift_ms`) and its shift, from the
-    replay.json beside its `dry-run/` (`runs`) or in `runs`."""
-    for path in (runs.parent / "replay.json", runs / "replay.json"):
-        if path.exists():
-            about = json.loads(path.read_text(encoding="utf-8"))
-            shift = timedelta(milliseconds=about["shift_ms"])
-            return iso(parse_dt(about["from"]) + shift), iso(parse_dt(about["until"]) + shift), about["shift_ms"]
-    return None
+    """A replay's window on its own clock (`from`/`until` + `shift_ms`) and its shift. One still
+    running, or stopped early, ends at its simulator's last minute (diag `ts_ms` closes a window)."""
+    path = replay_json(runs)
+    if path is None:
+        return None
+    about = json.loads(path.read_text(encoding="utf-8"))
+    shift = timedelta(milliseconds=about["shift_ms"])
+    until = parse_dt(about["until"]) + shift
+    ends = [row["ts_ms"] for diag in (path.parent / "dry-run").glob("sim-*.diag.jsonl") for _, row in iter_jsonl(diag)]
+    if ends:
+        until = min(until, datetime.fromtimestamp(max(ends) / 1000, timezone.utc))
+    return iso(parse_dt(about["from"]) + shift), iso(until), about["shift_ms"]
 
 
 def summarize_taker(path: Path, since: datetime, now: datetime, market: str, shift_ms: int = 0) -> dict[str, Any]:

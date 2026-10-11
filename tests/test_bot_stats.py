@@ -153,6 +153,27 @@ class BotStatsTests(unittest.TestCase):
             result = json.loads(proc.stdout)
         self.assertEqual((result["now"][:19], result["hours"]), ("2026-10-11T04:00:00", 4))
 
+    def test_a_replay_stopped_early_ends_at_its_last_minute_and_reports_the_taped_lag(self) -> None:
+        day, lead = 10 * 86_400_000, 120_000
+        start = int(datetime(2026, 10, 1, tzinfo=timezone.utc).timestamp() * 1000) + day
+        # The simulator stamps lag on the replay's clock, fed `lead` early: 250 ms as taped.
+        venue = {"frames": 10, "late_frames": 0, "gaps": 0, "lag_ms": {"book": {"n": 5, "p99": day - lead + 250}},
+                 "requests": 1, "orders": 0, "rejects": {}, "maker_fills": 0, "taker_fills": 0, "prints": 0,
+                 "prints_inside_spread": 0, "prints_over_visible": 0, "account": {"equity": "200", "fees": "0", "funding": "0"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "dry-run"
+            runs.mkdir()
+            (runs.parent / "replay.json").write_text(json.dumps({"from": "2026-10-01T00:00:00Z", "until": "2026-10-02T00:00:00Z",
+                "shift_ms": day, "lead_ms": lead}), encoding="utf-8")
+            # Stopped two hours into its day.
+            write_jsonl(runs / "sim-HYPE.diag.jsonl", [{"ts_ms": start + h * 3_600_000, "window_s": 60,
+                "lateness_ms": {"n": 1, "p99": 2, "max": 2}, "aster": venue} for h in (1, 2)])
+            proc = subprocess.run([sys.executable, bot_stats.__file__, "--market", "HYPE", "--runs", str(runs), "--json"],
+                check=True, capture_output=True, text=True)
+            result = json.loads(proc.stdout)
+        self.assertEqual((result["now"][:19], result["hours"]), ("2026-10-11T02:00:00", 2))
+        self.assertEqual(result["simulator"]["aster"]["book_lag_p99_ms"], 250)
+
 
 if __name__ == "__main__":
     unittest.main()
