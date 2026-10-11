@@ -14,7 +14,7 @@
 //! | `H-`, `HS-` | that Hyperliquid connection ended, or a reconnect failed (empty) |
 //! | `F` | an Aster `premiumIndex` response (funding), every minute |
 //! | `X`, `O` | the Aster `exchangeInfo` and Lighter `orderBooks` responses (filters), hourly |
-//! | `DA`, `DL` | the Aster `depth` (100 levels) and Lighter `orderBookOrders` (250 orders) responses, every minute: the books past the streams' 20 levels, which reach ~5 bps on Aster (Lighter's 100 orders reached 20-26 bps, 250 ~230 bps, on 2026-10-10) |
+//! | `DA`, `DL` | the Aster `depth` (500 levels) and Lighter `orderBookOrders` (250 orders) responses, every minute: the books past the streams' 20 levels, which reach ~5 bps on Aster (on 2026-10-10/11, Aster's 100 levels reached 20-31 bps, 500 ~300 bps; Lighter's 100 orders 20-26 bps, 250 ~180-230 bps) |
 //!
 //! `replay` reads the Aster and Lighter kinds only (tapes before 2026-10-10 have no `H`).
 //! Lines are in the order they arrived, which a reader keeps. Their times are the recording host's
@@ -351,7 +351,7 @@ pub async fn record(config: &Path, market: &str, dir: PathBuf, stop: Cancellatio
     let (tape, writer) = Tape::open(&dir, &market.id().0)?;
     let polls = [
         (SPECS_EVERY, [("X", format!("{aster_base}/fapi/v3/exchangeInfo")), ("O", format!("{lighter_base}/api/v1/orderBooks"))]),
-        (DEPTH_EVERY, [("DA", format!("{aster_base}/fapi/v1/depth?symbol={symbol}&limit=100")),
+        (DEPTH_EVERY, [("DA", format!("{aster_base}/fapi/v1/depth?symbol={symbol}&limit=500")),
             ("DL", format!("{lighter_base}/api/v1/orderBookOrders?market_id={index}&limit=250"))]),
     ];
     for (every, specs) in polls {
