@@ -198,11 +198,16 @@ class XemmSummaryTests(unittest.TestCase):
                                                                  "shift_ms": 3_600_000}), encoding="utf-8")
             write_jsonl(runs / "trades_HYPE.jsonl", [trade("2026-01-03T00:30:00Z"), trade("2026-01-03T01:30:00Z"),
                                                      trade("2026-01-03T02:00:00Z", net="2"), trade("2026-01-03T04:00:00Z")])
+            # The account equity change counts only samples in the window.
+            write_jsonl(runs / "bot-HYPE.equity.jsonl", [{"timestamp": at, "total_equity_usd": eq} for at, eq in [
+                ("2026-01-02T23:59:50Z", "300"), ("2026-01-03T00:00:05Z", "400"), ("2026-01-03T02:59:55.123456789Z", "399.9"),
+                ("2026-01-03T03:00:10Z", "300")]])
             out = json.loads(subprocess.run([sys.executable, combined_pnl.__file__, "--runs", str(runs), "--market", "HYPE", "--json"],
                                             check=True, capture_output=True, text=True).stdout)
         self.assertEqual((out["since"][:19], out["now"][:19], out["shift_ms"]), ("2026-01-03T00:00:00", "2026-01-03T03:00:00", 3_600_000))
         days = {day: (d["trades"], Decimal(d["known_net_pnl_usdc"]), d["incomplete"]) for day, d in out["taker"]["by_day"].items()}
         self.assertEqual(days, {"2026-01-02": (1, Decimal(1), 0), "2026-01-03": (2, Decimal(1), 1)})
+        self.assertEqual((Decimal(out["equity"]["from_usd"]), Decimal(out["equity"]["change_usdc"])), (Decimal(400), Decimal("-0.1")))
 
 
 if __name__ == "__main__":

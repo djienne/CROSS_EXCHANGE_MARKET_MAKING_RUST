@@ -43,7 +43,8 @@ def summary(runs: Path, market: str, since: str | None, now: str | None) -> None
     usd = lambda v: f"{float(v):+.4f}" if v is not None else "?"
     print(f"== {market}: {stats['since'][:16]}Z -> {stats['now'][:16]}Z ({stats['hours']} h)")
     print(f"  net $: taker {usd(pnl['taker']['net_pnl_usdc'])} ({pnl['taker']['trades']} trades), "
-          f"xemm {usd(pnl['xemm']['net_pnl_usdc'])} ({pnl['xemm']['trades']} trades), total {usd(pnl['total']['net_pnl_usdc'])}")
+          f"xemm {usd(pnl['xemm']['net_pnl_usdc'])} ({pnl['xemm']['trades']} trades), total {usd(pnl['total']['net_pnl_usdc'])}; "
+          f"account equity {usd((pnl['equity'] or {}).get('change_usdc'))} (with marks and funding)")
     gate = t["gate"]
     print(f"  taker: last trade {last_trade(runs, market)}, edge kept {t['edge_kept']}, "
           f"expected/realized gross bps {dist(t['expected_gross_bps'], 'mean')}/{dist(t['realized_gross_bps'], 'mean')}, "

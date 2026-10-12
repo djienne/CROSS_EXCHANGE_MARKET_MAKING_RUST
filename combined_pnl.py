@@ -299,6 +299,21 @@ def projection(net: Decimal | None, capital: Decimal | None, since: datetime, no
     return out
 
 
+def equity_change(path: Path, since: datetime, now: datetime) -> dict[str, Any] | None:
+    """The accounts' total equity at the window's first and last sample (bot-<M>.equity.jsonl, every
+    15 s): what execution economics leave out. A position built one way books its spread per trade,
+    but earns it only if the spread closes; meanwhile its two venues' marks swing this by ~$0.1 a
+    sample (HYPE-LH, 10-11). Live, deposits and withdrawals show here too."""
+    if not path.exists():
+        return None
+    rows = [(at, dec(row.get("total_equity_usd"))) for _, row in iter_jsonl(path)
+            if (at := parse_timestamp(row.get("timestamp"))) and since <= at <= now]
+    if not rows:
+        return None
+    (start, first), (end, last) = rows[0], rows[-1]
+    return {"from": start, "until": end, "from_usd": first, "until_usd": last, "change_usdc": last - first}
+
+
 def combine(args: argparse.Namespace) -> dict[str, Any]:
     since = parse_dt(args.since)
     now = parse_dt(args.now) if args.now else utc_now()
@@ -362,7 +377,8 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
         capital, capital_source = latest_capital_from_state(args.orchestrator_state)
     proj = projection(total["net_pnl_usdc"], capital, since, now)
     notes = [
-        "Execution economics include matched spread and explicit recovery closes; portfolio marks and funding are excluded.",
+        "Execution economics include matched spread and explicit recovery closes; portfolio marks and funding are excluded "
+        "(the account equity line includes them).",
         "Unknown/legacy fee evidence makes full net totals and return projections unavailable; known subtotals remain visible.",
         "Known net subtotals exclude unresolved rows; estimated recovery losses are shown separately.",
         "By default XEMM includes only the production run/orchestrator journals. Pass --xemm-journal for exact files or --xemm-runs-dir for an mtime-based scan.",
@@ -389,6 +405,7 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
         "xemm": xemm,
         "total": total,
         "projection": proj,
+        "equity": equity_change(args.equity, since, now),
         "capital_source": capital_source,
         "notes": notes,
     }
@@ -477,6 +494,9 @@ def print_human(result: dict[str, Any]) -> None:
     print(f"Known net subtotal: {fmt_money(result['total']['known_net_pnl_usdc'])}; "
           f"estimated recovery net: {fmt_money(result['total']['estimated_net_pnl_usdc'])}; "
           f"incomplete trades: {result['total']['incomplete_trades']}")
+    if eq := result["equity"]:
+        print(f"Account equity (marks and funding included): {eq['from_usd']:.4f} -> {eq['until_usd']:.4f} USDC "
+              f"({fmt_money(eq['change_usdc'], places=4)}), {iso(eq['from'])} -> {iso(eq['until'])}")
     print_table(
         "Projection",
         ["Metric", "Value"],
@@ -554,6 +574,7 @@ def parse_args() -> argparse.Namespace:
     explicit_xemm_runs_dirs = args.xemm_runs_dir is not None
     if args.taker_trades is None:
         args.taker_trades = bot_runs / f"trades_{args.market}.jsonl"
+    args.equity = bot_runs / f"bot-{args.market}.equity.jsonl"
     if args.xemm_runs_dir is None:
         args.xemm_runs_dir = []
     if not explicit_xemm_journals and not explicit_xemm_runs_dirs:
