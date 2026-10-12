@@ -38,6 +38,9 @@ services:
   # scores in memory (~1 GB a day with Hyperliquid, measured 2026-09-26): past ~a week, score a
   # range with --since/--until.
   report:
+    # Its own `build:` too: a missing image is built here (`docker compose build report`), not
+    # pulled, now that `screener` sits behind the "collect" profile.
+    build: .
     image: aster_lighter_screener:latest
     profiles: ["report"]
     entrypoint: ["screener", "report"]

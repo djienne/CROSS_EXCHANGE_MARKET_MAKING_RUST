@@ -182,6 +182,9 @@ struct Data {
     series: BTreeMap<String, Series>,
     /// (file, recording, history?, format version)
     recordings: Vec<(String, Recording, bool, u64)>,
+    /// The scored span [from, to) in ms: `--since` 00:00 to the day after `--until`, UTC. A day's
+    /// file closes a few seconds past midnight, and a pre-roll can reach before it.
+    scored: Option<(i64, i64)>,
 }
 
 impl Data {
@@ -189,6 +192,9 @@ impl Data {
     /// for the gate.
     fn add(&mut self, file: &str, line: &str, history: bool) -> Result<()> {
         let f: Vec<&str> = line.split('\t').collect();
+        if !history && matches!(f[0], "B" | "T" | "R") && f.len() > 1 && !self.scores(f[1].parse()?) {
+            return Ok(());
+        }
         match f[0] {
             "P" => {
                 let params: Value = serde_json::from_str(f[1])?;
@@ -231,14 +237,19 @@ impl Data {
                 let mut s: Value = serde_json::from_str(f[1])?;
                 s["p"] = Value::String(universe::qualified(s["p"].as_str().context("summary without pair")?));
                 let series = self.series.entry(s["p"].as_str().unwrap_or_default().to_string()).or_default();
-                series.windows.push((s["t"].as_i64().context("a summary without its time")?, serde_json::from_value(s["samples"].clone())?));
-                if !history {
+                let t = s["t"].as_i64().context("a summary without its time")?;
+                series.windows.push((t, serde_json::from_value(s["samples"].clone())?));
+                if !history && self.scores(t) {
                     series.summaries.push(s);
                 }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    fn scores(&self, t: i64) -> bool {
+        self.scored.is_none_or(|(from, to)| from <= t && t < to)
     }
 
     /// Puts each series in time order (a pre-roll can be written after later states).
@@ -260,7 +271,10 @@ fn leg(file: &str, code: &str) -> Result<Leg> {
 /// The data of the days `since..=until`, plus the samples of the `history_days` before `since`.
 fn load(dir: &Path, since: Option<&str>, until: Option<&str>, history_days: u64) -> Result<Data> {
     let first = since.map(|s| -> Result<String> { Ok((NaiveDate::parse_from_str(s, "%Y-%m-%d")? - Days::new(history_days)).to_string()) }).transpose()?;
-    let mut data = Data::default();
+    let midnight = |day: &str| -> Result<i64> { Ok(NaiveDate::parse_from_str(day, "%Y-%m-%d")?.and_time(chrono::NaiveTime::MIN).and_utc().timestamp_millis()) };
+    let from = since.map(midnight).transpose()?.unwrap_or(i64::MIN);
+    let to = until.map(|u| midnight(u).map(|t| t + 86_400_000)).transpose()?.unwrap_or(i64::MAX);
+    let mut data = Data { scored: Some((from, to)), ..Data::default() };
     for file in crate::store::files(dir, first.as_deref(), until)? {
         let name = file.file_name().unwrap_or_default().to_string_lossy().to_string();
         // Names start with the day: "2026-09-25T..." sorts before "2026-09-26".
@@ -1112,6 +1126,26 @@ mod tests {
         assert_eq!(spearman(&[1.0, 2.0, 3.0, 4.0], &[10.0, 20.0, 30.0, 40.0]), Some(1.0));
         assert_eq!(spearman(&[1.0, 2.0, 3.0], &[3.0, 2.0, 1.0]), Some(-1.0));
         assert_eq!(spearman(&[1.0, 1.0, 1.0], &[1.0, 2.0, 3.0]), None);
+    }
+
+    #[test]
+    fn a_report_scores_only_its_days() {
+        // 2026-10-11 00:00 UTC; that day's file runs 6 s past midnight and pre-rolls 1 ms before it.
+        const DAY: i64 = 1_791_676_800_000;
+        let dir = std::env::temp_dir().join(format!("screener-days-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, times: &[i64]| {
+            let lines: String = times.iter().map(|t| format!("B\t{t}\tX\t100\t101\t100\t101\t15\nT\t{t}\tX\tL\t101\t1\tB\n")).collect();
+            std::fs::write(dir.join(name), zstd::bulk::compress(lines.as_bytes(), 3).unwrap()).unwrap();
+        };
+        file("2026-10-10T000000Z.screen.zst", &[DAY - 43_200_000]);
+        file("2026-10-11T000000Z.screen.zst", &[DAY - 1, DAY, DAY + 43_200_000, DAY + 86_400_000 + 6_000]);
+        let data = load(&dir, Some("2026-10-11"), Some("2026-10-11"), 1).unwrap();
+        let x = &data.series["A-L:X"];
+        assert_eq!(x.states.iter().map(|s| s.t).collect::<Vec<_>>(), [DAY, DAY + 43_200_000]);
+        assert_eq!(x.trades.len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
