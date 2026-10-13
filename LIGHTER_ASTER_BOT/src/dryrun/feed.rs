@@ -597,6 +597,12 @@ pub struct Upstream {
     inputs: mpsc::UnboundedSender<Input>,
     /// The latest engine time handed on since the last break.
     last_us: Option<i64>,
+    /// Just past the last break, which the core runs in engine-time order: a resubscribe's
+    /// snapshot of a book unchanged since repeats its last update's `last_updated_at` (tape
+    /// 2026-10-10 22:19:00.521), so stamped as is it ran before the break and was wiped until the
+    /// next snapshot (12 h of a replay). Frames after a break are stamped no earlier; a tie runs
+    /// in arrival order.
+    after_break_us: i64,
     sequences: HashMap<String, Sequence>,
     /// Each Lighter market's last settlement: `market_stats` repeats it.
     settled: HashMap<String, i64>,
@@ -604,12 +610,13 @@ pub struct Upstream {
 
 impl Upstream {
     pub fn new(venue: Venue, markets: Vec<String>, shift_us: i64, hub: Arc<Mutex<Hub>>, inputs: mpsc::UnboundedSender<Input>) -> Self {
-        Self { venue, markets, shift_us, hub, inputs, last_us: None, sequences: HashMap::new(), settled: HashMap::new() }
+        Self { venue, markets, shift_us, hub, inputs, last_us: None, after_break_us: i64::MIN, sequences: HashMap::new(), settled: HashMap::new() }
     }
 
     fn pass(&mut self, frame: Result<Option<Frame>>) {
         match frame {
-            Ok(Some(frame)) => {
+            Ok(Some(mut frame)) => {
+                frame.engine_us = frame.engine_us.max(self.after_break_us);
                 // The latest, not the last: an aggTrade's stamp runs ~190 ms behind the books'.
                 self.last_us = self.last_us.max(Some(frame.engine_us));
                 forward(frame, &self.hub, &self.inputs);
@@ -665,6 +672,7 @@ impl Upstream {
     pub fn closed(&mut self) {
         if let Some(last_us) = self.last_us.take() {
             gap(self.venue, &self.markets, last_us, &self.hub, &self.inputs);
+            self.after_break_us = last_us + 1;
         }
         self.sequences.clear();
     }
@@ -856,6 +864,25 @@ pub(crate) mod tests {
         format!(
             r#"{{"channel":"order_book:24","last_updated_at":{engine},"offset":{offset},"order_book":{{"code":0,"asks":{asks},"bids":{bids},"offset":{offset},"nonce":{nonce},"last_updated_at":{engine},"begin_nonce":{begin}}},"timestamp":{publish_ms},"type":"{kind}/order_book"}}"#
         )
+    }
+
+    #[test]
+    fn a_snapshot_repeating_the_last_update_time_runs_after_the_break() {
+        let hub = Arc::new(Mutex::new(Hub::new(0, ["order_book/24".to_string()])));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut up = Upstream::new(Venue::Lighter, vec!["24".into()], 0, hub, tx);
+        let (bid, ask) = (r#"[{"price":"40.1","size":"2"}]"#, r#"[{"price":"40.3","size":"1"}]"#);
+        assert!(up.lighter(&lighter("subscribed", 0, 10, 5_000, bid, ask)));
+        assert!(up.lighter(&lighter("update", 10, 11, 5_050, "[]", "[]")));
+        up.closed();
+        // The recorder's restart: the new connection's snapshot carries the same engine time.
+        assert!(up.lighter(&lighter("subscribed", 0, 20, 5_050, bid, ask)));
+        let mut stamps = Vec::new();
+        while let Ok(Input::Frame { exch_us, event, .. }) = rx.try_recv() {
+            stamps.push((exch_us, matches!(event, FeedEvent::Gap)));
+        }
+        let last = 5_050_000 - 11_400;
+        assert_eq!(stamps, [(5_000_000 - 11_400, false), (last, false), (last + 1, true), (last + 1, false)]);
     }
 
     #[test]
