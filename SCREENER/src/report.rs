@@ -236,10 +236,11 @@ impl Data {
             "S" => {
                 let mut s: Value = serde_json::from_str(f[1])?;
                 s["p"] = Value::String(universe::qualified(s["p"].as_str().context("summary without pair")?));
-                let series = self.series.entry(s["p"].as_str().unwrap_or_default().to_string()).or_default();
                 let t = s["t"].as_i64().context("a summary without its time")?;
+                let scored = !history && self.scores(t);
+                let series = self.series.entry(s["p"].as_str().unwrap_or_default().to_string()).or_default();
                 series.windows.push((t, serde_json::from_value(s["samples"].clone())?));
-                if !history && self.scores(t) {
+                if scored {
                     series.summaries.push(s);
                 }
             }
