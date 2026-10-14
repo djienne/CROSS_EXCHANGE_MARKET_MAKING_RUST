@@ -156,9 +156,9 @@ impl Replica {
         self.book.asks.upsert(ask.0, ask.1);
     }
 
-    /// Liquidity a `taker` order can take, best first, up to `limit`: at each level the smaller
-    /// of this state and `next` (the state after the next update, when the bracket has one;
-    /// matching must assume the worse of the two), less what we already took.
+    /// Liquidity a `taker` order can take, best first, up to `limit`: the worse of this state
+    /// and `next` (the state after the next update, when the bracket has one; matching must
+    /// assume the worse of the two), less what we already took.
     pub fn takeable(&self, next: Option<&Replica>, taker: Side, limit: Option<Decimal>) -> Vec<Level> {
         let side = taker.opposite();
         let within = |price: Decimal| {
@@ -167,10 +167,13 @@ impl Replica {
                 Side::Sell => price >= limit,
             })
         };
-        self.levels(side)
-            .take_while(|&(price, _)| within(price))
+        let shown = |replica: &Replica| -> Vec<Level> { replica.levels(side).take_while(|&(price, _)| within(price)).collect() };
+        let levels = match next {
+            Some(next) => worse(&shown(self), &shown(next), taker),
+            None => shown(self),
+        };
+        levels.into_iter()
             .filter_map(|(price, size)| {
-                let size = next.map_or(size, |next| size.min(next.book_side(side).size_at(price)));
                 let free = size - self.consumed_at(side, price);
                 (free > Decimal::ZERO).then_some((price, free))
             })
@@ -181,6 +184,42 @@ impl Replica {
     /// already emptied)?
     pub fn crosses(&self, side: Side, price: Decimal) -> bool {
         !self.takeable(None, side, Some(price)).is_empty()
+    }
+}
+
+/// The worse of two states for a `taker` at every quantity, as levels best first: the lower
+/// envelope of their depth curves (the size at prices at least as good). A level-by-level
+/// minimum would be worse than both whenever liquidity moved between prices, and empty once
+/// the market moved through every level shown (Hyperliquid's 5 levels within one ~0.5 s
+/// snapshot: IOC hedges refused "no match" with the tape well inside their bound, 2026-10-12).
+fn worse(a: &[Level], b: &[Level], taker: Side) -> Vec<Level> {
+    let before = |x: Decimal, y: Decimal| match taker {
+        Side::Buy => x < y,
+        Side::Sell => x > y,
+    };
+    let (mut i, mut j) = (0, 0);
+    let (mut depth_a, mut depth_b, mut listed) = (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+    let mut levels = Vec::new();
+    loop {
+        let price = match (a.get(i), b.get(j)) {
+            (Some(x), Some(y)) if before(y.0, x.0) => y.0,
+            (Some(x), _) => x.0,
+            (None, Some(y)) => y.0,
+            (None, None) => return levels,
+        };
+        if a.get(i).is_some_and(|l| l.0 == price) {
+            depth_a += a[i].1;
+            i += 1;
+        }
+        if b.get(j).is_some_and(|l| l.0 == price) {
+            depth_b += b[j].1;
+            j += 1;
+        }
+        let depth = depth_a.min(depth_b);
+        if depth > listed {
+            levels.push((price, depth - listed));
+            listed = depth;
+        }
     }
 }
 
@@ -248,8 +287,15 @@ mod tests {
         let cur = aster();
         let mut next = cur.clone();
         next.apply(2_000, &BookUpdate::Delta { bids: vec![], asks: levels(&[(101, 0), (102, 9)]) });
+        // Up to 102: 10 now (5 of them at 101), 9 next, all at 102. The worse is next's.
         let got = cur.takeable(Some(&next), Side::Buy, Some(dec!(102)));
-        assert_eq!(got, vec![(dec!(102), dec!(5))]);
+        assert_eq!(got, vec![(dec!(102), dec!(9))]);
+        // Sharing a price with neither, the market moved through every level shown: the
+        // taker still gets the next state's, never the empty overlap.
+        let mut moved = cur.clone();
+        moved.apply(3_000, &BookUpdate::Replace { bids: levels(&[(96, 4), (95, 6)]), asks: levels(&[(104, 2)]) });
+        assert_eq!(cur.takeable(Some(&moved), Side::Sell, Some(dec!(95))), levels(&[(96, 4), (95, 6)]));
+        assert_eq!(cur.takeable(Some(&moved), Side::Buy, Some(dec!(104))), levels(&[(104, 2)]));
         assert!(!cur.crosses(Side::Buy, dec!(100)));
         assert!(cur.crosses(Side::Buy, dec!(101)) && !next.crosses(Side::Buy, dec!(101)));
         assert!(cur.crosses(Side::Sell, dec!(99)));
