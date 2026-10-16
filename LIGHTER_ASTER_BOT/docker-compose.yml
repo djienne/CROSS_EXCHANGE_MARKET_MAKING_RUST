@@ -195,7 +195,7 @@ services:
 
   # A backtest: the dry run against the tape (data-tokyo/ or data/, see `replay --help`) instead of the live market, at its own
   # pace (RUNBOOK.md, "Backtest"). Never started by `up`; one container per window, side by side:
-  #   docker compose run -d --name replay-0928 replay replay --market HYPE --from 2026-09-28T00:00:00Z --until 2026-09-29T00:00:00Z
+  #   docker compose run -d --rm --name replay-0928 replay replay --market HYPE --from 2026-09-28T00:00:00Z --until 2026-09-29T00:00:00Z
   # No network at all: a replay cannot reach a venue.
   replay:
     profiles: ["replay"]

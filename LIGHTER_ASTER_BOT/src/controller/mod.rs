@@ -221,6 +221,7 @@ pub(crate) async fn replay_with(mut cfg: BotConfig, runs_root: &Path, market: &s
     about["shift_ms"] = (shift_us / 1_000).into();
     about["dry_run"] = serde_json::to_value(&*dry)?;
     std::fs::create_dir_all(dir.join("dry-run"))?;
+    crate::log_copy::to(&dir.join("replay.log"))?;
     about["gate_samples"] = seed_gate(&cfg, &gate_source, &market, from_us, shift_us, &dir.join("dry-run"))?.into();
     std::fs::write(dir.join("replay.json"), format!("{about:#}\n"))?;
     run_with(cfg, &dir, &market, LiveMode::DryRun, false, false, stop).await
@@ -710,6 +711,9 @@ mod tests {
         assert_eq!((row.economic_status, row.direction.as_str()), (crate::taker::pnl::EconomicStatus::Confirmed, "SELL_LIGHTER_BUY_ASTER"), "{row:?}");
         assert_eq!((row.aster_fill.vwap, row.hedge_fill.vwap), (dec!(98), dec!(99)), "each leg took the top: {row:?}");
         assert!((row.hedge_fill.fee_usd - row.hedge_fill.notional * dec!(0.00028)).abs() < dec!(0.000001), "Premium's taker fee charged: {row:?}");
+        // Its log is copied into its directory, so its container can run with --rm.
+        std::io::Write::write_all(&mut crate::log_copy::Tee, b"logged\n").unwrap();
+        assert!(std::fs::read_to_string(runs[0].join("replay.log")).unwrap().contains("logged"));
         let about: Value = serde_json::from_str(&std::fs::read_to_string(runs[0].join("replay.json")).unwrap()).unwrap();
         assert_eq!(about["gate_samples"], 60, "the hour before --from, Premium's floor: {about}");
         let bps = |key: &str| about["fees"][key].as_str().unwrap().parse::<Decimal>().unwrap();

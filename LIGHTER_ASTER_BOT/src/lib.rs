@@ -27,6 +27,8 @@ pub mod metrics;
 pub mod position;
 pub mod quote_engine;
 pub mod live_report;
+/// The log on stdout, plus a copy in a file a run picks once it knows its directory.
+pub mod log_copy;
 /// Taker–taker arbitrage engine (`run`'s taker; `lighter_aster_bot taker ...` on its own).
 pub mod taker;
 pub mod types;

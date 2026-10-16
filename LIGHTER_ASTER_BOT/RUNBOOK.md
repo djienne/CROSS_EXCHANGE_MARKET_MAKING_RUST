@@ -302,10 +302,14 @@ one per UTC day and per recorder start, named after the first line's arrival: ta
 on the day do not reach the bot. The `replay` service has no network at all and no credentials.
 
 ```bash
-docker compose run -d --name replay-0928 replay replay --market HYPE --from 2026-09-28T00:00:00Z --until 2026-09-29T00:00:00Z
+docker compose run -d --rm --name replay-0928 replay replay --market HYPE --from 2026-09-28T00:00:00Z --until 2026-09-29T00:00:00Z
 docker logs -f replay-0928
 python ../dryrun_summary.py --runs LIGHTER_ASTER_BOT/runs/replay/HYPE-20260928T000000Z-20260929T000000Z-k1-standard-s0
 ```
+
+Always `--rm`: a finished replay's container then goes by itself. Its log is copied into its
+directory as `replay.log` (all but its first second of startup), so nothing is lost with it; kept containers
+piled up in Docker and two cleanups saving their logs lost 12 of them (2026-10-16).
 
 - **Pace.** It runs at the market's own pace (a day takes a day, after ~2 minutes of warm-up),
   at ~30 MB and a few % of a core; windows run side by side on free ports. Its start reads the
