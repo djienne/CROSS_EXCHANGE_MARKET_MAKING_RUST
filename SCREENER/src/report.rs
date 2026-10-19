@@ -56,6 +56,11 @@ pub struct Args {
     /// JSON instead of a table.
     #[arg(long)]
     json: bool,
+    /// Scores the pairs in N passes over the files, each holding 1/N of them: the same report (each
+    /// pair is scored on its own), N times the read time, less memory (10-17 at N=3: 0.67 GB, not
+    /// 1.36). 12-18/10 (~236 M lines) went over 16 GB in one pass.
+    #[arg(long, default_value_t = 1)]
+    pair_groups: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -185,14 +190,28 @@ struct Data {
     /// The scored span [from, to) in ms: `--since` 00:00 to the day after `--until`, UTC. A day's
     /// file closes a few seconds past midnight, and a pre-roll can reach before it.
     scored: Option<(i64, i64)>,
+    /// (group, groups): only the pairs of one `--pair-groups` pass; None for all.
+    group: Option<(u64, u64)>,
+}
+
+/// A pair's group of `n` (FNV-1a: the same in every pass and on every platform).
+fn group_of(pair: &str, n: u64) -> u64 {
+    pair.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3)) % n
 }
 
 impl Data {
+    fn mine(&self, pair: &str) -> bool {
+        self.group.is_none_or(|(g, n)| group_of(pair, n) == g)
+    }
+
     /// Adds one line of `file`. A history file (a day before `--since`) gives only its samples,
     /// for the gate.
     fn add(&mut self, file: &str, line: &str, history: bool) -> Result<()> {
         let f: Vec<&str> = line.split('\t').collect();
         if !history && matches!(f[0], "B" | "T" | "R") && f.len() > 1 && !self.scores(f[1].parse()?) {
+            return Ok(());
+        }
+        if matches!(f[0], "B" | "T" | "R") && f.len() > 2 && !self.mine(&universe::qualified(f[2])) {
             return Ok(());
         }
         match f[0] {
@@ -236,6 +255,9 @@ impl Data {
             "S" => {
                 let mut s: Value = serde_json::from_str(f[1])?;
                 s["p"] = Value::String(universe::qualified(s["p"].as_str().context("summary without pair")?));
+                if !self.mine(s["p"].as_str().unwrap_or_default()) {
+                    return Ok(());
+                }
                 let t = s["t"].as_i64().context("a summary without its time")?;
                 let scored = !history && self.scores(t);
                 let series = self.series.entry(s["p"].as_str().unwrap_or_default().to_string()).or_default();
@@ -269,13 +291,14 @@ fn leg(file: &str, code: &str) -> Result<Leg> {
     Ok(match code { "A" | "0" => Leg::Left, "L" | "1" => Leg::Right, _ => bail!("{file}: invalid leg {code}") })
 }
 
-/// The data of the days `since..=until`, plus the samples of the `history_days` before `since`.
-fn load(dir: &Path, since: Option<&str>, until: Option<&str>, history_days: u64) -> Result<Data> {
+/// The data of the days `since..=until`, plus the samples of the `history_days` before `since`;
+/// with a `group`, only its pairs' series.
+fn load(dir: &Path, since: Option<&str>, until: Option<&str>, history_days: u64, group: Option<(u64, u64)>) -> Result<Data> {
     let first = since.map(|s| -> Result<String> { Ok((NaiveDate::parse_from_str(s, "%Y-%m-%d")? - Days::new(history_days)).to_string()) }).transpose()?;
     let midnight = |day: &str| -> Result<i64> { Ok(NaiveDate::parse_from_str(day, "%Y-%m-%d")?.and_time(chrono::NaiveTime::MIN).and_utc().timestamp_millis()) };
     let from = since.map(midnight).transpose()?.unwrap_or(i64::MIN);
     let to = until.map(|u| midnight(u).map(|t| t + 86_400_000)).transpose()?.unwrap_or(i64::MAX);
-    let mut data = Data { scored: Some((from, to)), ..Data::default() };
+    let mut data = Data { scored: Some((from, to)), group, ..Data::default() };
     for file in crate::store::files(dir, first.as_deref(), until)? {
         let name = file.file_name().unwrap_or_default().to_string_lossy().to_string();
         // Names start with the day: "2026-09-25T..." sorts before "2026-09-26".
@@ -710,36 +733,7 @@ pub fn run(cfg: &Report, args: &Args) -> Result<()> {
             Timing::Delays(s)
         }
     };
-    let data = load(&args.data, args.since.as_deref(), args.until.as_deref(), (cfg.taker.gate_window_hours / 24.0).ceil() as u64)?;
-    for (file, rec, history, version) in &data.recordings {
-        rec.check(&cfg, lighter, &data.pairs).with_context(|| format!("{file}: these settings would trade on moments it did not record"))?;
-        ensure!(*history || *version >= 4 || !matches!(timing, Timing::Delays(_)), "{file}: format v{version} has no venue stamps or stall spans for a scenario; score newer days (--since)");
-        if !history {
-            for name in rec.floors.keys() {
-                if let Some(pair) = data.pairs.get(name) { rec.check_latency(&cfg, pair, args.latency).with_context(|| file.clone())?; }
-            }
-        }
-    }
-    let empty = Series::default();
-    let mut scores: Vec<Score> = data.pairs.values().map(|p| score(&cfg, args.latency, p, data.series.get(&p.name).unwrap_or(&empty), timing)).collect::<Result<_>>()?;
-    scores.retain(|s| s.days > 0.0);
-    scores.sort_by(|a, b| b.best_usd_day.total_cmp(&a.best_usd_day));
-
-    // Does the ranking hold from one day to the next? Mean Spearman over consecutive days.
-    let all_days: std::collections::BTreeSet<i64> = scores.iter().flat_map(|s| data.series[&s.pair].summaries.iter().filter_map(|x| x["t"].as_i64()).map(day)).collect();
-    let days: Vec<i64> = all_days.into_iter().collect();
-    let correlations: Vec<f64> = days
-        .windows(2)
-        .filter_map(|w| {
-            // Newly collected routes have no result on earlier days, rather than zero PnL.
-            let shared: Vec<_> = scores.iter().filter(|s| w.iter().all(|d| data.series[&s.pair].summaries.iter().any(|v|
-                v["t"].as_i64().is_some_and(|t| day(t) == *d) && v["up"].as_f64().unwrap_or(0.0) > 0.0))).collect();
-            let at = |d: i64| shared.iter().map(|s| s.best_by_day.get(&d).copied().unwrap_or(0.0)).collect::<Vec<_>>();
-            spearman(&at(w[0]), &at(w[1]))
-        })
-        .collect();
-    let stability = (!correlations.is_empty()).then(|| correlations.iter().sum::<f64>() / correlations.len() as f64);
-    let delays = feed_delays(&data);
+    let (scores, stability, delays) = rank(&cfg, lighter, args, timing)?;
     let scenario = match timing { Timing::Delays(s) => serde_json::to_value(s)?, _ => Value::String(args.scenario.clone().unwrap_or("arrival".into())) };
 
     if args.json {
@@ -788,11 +782,53 @@ pub fn run(cfg: &Report, args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// Per venue, the feed delay here of its book changes and of its prints (arrival minus the
-/// venue's stamp, v3 lines; 0 means none): [p50, p99, samples] ms. The difference between a
-/// venue's prints and books is what `aster_print_delay_ms` models on arrival time.
-fn feed_delays(data: &Data) -> BTreeMap<universe::Venue, Value> {
-    let mut ages: BTreeMap<universe::Venue, [Vec<i32>; 2]> = BTreeMap::new();
+/// The scores, best first, the day-to-day rank correlation and the feed delays here, in
+/// `--pair-groups` passes.
+fn rank(cfg: &Report, lighter: &crate::config::LighterTier, args: &Args, timing: Timing) -> Result<(Vec<Score>, Option<f64>, BTreeMap<universe::Venue, Value>)> {
+    ensure!(args.pair_groups >= 1, "--pair-groups must be at least 1");
+    let (mut scores, mut summaries, mut ages) = (Vec::new(), BTreeMap::new(), BTreeMap::new());
+    for g in 0..args.pair_groups {
+        let group = (args.pair_groups > 1).then_some((g, args.pair_groups));
+        let data = load(&args.data, args.since.as_deref(), args.until.as_deref(), (cfg.taker.gate_window_hours / 24.0).ceil() as u64, group)?;
+        for (file, rec, history, version) in data.recordings.iter().filter(|_| g == 0) {
+            rec.check(cfg, lighter, &data.pairs).with_context(|| format!("{file}: these settings would trade on moments it did not record"))?;
+            ensure!(*history || *version >= 4 || !matches!(timing, Timing::Delays(_)), "{file}: format v{version} has no venue stamps or stall spans for a scenario; score newer days (--since)");
+            if !history {
+                for name in rec.floors.keys() {
+                    if let Some(pair) = data.pairs.get(name) { rec.check_latency(cfg, pair, args.latency).with_context(|| file.clone())?; }
+                }
+            }
+        }
+        let empty = Series::default();
+        for p in data.pairs.values().filter(|p| data.mine(&p.name)) {
+            scores.push(score(cfg, args.latency, p, data.series.get(&p.name).unwrap_or(&empty), timing)?);
+        }
+        feed_ages(&data, &mut ages);
+        summaries.extend(data.series.into_iter().map(|(name, s)| (name, s.summaries)));
+    }
+    scores.retain(|s| s.days > 0.0);
+    // Equal $/day keep the pairs' name order, whatever the passes.
+    scores.sort_by(|a, b| b.best_usd_day.total_cmp(&a.best_usd_day).then_with(|| a.pair.cmp(&b.pair)));
+
+    // Does the ranking hold from one day to the next? Mean Spearman over consecutive days.
+    let all_days: std::collections::BTreeSet<i64> = scores.iter().flat_map(|s| summaries[&s.pair].iter().filter_map(|x| x["t"].as_i64()).map(day)).collect();
+    let days: Vec<i64> = all_days.into_iter().collect();
+    let correlations: Vec<f64> = days
+        .windows(2)
+        .filter_map(|w| {
+            // Newly collected routes have no result on earlier days, rather than zero PnL.
+            let shared: Vec<_> = scores.iter().filter(|s| w.iter().all(|d| summaries[&s.pair].iter().any(|v|
+                v["t"].as_i64().is_some_and(|t| day(t) == *d) && v["up"].as_f64().unwrap_or(0.0) > 0.0))).collect();
+            let at = |d: i64| shared.iter().map(|s| s.best_by_day.get(&d).copied().unwrap_or(0.0)).collect::<Vec<_>>();
+            spearman(&at(w[0]), &at(w[1]))
+        })
+        .collect();
+    let stability = (!correlations.is_empty()).then(|| correlations.iter().sum::<f64>() / correlations.len() as f64);
+    Ok((scores, stability, feed_delays(ages)))
+}
+
+/// Adds `data`'s feed delays here, per venue, to `ages` (book changes, prints).
+fn feed_ages(data: &Data, ages: &mut BTreeMap<universe::Venue, [Vec<i32>; 2]>) {
     for (name, s) in &data.series {
         let Some(pair) = data.pairs.get(name) else { continue };
         for (k, (market, leg)) in [(&pair.left, Leg::Left), (&pair.right, Leg::Right)].into_iter().enumerate() {
@@ -808,6 +844,12 @@ fn feed_delays(data: &Data) -> BTreeMap<universe::Venue, Value> {
             prints.extend(s.trades.iter().filter(|t| t.venue == leg && t.age != 0).map(|t| t.age));
         }
     }
+}
+
+/// Per venue, the feed delay here of its book changes and of its prints (arrival minus the
+/// venue's stamp, v3 lines; 0 means none): [p50, p99, samples] ms. The difference between a
+/// venue's prints and books is what `aster_print_delay_ms` models on arrival time.
+fn feed_delays(ages: BTreeMap<universe::Venue, [Vec<i32>; 2]>) -> BTreeMap<universe::Venue, Value> {
     let quantiles = |v: &mut Vec<i32>| {
         v.sort_unstable();
         let at = |q: f64| v.get(((v.len() as f64 * q) as usize).min(v.len().saturating_sub(1))).copied();
@@ -1142,10 +1184,48 @@ mod tests {
         };
         file("2026-10-10T000000Z.screen.zst", &[DAY - 43_200_000]);
         file("2026-10-11T000000Z.screen.zst", &[DAY - 1, DAY, DAY + 43_200_000, DAY + 86_400_000 + 6_000]);
-        let data = load(&dir, Some("2026-10-11"), Some("2026-10-11"), 1).unwrap();
+        let data = load(&dir, Some("2026-10-11"), Some("2026-10-11"), 1, None).unwrap();
         let x = &data.series["A-L:X"];
         assert_eq!(x.states.iter().map(|s| s.t).collect::<Vec<_>>(), [DAY, DAY + 43_200_000]);
         assert_eq!(x.trades.len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pair_groups_give_the_same_report() {
+        // 2026-10-11 00:00 UTC; five pairs over two days, Lighter's bid wandering over Aster's ask.
+        const DAY: i64 = 1_791_676_800_000;
+        let dir = std::env::temp_dir().join(format!("screener-groups-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let names = ["X", "Y", "Z", "W", "V"];
+        let pairs = names.iter().enumerate().map(|(i, n)| format!(r#"{{"name":"{n}","aster":"{n}USDT","lighter_id":{i},"scale":1.0,"aster_subtypes":[],"aster_volume_usd":0.0,"lighter_volume_usd":0.0}}"#)).collect::<Vec<_>>().join(",");
+        for d in 0..2i64 {
+            let t0 = DAY + d * 86_400_000;
+            let mut lines = format!("U\t[{pairs}]\n");
+            for (i, n) in names.iter().enumerate() {
+                lines += &format!("S\t{{\"t\":{t0},\"p\":\"{n}\",\"samples\":{{\"30\":50}},\"up\":3600}}\n");
+                for k in 0..200i64 {
+                    let t = t0 + k * 7_000 + i as i64;
+                    let bid = 100.0 + 0.05 * ((k * (i as i64 + 1 + d)) % 7) as f64;
+                    lines += &format!("B\t{t}\t{n}\t100\t100.01\t{bid:.2}\t{:.2}\t15\nT\t{}\t{n}\tL\t{bid:.2}\t5\tB\n", bid + 0.01, t + 3);
+                }
+            }
+            let file = format!("2026-10-{}T000000Z.screen.zst", 11 + d);
+            std::fs::write(dir.join(file), zstd::bulk::compress(lines.as_bytes(), 3).unwrap()).unwrap();
+        }
+        let cfg = crate::config::Config::load(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/screener.toml"))).unwrap().report;
+        let report = |pair_groups| {
+            let args = Args { data: dir.clone(), since: None, until: None, lighter: None, latency: 1.0, scenario: None, json: true, pair_groups };
+            let (scores, stability, delays) = rank(&cfg, cfg.lighter().unwrap(), &args, Timing::Arrival).unwrap();
+            (serde_json::to_value(&scores).unwrap(), scores.iter().map(|s| s.best_by_day.clone()).collect::<Vec<_>>(), stability, delays)
+        };
+        let groups: std::collections::BTreeSet<u64> = names.iter().map(|n| group_of(&universe::qualified(n), 3)).collect();
+        assert!(groups.len() > 1, "the test pairs must span several groups");
+        let one = report(1);
+        assert_eq!(one.0.as_array().unwrap().len(), names.len());
+        assert!(one.1.iter().any(|by_day| by_day.values().any(|&v| v != 0.0)), "some pair should trade");
+        assert_eq!(report(3), one);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

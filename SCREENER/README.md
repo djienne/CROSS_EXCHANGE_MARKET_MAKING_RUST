@@ -63,7 +63,9 @@ docker compose run --rm report --since 2026-10-11 --scenario tokyo   # on the ve
 `report` is its own service (profile `report`, never started by `up`): it holds every recorded
 state of the days it scores in memory, ~75 bytes a row: ~1 GB a day at the three-venue rate below
 (0.4 GB for Aster-Lighter alone). Parsing/replay buffers add to peak memory, so the history
-that fits under the 8 GB cap varies with market activity.
+that fits under the 8 GB cap varies with market activity. `--pair-groups N` reads the files N
+times, scoring 1/N of the pairs each time: the same report in N times the time, with less memory
+(10-17 at N=3: 0.67 GB instead of 1.36).
 
 ## Reading the report
 
