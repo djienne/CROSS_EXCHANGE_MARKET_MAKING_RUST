@@ -124,12 +124,16 @@ or trading connector is imported.
   orders and hedges meet the venues' own books, and a print sits at its stamp. `--scenario host`
   rebuilds this host's own delays from the stamps: the arrival result, a check. Every report prints
   this host's feed delays per venue (books, prints). A scenario leaves out, and counts, the time
-  around a stall here (a book change over 0.7 s late, plus the 1 s pre-roll either side: 2026-10-10
+  around a stall here (`days` and the $/day rates leave it out too) (a book change over 0.7 s late, plus the 1 s pre-roll either side: 2026-10-10
   a single one somewhere in two thirds of the 5-minute pair windows), and refuses delays more than
   0.3 s apart; a quote older than the pre-roll before its print arrived meets an
   unrecorded book, an `unres` fill (the Hyperliquid quote age at `--latency 2`). Delays are
   constants: jitter is second order. Exchange clocks may differ by a few ms. The gate's samples
-  stay those counted at arrival here.
+  stay those counted at arrival here. Checked 2026-10-10 12:18–21:28Z against the Tokyo
+  recording of the same hours: this PC's data scored as recorded came closer to Tokyo than with
+  `--scenario tokyo` (best $/day rank correlation 0.67 vs 0.46; XEMM fills 0.96 vs 0.80). The
+  scenario lost most Hyperliquid-route PnL (stalls left out 20% of their time; 468 `unres` fills),
+  while Aster-Lighter agreed either way. Rank on the Tokyo recording, not on a scenario of this PC's.
 - **Run starts.** A new run (daily at UTC midnight, or a restart) does not see the states before
   it: XEMM fills in its first second priced from them are not recorded.
 - **XEMM scope.** The bot makes only on Aster. Reverse-maker and Lighter/Hyperliquid maker

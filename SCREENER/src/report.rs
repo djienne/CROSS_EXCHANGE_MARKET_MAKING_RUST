@@ -604,7 +604,9 @@ fn score(cfg: &Report, latency: f64, pair: &Pair, series: &Series, timing: Timin
     let right = cfg.costs(&pair.right, lighter);
     let (fee_a, fee_l) = (left.taker_bps / 1e4, right.taker_bps / 1e4);
     let depth_usd = cfg.depth_usd();
-    let days = sum(&series.summaries, "up") / 86_400.0;
+    // A scenario's left-out stall time is an unknown view, as a gap: not time both books were known.
+    // 2026-10-10 on this PC: 20% of Hyperliquid routes' time, 1% of Aster-Lighter's.
+    let days = (sum(&series.summaries, "up") / 86_400.0 - uncovered_days).max(0.0);
     let per_day = |x: f64| if days > 0.0 { x / days } else { 0.0 };
     let close_basis_bps = series.summaries.iter().rev().find_map(|s| s["basis"].as_f64());
 
@@ -776,7 +778,7 @@ pub fn run(cfg: &Report, args: &Args) -> Result<()> {
     }
     let uncovered: f64 = scores.iter().map(|s| s.uncovered_days).sum();
     if uncovered > 0.0 {
-        let share = uncovered / scores.iter().map(|s| s.days + s.down_days).sum::<f64>();
+        let share = uncovered / scores.iter().map(|s| s.days + s.down_days + s.uncovered_days).sum::<f64>();
         println!("{:.1}% of the pair time was around a feed here over {STALL_MS} ms late (a stall): left out.", 100.0 * share);
     }
     Ok(())
@@ -1119,6 +1121,7 @@ mod tests {
                 assert_eq!(taker(&r), taker(&f), "taker, {case}");
                 assert_eq!(xemm(&r), xemm(&f), "xemm, {case}");
                 assert!(r.uncovered_days == f.uncovered_days && (r.uncovered_days > 0.0) != arrival, "{case}");
+                assert!((r.days + r.uncovered_days - sum(&recorded.summaries, "up") / 86_400.0).abs() < 1e-12, "the rates' days leave out the uncovered time, {case}");
                 if (tier, latency, percentile) == ("standard", 1.0, 90.0) {
                     assert!(r.taker_gated.trades > 0 && r.xemm_best.fills > 0 && r.xemm_reverse_best.fills > 0, "the market must trade, {case}");
                 }
