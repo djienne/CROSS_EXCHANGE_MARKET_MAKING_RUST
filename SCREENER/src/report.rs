@@ -549,7 +549,7 @@ pub struct Score {
     pub left_costs: crate::config::Costs,
     pub right_costs: crate::config::Costs,
     pub down_days: f64,
-    /// Days both venues were followed.
+    /// Days both venues were followed, less a scenario's left-out stall time: the $/day denominator.
     pub days: f64,
     pub left_usd_day: f64,
     pub right_usd_day: f64,
@@ -759,7 +759,7 @@ pub fn run(cfg: &Report, args: &Args) -> Result<()> {
         let d = |x: f64| x / s.days;
         let unresolved = t.unresolved + s.xemm_fixed.unresolved + s.xemm_reverse_fixed.unresolved;
         println!("{:<23} {:>5.2} {:>5.1} | {:>6.1} {:>6} {:>7.2} | {:>6.1} {:>7.2} {:>6.1} {:>7.2} | {:>4} {:>7.2} {:>4} {:>7.2} | {:<19} {:>2}/{:<2} {:>5}",
-            s.pair, s.days, 100.0 * s.down_days / (s.days + s.down_days), d(t.trades as f64), kept, d(t.pnl_usd),
+            s.pair, s.days, 100.0 * s.down_days / (s.days + s.down_days + s.uncovered_days), d(t.trades as f64), kept, d(t.pnl_usd),
             d(s.xemm_fixed.fills as f64), d(s.xemm_fixed.pnl_usd), d(s.xemm_reverse_fixed.fills as f64), d(s.xemm_reverse_fixed.pnl_usd),
             s.xemm_best.required_bps, d(s.xemm_best.pnl_usd), s.xemm_reverse_best.required_bps, d(s.xemm_reverse_best.pnl_usd),
             s.best, s.best_days_positive, s.best_by_day.len(), unresolved);
@@ -788,7 +788,9 @@ pub fn run(cfg: &Report, args: &Args) -> Result<()> {
 /// `--pair-groups` passes.
 fn rank(cfg: &Report, lighter: &crate::config::LighterTier, args: &Args, timing: Timing) -> Result<(Vec<Score>, Option<f64>, BTreeMap<universe::Venue, Value>)> {
     ensure!(args.pair_groups >= 1, "--pair-groups must be at least 1");
-    let (mut scores, mut summaries, mut ages) = (Vec::new(), BTreeMap::new(), BTreeMap::new());
+    // Across passes only what the ranking needs: per pair, its days and whether both books were
+    // known on each (the full summaries of every pass added up: 15 days at 7 passes went over 8 GB).
+    let (mut scores, mut up_days, mut ages) = (Vec::new(), BTreeMap::<String, BTreeMap<i64, bool>>::new(), BTreeMap::new());
     for g in 0..args.pair_groups {
         let group = (args.pair_groups > 1).then_some((g, args.pair_groups));
         let data = load(&args.data, args.since.as_deref(), args.until.as_deref(), (cfg.taker.gate_window_hours / 24.0).ceil() as u64, group)?;
@@ -806,21 +808,27 @@ fn rank(cfg: &Report, lighter: &crate::config::LighterTier, args: &Args, timing:
             scores.push(score(cfg, args.latency, p, data.series.get(&p.name).unwrap_or(&empty), timing)?);
         }
         feed_ages(&data, &mut ages);
-        summaries.extend(data.series.into_iter().map(|(name, s)| (name, s.summaries)));
+        for (name, s) in data.series {
+            let days = up_days.entry(name).or_default();
+            for v in &s.summaries {
+                if let Some(t) = v["t"].as_i64() {
+                    *days.entry(day(t)).or_default() |= v["up"].as_f64().unwrap_or(0.0) > 0.0;
+                }
+            }
+        }
     }
     scores.retain(|s| s.days > 0.0);
     // Equal $/day keep the pairs' name order, whatever the passes.
     scores.sort_by(|a, b| b.best_usd_day.total_cmp(&a.best_usd_day).then_with(|| a.pair.cmp(&b.pair)));
 
     // Does the ranking hold from one day to the next? Mean Spearman over consecutive days.
-    let all_days: std::collections::BTreeSet<i64> = scores.iter().flat_map(|s| summaries[&s.pair].iter().filter_map(|x| x["t"].as_i64()).map(day)).collect();
+    let all_days: std::collections::BTreeSet<i64> = scores.iter().flat_map(|s| up_days[&s.pair].keys().copied()).collect();
     let days: Vec<i64> = all_days.into_iter().collect();
     let correlations: Vec<f64> = days
         .windows(2)
         .filter_map(|w| {
             // Newly collected routes have no result on earlier days, rather than zero PnL.
-            let shared: Vec<_> = scores.iter().filter(|s| w.iter().all(|d| summaries[&s.pair].iter().any(|v|
-                v["t"].as_i64().is_some_and(|t| day(t) == *d) && v["up"].as_f64().unwrap_or(0.0) > 0.0))).collect();
+            let shared: Vec<_> = scores.iter().filter(|s| w.iter().all(|d| up_days[&s.pair].get(d) == Some(&true))).collect();
             let at = |d: i64| shared.iter().map(|s| s.best_by_day.get(&d).copied().unwrap_or(0.0)).collect::<Vec<_>>();
             spearman(&at(w[0]), &at(w[1]))
         })
@@ -829,8 +837,12 @@ fn rank(cfg: &Report, lighter: &crate::config::LighterTier, args: &Args, timing:
     Ok((scores, stability, feed_delays(ages)))
 }
 
-/// Adds `data`'s feed delays here, per venue, to `ages` (book changes, prints).
-fn feed_ages(data: &Data, ages: &mut BTreeMap<universe::Venue, [Vec<i32>; 2]>) {
+/// Per venue, how many book changes and prints arrived each feed delay here, in ms.
+type Ages = BTreeMap<universe::Venue, [BTreeMap<i32, u64>; 2]>;
+
+/// Adds `data`'s feed delays here, per venue, to `ages` (book changes, prints): counts per ms,
+/// so they stay small over any number of days and passes.
+fn feed_ages(data: &Data, ages: &mut Ages) {
     for (name, s) in &data.series {
         let Some(pair) = data.pairs.get(name) else { continue };
         for (k, (market, leg)) in [(&pair.left, Leg::Left), (&pair.right, Leg::Right)].into_iter().enumerate() {
@@ -839,26 +851,32 @@ fn feed_ages(data: &Data, ages: &mut BTreeMap<universe::Venue, [Vec<i32>; 2]>) {
             for st in &s.states {
                 let (stamp, book) = (st.t - st.age[k] as i64, if k == 0 { st.a } else { st.l });
                 if st.age[k] != 0 && book.known() && last != Some(stamp) {
-                    books.push(st.age[k]);
+                    *books.entry(st.age[k]).or_default() += 1;
                 }
                 last = Some(stamp);
             }
-            prints.extend(s.trades.iter().filter(|t| t.venue == leg && t.age != 0).map(|t| t.age));
+            for t in s.trades.iter().filter(|t| t.venue == leg && t.age != 0) {
+                *prints.entry(t.age).or_default() += 1;
+            }
         }
     }
 }
 
 /// Per venue, the feed delay here of its book changes and of its prints (arrival minus the
-/// venue's stamp, v3 lines; 0 means none): [p50, p99, samples] ms. The difference between a
-/// venue's prints and books is what `aster_print_delay_ms` models on arrival time.
-fn feed_delays(ages: BTreeMap<universe::Venue, [Vec<i32>; 2]>) -> BTreeMap<universe::Venue, Value> {
-    let quantiles = |v: &mut Vec<i32>| {
-        v.sort_unstable();
-        let at = |q: f64| v.get(((v.len() as f64 * q) as usize).min(v.len().saturating_sub(1))).copied();
-        serde_json::json!([at(0.5), at(0.99), v.len()])
+/// venue's stamp, v3 lines; 0 means none): [p50, p99, samples] ms, nearest rank below. The
+/// difference between a venue's prints and books is what `aster_print_delay_ms` models on
+/// arrival time.
+fn feed_delays(ages: Ages) -> BTreeMap<universe::Venue, Value> {
+    let quantiles = |h: &BTreeMap<i32, u64>| {
+        let n: u64 = h.values().sum();
+        let at = |q: f64| {
+            let (rank, mut seen) = (((n as f64 * q) as u64).min(n.saturating_sub(1)), 0);
+            h.iter().find(|(_, count)| { seen += **count; seen > rank }).map(|(age, _)| *age)
+        };
+        serde_json::json!([at(0.5), at(0.99), n])
     };
     ages.into_iter().filter(|(_, [b, p])| !b.is_empty() || !p.is_empty())
-        .map(|(venue, [mut b, mut p])| (venue, serde_json::json!({ "books": quantiles(&mut b), "prints": quantiles(&mut p) }))).collect()
+        .map(|(venue, [b, p])| (venue, serde_json::json!({ "books": quantiles(&b), "prints": quantiles(&p) }))).collect()
 }
 
 #[cfg(test)]
@@ -1210,8 +1228,11 @@ mod tests {
                 lines += &format!("S\t{{\"t\":{t0},\"p\":\"{n}\",\"samples\":{{\"30\":50}},\"up\":3600}}\n");
                 for k in 0..200i64 {
                     let t = t0 + k * 7_000 + i as i64;
-                    let bid = 100.0 + 0.05 * ((k * (i as i64 + 1 + d)) % 7) as f64;
-                    lines += &format!("B\t{t}\t{n}\t100\t100.01\t{bid:.2}\t{:.2}\t15\nT\t{}\t{n}\tL\t{bid:.2}\t5\tB\n", bid + 0.01, t + 3);
+                    // Wider swings on later pairs: they rank apart, so the stability is defined.
+                    let bid = 100.0 + 0.01 * (i as f64 + 1.0) * ((k * (1 + d)) % 7) as f64;
+                    // v3 lines: each leg's age, so the feed delays add up across passes too.
+                    lines += &format!("B\t{t}\t{n}\t100\t100.01\t{bid:.2}\t{:.2}\t15\t{}\t{}\nT\t{}\t{n}\tL\t{bid:.2}\t5\tB\t{}\n",
+                        bid + 0.01, 20 + k % 5, 30 + (k * (i as i64 + 1)) % 11, t + 3, 40 + k % 3);
                 }
             }
             let file = format!("2026-10-{}T000000Z.screen.zst", 11 + d);
@@ -1228,7 +1249,12 @@ mod tests {
         let one = report(1);
         assert_eq!(one.0.as_array().unwrap().len(), names.len());
         assert!(one.1.iter().any(|by_day| by_day.values().any(|&v| v != 0.0)), "some pair should trade");
+        assert!(one.2.is_some() && one.3.len() == 2, "the stability and both venues' delays are compared: {:?} {:?}", one.2, one.3);
         assert_eq!(report(3), one);
+        // The delays' quantiles from counts are those of the sorted samples 1 3 3 5 9.
+        let counts: BTreeMap<i32, u64> = [(1, 1), (3, 2), (5, 1), (9, 1)].into();
+        let delays = feed_delays([(universe::Venue::Aster, [counts, BTreeMap::new()])].into());
+        assert_eq!(delays[&universe::Venue::Aster], serde_json::json!({ "books": [3, 9, 5], "prints": [null, null, 0] }));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

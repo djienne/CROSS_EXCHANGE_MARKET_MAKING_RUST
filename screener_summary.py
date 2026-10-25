@@ -3,15 +3,18 @@
 
 It scores the Tokyo VPS's recording (SCREENER/data-tokyo, pulled daily by `python vps.py pull`;
 clean feeds, from 2026-10-10 12:18Z) unless --local picks this PC's (SCREENER/data, whose feeds
-stall for tens of seconds). It runs SCREENER's report in Docker (`docker compose run --rm report --json`; ~1 GB of memory per
-recorded day, 8 GB cap) and prints the best routes by the report's own `best` fixed strategy.
-Report options (--since, --until, --lighter premium, --latency 2) pass through; SCREENER/README.md
-explains them and the columns. $/day use the configured clip ($13 by default).
+stall for tens of seconds). It runs SCREENER's report in Docker (`docker compose run --rm report
+--json`, 8 GB cap) and prints the best routes by the report's own `best` fixed strategy. The report
+holds the days in memory, ~12x their files' size, so this splits the pairs into enough
+`--pair-groups` passes for ~4 GB on average, under the cap. Report options (--since, --until, --lighter
+premium, --latency 2, --pair-groups) pass through; SCREENER/README.md explains them and the
+columns. $/day use the configured clip ($13 by default).
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -26,6 +29,12 @@ def main() -> int:
     parser.add_argument("--local", action="store_true", help="Score this PC's recording instead of the Tokyo VPS's.")
     args, report_args = parser.parse_known_args()
     data = "data" if args.local else "data-tokyo"
+    if not any(a.startswith("--pair-groups") for a in report_args):
+        # ~12x the files in memory (2026-10-12..18: 1.57 GB of files took over 16 GB). The passes are
+        # uneven (2026-10-25, 8 of them: 3.9 to 7.0 GB), hence ~4 GB on average. Ponytail: counts every
+        # file, so a --since/--until window gets more passes than it needs (slower, not wrong).
+        gb = sum(p.stat().st_size for p in (SCREENER / data).glob("*.screen.zst")) / 1e9
+        report_args += ["--pair-groups", str(max(1, math.ceil(12 * gb / 4)))]
     print(f"data: SCREENER/{data} ({'this PC' if args.local else 'Tokyo VPS'})")
     out = subprocess.run(["docker", "compose", "run", "--rm", "-T", "report", "--json", "--data", data, *report_args],
                          cwd=SCREENER, check=True, capture_output=True, text=True).stdout
