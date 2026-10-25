@@ -162,10 +162,9 @@ The venue model targets AWS Tokyo timings, with estimates where measurements are
   rates at Aster and Lighter settlement times; Hyperliquid funding is not simulated.
   A maintenance-margin breach is reported, not liquidated.
 
-The three dry runs run on the Tokyo VPS (`../VPS.md`), and only there since 2026-10-10;
-`python vps.py pull` copies their files to `runs/tokyo/dry-run/` daily, and the reports read that
-copy. The commands below run one here, by name: their services sit behind the `dryrun` profile,
-so the fleet's `start_all.bat` no longer starts them. Docker (from this directory):
+The three dry runs run only on the Tokyo VPS (`../VPS.md`); `python vps.py pull` copies their
+files to `runs/tokyo/dry-run/` daily, and the reports read that copy. To run one here by name (the
+services sit behind the `dryrun` profile, so `start_all.bat` starts none), from this directory:
 
 ```bash
 docker compose up -d --build dryrun dryrun-hl dryrun-lh   # HYPE, HYPE-HL, HYPE-LH (taker only)
@@ -265,11 +264,10 @@ Windows bind mount as mode 777: on this host, put `XEMM_ENV_MODE_CHECK=off` in t
 
 ## Market data tape
 
-`record --market HYPE` records HYPE's public feeds for [backtests](#backtest). Since 2026-10-10 it
-runs on the Tokyo VPS as `xemm-recorder` (VPS.md), because this PC's route to Tokyo stalls for tens
-of seconds and a stall is a hole in the tape. `python vps.py pull` copies the files here daily, to
-`data-tokyo/HYPE/`. This PC's own recorder (compose service `recorder`, now behind the `recorder`
-profile) is stopped; its tapes up to 2026-10-10 stay in `data/HYPE/`.
+`record --market HYPE` records HYPE's public feeds for [backtests](#backtest). It runs on the
+Tokyo VPS as `xemm-recorder` (VPS.md), since a stall on this PC's route to Tokyo is a hole in the
+tape; `python vps.py pull` copies the files to `data-tokyo/HYPE/` daily. This PC's tapes up to
+2026-10-10 stay in `data/HYPE/` (compose service `recorder`, behind the `recorder` profile).
 
 - **Aster:** `depth20@100ms` (20 levels), `bookTicker` and `aggTrade`.
 - **Lighter:** `order_book` (a snapshot, then deltas: the whole book), `trade` and `market_stats`.
@@ -307,10 +305,9 @@ docker logs -f replay-0928
 python ../dryrun_summary.py --runs LIGHTER_ASTER_BOT/runs/replay/HYPE-20260928T000000Z-20260929T000000Z-k1-standard-s0
 ```
 
-Always `--rm`: a finished replay's container then goes by itself. Its log is copied into its
-directory as `replay.log` (all but a failure to open the tape, ~2 s at startup: rerun that one in
-the foreground), so nothing is lost with it; kept containers piled up in Docker and two cleanups
-saving their logs lost 12 of them (2026-10-16).
+Always `--rm`: the container goes when the replay ends, and its log is copied into the run
+directory as `replay.log` (all but a failure to open the tape at startup, ~2 s: rerun that one in
+the foreground).
 
 - **Pace.** It runs at the market's own pace (a day takes a day, after ~2 minutes of warm-up),
   at ~60-75 MB and a few % of a core (2026-10-20); windows run side by side on free ports. Its
@@ -319,9 +316,9 @@ saving their logs lost 12 of them (2026-10-16).
   while the tape keeps feeding, or once the tape ends, two minutes of market ahead of the bot.
   It runs on wall time, so a busy host delays the simulated venues as it delays the bot: the
   summary's `scheduler` line should read a few ms (2026-10-10: 0.2-1.6 s p99 while heavy jobs
-  shared the CPU, 2 ms after). Faster than real time does not work: libfaketime at x10 (one core
-  per run) changed the bot's behavior (Aster orders 35/min vs 47, rejects 4/min vs 0.2, Lighter
-  rate-limited, half the minutes over 0.5 s late), so speed comes from running windows side by side.
+  shared the CPU, 2 ms after). Faster than real time does not work: libfaketime at x10 changed the
+  bot's behavior (Aster rejects 4/min vs 0.2, Lighter rate-limited), so speed comes from running
+  windows side by side.
 - **Variants.** `--latency k` multiplies every network and stream delay of `[dry_run]` (round
   trips, feeds, user/account streams; `0`: none), not Lighter's 300 ms taker delay, a venue rule.
   `--lighter premium` is Lighter's Premium account: 140 ms taker delay and 2.8 bps taker fee,
@@ -491,7 +488,7 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
 - Read-only: `probe aster-balance | aster-positions | aster-open-orders | leverage |
   lighter-balance | lighter-open-orders | hl-balance`, `taker probe`, `status` and `taker status` (JSON),
   `fetch-specs`. `taker run --markets HYPE --observe-only` scans and records entry-gate
-  history without orders. Standalone `taker probe` / `taker status` / `taker fetch-specs` cover Aster/Lighter only;
+  history without orders. Standalone `taker probe` / `taker status` cover Aster/Lighter only;
   `status` covers XEMM routes. Use `hl-balance --market HYPE` for Hyperliquid account reads.
 - `probe lighter-order-dry-run` signs IOC and native market plans without submitting them.
 - These submit real orders; run them only with explicit approval. Each needs

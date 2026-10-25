@@ -235,11 +235,8 @@ def unit_files():
 def screener():
     ssh("mkdir -p ~/xemm && tar -x -C ~/xemm", stdin=tracked_tar("SCREENER"))
     ssh(". ~/.cargo/env && cd ~/xemm/SCREENER && CARGO_BUILD_JOBS=1 nice cargo build --release")
-    # Permanent since 2026-10-10: the stop timer of the first, 3-day run goes.
-    stop = f"{SCREENER}-stop"
     ssh(f"cat > /etc/systemd/system/{SCREENER}.service <<'EOF'\n{SCREENER_UNIT}EOF\n"
-        f"(systemctl stop {stop}.timer {stop}.service; systemctl reset-failed {stop}.timer {stop}.service) 2>/dev/null;"
-        f" systemctl daemon-reload && systemctl enable -q {SCREENER} && systemctl restart {SCREENER}"
+        f"systemctl daemon-reload && systemctl enable -q {SCREENER} && systemctl restart {SCREENER}"
         f" && sleep 5 && systemctl --no-pager status {SCREENER} | head -5")
 
 

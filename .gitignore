@@ -1,18 +1,15 @@
 # Secrets and local credentials
 *.env
-.env
 *.pem
 *.key
 
 # Runtime outputs
 runs/
-**/runs/
 *.sqlite
 *.sqlite-*
 *.db
 *.log
 *.pid
-*.logpath
 *.jsonl
 *.jsonl.zst
 *.zst
@@ -21,11 +18,9 @@ runs/
 
 # Build outputs
 target/
-**/target/
 
 # Python caches
 __pycache__/
-**/__pycache__/
 *.py[cod]
 
 # Editor / OS cruft
@@ -35,8 +30,3 @@ __pycache__/
 # Local harness state
 .claude/
 **/codex-help.md
-
-# Soak-test build outputs (isolated from target/ so a live bot restart cannot
-# pick up unapproved binaries)
-target-soak/
-**/target-soak/

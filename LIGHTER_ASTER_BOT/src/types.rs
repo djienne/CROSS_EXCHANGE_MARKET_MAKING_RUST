@@ -29,6 +29,12 @@ impl Side {
     }
 }
 
+impl fmt::Display for Side {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Configured route identifier (e.g. "HYPE-HL"); maps to a market on each selected venue.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MarketId(pub String);

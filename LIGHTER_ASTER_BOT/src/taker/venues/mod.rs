@@ -88,14 +88,6 @@ impl OtherLeg {
         either!(self, v => v.rest_open_orders_count(market).await)
     }
 
-    /// Lighter's websocket count; Hyperliquid's REST one.
-    pub async fn open_orders_count(&self, market: &MarketId) -> Result<usize> {
-        match self {
-            Self::Lighter(l) => l.open_orders_count(market).await,
-            Self::Hyperliquid(h) => h.rest_open_orders_count(market).await,
-        }
-    }
-
     /// Lighter's websocket position. Hyperliquid pushes none here, so the checks that hold it
     /// against the REST one skip.
     pub fn ws_position_qty(&self, market: &MarketId) -> Result<Decimal> {

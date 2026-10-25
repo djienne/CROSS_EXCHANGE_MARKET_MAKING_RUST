@@ -3,15 +3,9 @@ use chrono::{DateTime, Utc};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
+use crate::book::build_side;
+pub use crate::book::{Level, MAX_BOOK_LEVELS};
 use crate::taker::types::Side;
-
-pub const MAX_BOOK_LEVELS: usize = 20;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Level {
-    pub px: Decimal,
-    pub qty: Decimal,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DepthQuote {
@@ -244,38 +238,6 @@ impl OrderBook {
             levels_used,
         })
     }
-}
-
-fn build_side(
-    levels: impl IntoIterator<Item = (Decimal, Decimal)>,
-    descending: bool,
-) -> ArrayVec<Level, MAX_BOOK_LEVELS> {
-    let mut out = ArrayVec::<Level, MAX_BOOK_LEVELS>::new();
-    for (px, qty) in levels {
-        if px <= Decimal::ZERO || qty <= Decimal::ZERO {
-            continue;
-        }
-        let pos = match out.binary_search_by(|cur| {
-            if descending {
-                cur.px.cmp(&px).reverse()
-            } else {
-                cur.px.cmp(&px)
-            }
-        }) {
-            Ok(idx) => {
-                out[idx].qty += qty;
-                continue;
-            }
-            Err(idx) => idx,
-        };
-        if out.len() < MAX_BOOK_LEVELS {
-            out.insert(pos, Level { px, qty });
-        } else if pos < MAX_BOOK_LEVELS {
-            let _ = out.pop();
-            out.insert(pos, Level { px, qty });
-        }
-    }
-    out
 }
 
 #[cfg(test)]

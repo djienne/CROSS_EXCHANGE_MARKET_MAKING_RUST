@@ -55,21 +55,11 @@ The reports need Python 3.
 
 ## Dry run
 
-The three dry runs (HYPE, HYPE-HL, HYPE-LH) run on the Tokyo VPS (VPS.md), and only there since
-2026-10-10, so nothing is collected twice. `python vps.py pull` copies their files to
-`LIGHTER_ASTER_BOT/runs/tokyo/dry-run/` daily; `LIGHTER_ASTER_BOT/runs/dry-run/` keeps this PC's
-until then. One can still run here by name (`start_all.bat` no longer starts them):
-
-```bash
-cd LIGHTER_ASTER_BOT
-docker compose up -d --build dryrun dryrun-hl dryrun-lh   # HYPE, HYPE-HL, HYPE-LH
-docker compose logs -f dryrun
-```
-
-The model, halts, diagnostics and the going-live checklist
-are in the [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md#dry-run). The Tokyo VPS records HYPE's
-Aster, Lighter and Hyperliquid public feeds for backtests, and `python vps.py pull` copies them to
-`LIGHTER_ASTER_BOT/data-tokyo/HYPE/` daily ([Market data tape](LIGHTER_ASTER_BOT/RUNBOOK.md#market-data-tape), VPS.md).
+The three dry runs (HYPE, HYPE-HL, HYPE-LH) and the recorder of HYPE's public feeds for backtests
+run only on the Tokyo VPS (VPS.md); `python vps.py pull` copies their files daily to
+`LIGHTER_ASTER_BOT/runs/tokyo/dry-run/` and `LIGHTER_ASTER_BOT/data-tokyo/HYPE/`. The model, halts,
+diagnostics and the going-live checklist are in the [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md#dry-run),
+the tape in its [Market data tape](LIGHTER_ASTER_BOT/RUNBOOK.md#market-data-tape) section.
 
 ## Reports
 

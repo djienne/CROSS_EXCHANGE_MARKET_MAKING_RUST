@@ -1,24 +1,4 @@
-# Secrets — NEVER commit (mounted at runtime, per Dockerfile/compose)
-*.env
-aster.env
-lighter.env
-
-# Rust build output
-/target
-
-# Runtime outputs: journals, ledgers, controller state, trip latches
-/runs
-# The market-data tape (`record`): this PC's, and the Tokyo VPS's (`vps.py pull`)
+# The market-data tape (`record`): this PC's, and the Tokyo VPS's (`vps.py pull`). Secrets, runs/
+# and target/ are ignored by the root .gitignore.
 /data
 /data-tokyo
-
-# Python caches
-__pycache__/
-*.pyc
-
-# Editor / OS cruft
-*.swp
-.DS_Store
-
-# Harness state (not project code)
-.claude/

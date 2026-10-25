@@ -1,10 +1,7 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use rust_decimal::Decimal;
 
-pub fn parse_dec(s: &str) -> Result<Decimal> {
-    s.parse::<Decimal>()
-        .map_err(|e| anyhow!("invalid decimal {s:?}: {e}"))
-}
+pub use crate::decimal::parse_dec;
 
 pub fn trim_dec(d: Decimal) -> String {
     d.normalize().to_string()

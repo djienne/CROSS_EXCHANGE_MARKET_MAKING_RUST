@@ -233,9 +233,9 @@ impl Book {
     }
 }
 
+/// The same levels (already sorted and capped by `crate::book`), as the taker's book.
 pub(crate) fn taker_book(book: crate::book::OrderBook) -> OrderBook {
-    let rows = |levels: &[crate::book::Level]| levels.iter().map(|l| (l.px, l.qty)).collect::<Vec<_>>();
-    OrderBook::from_levels(rows(&book.bids), rows(&book.asks), book.exch_ts, book.local_recv_ts)
+    OrderBook { bids: book.bids, asks: book.asks, exch_ts: book.exch_ts, engine_ts: None, local_recv_ts: book.local_recv_ts }
 }
 
 impl BookTap for Book {

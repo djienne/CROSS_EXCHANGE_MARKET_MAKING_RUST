@@ -1,37 +1,14 @@
-use std::collections::HashMap;
-use std::time::Duration;
+//! The taker's market specs, from the shared fetchers (`crate::connectors::rest_specs`).
 
-use anyhow::{anyhow, bail, Context, Result};
+use std::collections::HashMap;
+
+use anyhow::{anyhow, bail, Result};
 use rust_decimal::Decimal;
-use serde::Deserialize;
 
 use crate::config::{FirstVenue, HedgeVenue};
+use crate::connectors::rest_specs::{self as shared, AsterFilters, LighterMarketMeta};
 use crate::taker::config::MarketCfg;
-use crate::taker::decimal::parse_dec;
 use crate::taker::markets::MarketSpec;
-
-fn endpoint(base_url: &str, path: &str) -> String {
-    format!("{}{}", base_url.trim_end_matches('/'), path)
-}
-
-fn client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-        .context("building specs http client")
-}
-
-#[derive(Deserialize)]
-struct ExchangeInfo {
-    symbols: Vec<SymbolInfo>,
-}
-
-#[derive(Deserialize)]
-struct SymbolInfo {
-    symbol: String,
-    #[serde(default)]
-    filters: Vec<serde_json::Value>,
-}
 
 /// The markets' specs. A market hedged on Hyperliquid needs `hyperliquid_base_url`: the commands
 /// that trade Lighter only pass none, and are refused it.
@@ -41,17 +18,20 @@ pub async fn build_market_specs(
     lighter_base_url: &str,
     hyperliquid_base_url: Option<&str>,
 ) -> Result<Vec<MarketSpec>> {
-    let client = client()?;
-    let aster = if markets.iter().any(|m| m.first_venue == FirstVenue::Aster) {
-        fetch_aster_exchange_info(&client, aster_base_url).await?
+    let client = shared::client()?;
+    let aster: HashMap<String, AsterFilters> = if markets.iter().any(|m| m.first_venue == FirstVenue::Aster) {
+        shared::fetch_aster_exchange_info_from_base(&client, aster_base_url).await?.into_iter().map(|(s, f)| (s.to_ascii_uppercase(), f)).collect()
     } else {
         HashMap::new()
     };
     let needs_lighter_rest = markets.iter().any(|m| {
         (m.hedge_venue == HedgeVenue::Lighter || m.first_venue == FirstVenue::Lighter) && manual_lighter_meta(m).is_none()
     });
+    // An unreadable or zero Lighter minimum is $10 here (the shared fetch leaves 0).
     let lighter = if needs_lighter_rest {
-        fetch_lighter_meta(&client, lighter_base_url).await?
+        let mut meta = shared::fetch_lighter_meta_from_base(&client, lighter_base_url).await?;
+        meta.values_mut().filter(|m| m.min_quote_amount <= Decimal::ZERO).for_each(|m| m.min_quote_amount = Decimal::from(10));
+        meta
     } else {
         HashMap::new()
     };
@@ -67,11 +47,11 @@ pub async fn build_market_specs(
         let (symbol, (tick, step, min_qty, min_notional), first_market_index) = match m.first_venue {
             FirstVenue::Aster => {
                 let symbol = m.aster_symbol.to_ascii_uppercase();
-                let filters = aster
+                let f = aster
                     .get(&symbol)
                     .copied()
                     .ok_or_else(|| anyhow!("Aster symbol {} not found in exchangeInfo", m.aster_symbol))?;
-                (symbol, filters, 0)
+                (symbol, (f.tick, f.step, f.min_qty, f.min_notional), 0)
             }
             FirstVenue::Lighter => {
                 let lm = lighter_meta()?;
@@ -116,7 +96,7 @@ async fn hyperliquid_meta(client: &reqwest::Client, base_url: &str, coin: &str) 
         symbol: asset.coin,
         size_decimals: asset.sz_decimals,
         price_decimals: 6u32.saturating_sub(asset.sz_decimals),
-        min_quote_amount: crate::connectors::rest_specs::HYPERLIQUID_MIN_NOTIONAL,
+        min_quote_amount: shared::HYPERLIQUID_MIN_NOTIONAL,
     })
 }
 
@@ -128,96 +108,4 @@ fn manual_lighter_meta(m: &MarketCfg) -> Option<LighterMarketMeta> {
         price_decimals: m.lighter_price_decimals?,
         min_quote_amount: m.lighter_min_notional?,
     })
-}
-
-async fn fetch_aster_exchange_info(
-    client: &reqwest::Client,
-    base_url: &str,
-) -> Result<HashMap<String, (Decimal, Decimal, Decimal, Decimal)>> {
-    let url = endpoint(base_url, "/fapi/v3/exchangeInfo");
-    let info: ExchangeInfo = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET Aster exchangeInfo from {base_url}"))?
-        .error_for_status()?
-        .json()
-        .await
-        .context("parse Aster exchangeInfo")?;
-    let mut out = HashMap::new();
-    for s in info.symbols {
-        let mut tick = None;
-        let mut step = None;
-        let mut min_qty = None;
-        let mut min_notional = None;
-        for f in &s.filters {
-            match f.get("filterType").and_then(|v| v.as_str()) {
-                Some("PRICE_FILTER") => tick = field_dec(f, "tickSize"),
-                Some("LOT_SIZE") => {
-                    step = field_dec(f, "stepSize");
-                    min_qty = field_dec(f, "minQty");
-                }
-                Some("MIN_NOTIONAL") => min_notional = field_dec(f, "notional"),
-                _ => {}
-            }
-        }
-        if let (Some(tick), Some(step)) = (tick, step) {
-            out.insert(
-                s.symbol.to_ascii_uppercase(),
-                (
-                    tick,
-                    step,
-                    min_qty.unwrap_or(step),
-                    min_notional.unwrap_or(Decimal::from(5)),
-                ),
-            );
-        }
-    }
-    Ok(out)
-}
-
-fn field_dec(f: &serde_json::Value, key: &str) -> Option<Decimal> {
-    f.get(key)
-        .and_then(|v| v.as_str())
-        .and_then(|s| parse_dec(s).ok())
-}
-
-#[derive(Debug, Clone)]
-struct LighterMarketMeta {
-    market_id: u32,
-    symbol: String,
-    size_decimals: u32,
-    price_decimals: u32,
-    min_quote_amount: Decimal,
-}
-
-async fn fetch_lighter_meta(
-    client: &reqwest::Client,
-    base_url: &str,
-) -> Result<HashMap<String, LighterMarketMeta>> {
-    let url = endpoint(base_url, "/api/v1/orderBooks");
-    let resp: crate::lighter::messages::OrderBooksResponse = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET Lighter orderBooks from {base_url}"))?
-        .error_for_status()?
-        .json()
-        .await
-        .context("parse Lighter orderBooks")?;
-    let mut out = HashMap::new();
-    for b in resp.order_books {
-        let min_quote_amount = parse_dec(&b.min_quote_amount).unwrap_or(Decimal::from(10));
-        out.insert(
-            b.symbol.to_ascii_uppercase(),
-            LighterMarketMeta {
-                market_id: b.market_id,
-                symbol: b.symbol,
-                size_decimals: b.supported_size_decimals,
-                price_decimals: b.supported_price_decimals,
-                min_quote_amount,
-            },
-        );
-    }
-    Ok(out)
 }

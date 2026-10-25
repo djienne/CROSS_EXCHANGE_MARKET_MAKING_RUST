@@ -68,10 +68,8 @@ COPY --from=builder /usr/local/bin/lighter_aster_bot /usr/local/bin/lighter_aste
 # markets/edge can be tuned without rebuilding the image.
 COPY bot.toml /app/bot.toml
 
-# SIGINT, SIGTERM and SIGHUP all start the same graceful drain (cancel resting orders,
-# hedge fills, correct net residuals, verify; paired positions stay open). The controller allows
-# 200 s per engine after an in-progress status read: stop with `docker stop -t 460` (compose sets
-# stop_grace_period), never the 10 s default, which SIGKILLs a legitimate drain.
+# The graceful drain (as SIGTERM/SIGHUP; paired positions stay open). Stop with `docker stop -t
+# 460`, never the 10 s default: docker-compose.yml's stop_grace_period says why.
 STOPSIGNAL SIGINT
 
 ENTRYPOINT ["lighter_aster_bot"]

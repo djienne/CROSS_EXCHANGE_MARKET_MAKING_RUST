@@ -1,58 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::fmt;
 
 use rust_decimal::Decimal;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Side {
-    Buy,
-    Sell,
-}
-
-impl Side {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Side::Buy => "BUY",
-            Side::Sell => "SELL",
-        }
-    }
-
-    pub fn opposite(self) -> Self {
-        match self {
-            Side::Buy => Side::Sell,
-            Side::Sell => Side::Buy,
-        }
-    }
-}
-
-impl fmt::Display for Side {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct MarketId(pub String);
-
-impl fmt::Display for MarketId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl From<&str> for MarketId {
-    fn from(s: &str) -> Self {
-        MarketId(s.to_string())
-    }
-}
-
-impl From<String> for MarketId {
-    fn from(s: String) -> Self {
-        MarketId(s)
-    }
-}
-
-pub use crate::types::TxSendStatus;
+pub use crate::types::{MarketId, Side, TxSendStatus};
 
 /// Only venue-reported rates/commissions establish a known execution fee.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -79,7 +79,7 @@ impl OrderBook {
 }
 
 #[inline]
-fn build_side(
+pub(crate) fn build_side(
     levels: impl IntoIterator<Item = (Decimal, Decimal)>,
     descending: bool,
 ) -> ArrayVec<Level, MAX_BOOK_LEVELS> {

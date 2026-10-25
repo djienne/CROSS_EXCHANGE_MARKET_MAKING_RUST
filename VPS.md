@@ -29,8 +29,7 @@ set up by `sync` and `pull`:
   what it would copy and delete.
 - `pull` then copies the VPS's `runs/dry-run/` (and each `runs/archive/` batch not here yet) whole,
   gzipped, to `LIGHTER_ASTER_BOT/runs/tokyo/` and writes the time to `pulled_at.txt`, where the
-  reports end their window. Only the VPS runs the dry runs and collectors (user, 2026-10-10): this
-  PC's stopped, so nothing is recorded twice.
+  reports end their window.
 - The daily 03:30 UTC script stops both collectors below 4 GB free, so the dry run keeps its disk;
   the next `pull` starts them again once there is room.
 
@@ -59,15 +58,14 @@ python vps.py latency   # TCP and HTTPS round trips to Aster, Lighter, Hyperliqu
 The release build (thin LTO, one job) takes a while on one CPU and leans on swap; the running dry
 run keeps going until the restart, but its timing is noisier while cargo runs.
 
-## Screener collector (permanent since 2026-10-10)
+## Screener collector
 
 `python vps.py screener` uploads the tracked `SCREENER/` files, builds them and (re)starts the pair
 screener's collector as `xemm-screener`, with the full pair list: 400 MB cap, niced below the dry
-run, enabled at boot. It began as a 3-day ground truth (from 2026-10-10 12:18Z) and stays. `pull`
+run, enabled at boot. `pull`
 copies its files to `SCREENER/data-tokyo/` (git-ignored), which `python screener_summary.py`
 scores by default (`--local` for this PC's own recording). Its first hours gave
-`[report.scenario.tokyo]` its delays, and the comparison with `--scenario tokyo` on this PC's data
-of the same hours is in SCREENER/README.md ("Venue clocks"): rank on this recording.
+`[report.scenario.tokyo]` its delays; rank on this recording (SCREENER/README.md, "Venue clocks").
 
 ## Latency from the VPS (2026-10-10)
 

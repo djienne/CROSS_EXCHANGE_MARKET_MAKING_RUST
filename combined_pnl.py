@@ -179,46 +179,21 @@ def summarize_xemm_journal(
         "time_filtered_trades": filtered}
 
 
-def selected_xemm_journals(
-    paths: list[Path],
-    runs_dirs: list[Path],
-    since: datetime,
-    require_paths: bool = False,
-) -> tuple[list[Path], list[Path]]:
-    if paths:
-        included = []
-        skipped = []
-        seen: set[Path] = set()
-        for raw_path in paths:
-            path = raw_path.expanduser().resolve()
-            if path in seen:
-                continue
-            seen.add(path)
-            if require_paths and not path.is_file():
-                raise SystemExit(f"error: --xemm-journal file not found: {path}")
-            if path.is_file() and (require_paths or path.stat().st_size > 0):
-                included.append(path)
-            else:
-                skipped.append(path)
-        return included, skipped
+def selected_xemm_journals(paths: list[Path], require_paths: bool = False) -> tuple[list[Path], list[Path]]:
     included: list[Path] = []
     skipped: list[Path] = []
     seen: set[Path] = set()
-    for runs_dir in runs_dirs:
-        if not runs_dir.exists():
+    for raw_path in paths:
+        path = raw_path.expanduser().resolve()
+        if path in seen:
             continue
-        for path in sorted(runs_dir.glob("*journal*.jsonl")):
-            path = path.resolve()
-            if path in seen:
-                continue
-            seen.add(path)
-            if not path.is_file() or path.stat().st_size == 0:
-                continue
-            mtime = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
-            if mtime >= since:
-                included.append(path)
-            else:
-                skipped.append(path)
+        seen.add(path)
+        if require_paths and not path.is_file():
+            raise SystemExit(f"error: --xemm-journal file not found: {path}")
+        if path.is_file() and (require_paths or path.stat().st_size > 0):
+            included.append(path)
+        else:
+            skipped.append(path)
     return included, skipped
 
 
@@ -318,12 +293,7 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
     since = parse_dt(args.since)
     now = parse_dt(args.now) if args.now else utc_now()
     taker = summarize_taker(args.taker_trades, since, now, args.market, args.shift_ms)
-    journal_paths, skipped_journals = selected_xemm_journals(
-        args.xemm_journal,
-        args.xemm_runs_dir,
-        since,
-        args.require_xemm_journal_paths,
-    )
+    journal_paths, skipped_journals = selected_xemm_journals(args.xemm_journal, args.require_xemm_journal_paths)
     xemm_journals = [
         summarize_xemm_journal(
             path,
@@ -381,7 +351,7 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
         "(the account equity line includes them).",
         "Unknown/legacy fee evidence makes full net totals and return projections unavailable; known subtotals remain visible.",
         "Known net subtotals exclude unresolved rows; estimated recovery losses are shown separately.",
-        "By default XEMM includes only the production run/orchestrator journals. Pass --xemm-journal for exact files or --xemm-runs-dir for an mtime-based scan.",
+        "By default XEMM includes only the production run/orchestrator journals. Pass --xemm-journal for exact files.",
     ]
     if xemm["untimestamped_trades"]:
         notes.append(
@@ -554,7 +524,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--capital-usdc", type=Decimal, default=None, help="Capital denominator for projected CAGR. Defaults to the latest active bot equity in the controller state file.")
     parser.add_argument("--taker-trades", type=Path, default=None)
-    parser.add_argument("--xemm-runs-dir", type=Path, action="append", default=None, help="Advanced: scan a directory of XEMM journal files by mtime. Repeatable.")
     parser.add_argument("--xemm-journal", type=Path, action="append", default=[], help="Explicit XEMM journal to include. Repeatable. Overrides default journal selection.")
     parser.add_argument(
         "--xemm-untimestamped",
@@ -570,26 +539,19 @@ def parse_args() -> argparse.Namespace:
     args.shift_ms = window[2] if window else 0
     args.since = args.since or (window[0] if window else default_since(bot_runs, args.market, args.dry_run))
     args.now = args.now or (window[1] if window else copy_end(bot_runs))
-    explicit_xemm_journals = bool(args.xemm_journal)
-    explicit_xemm_runs_dirs = args.xemm_runs_dir is not None
     if args.taker_trades is None:
         args.taker_trades = bot_runs / f"trades_{args.market}.jsonl"
     args.equity = bot_runs / f"bot-{args.market}.equity.jsonl"
-    if args.xemm_runs_dir is None:
-        args.xemm_runs_dir = []
-    if not explicit_xemm_journals and not explicit_xemm_runs_dirs:
+    if not args.xemm_journal:
         args.xemm_journal = [
             legacy_runs / f"orchestrator-xemm-{args.market}-journal.jsonl",
             bot_runs / f"bot-{args.market}-journal.jsonl",
         ]
         args.xemm_journal_selection = "default_production_journals"
         args.require_xemm_journal_paths = False
-    elif explicit_xemm_journals:
+    else:
         args.xemm_journal_selection = "explicit_journals"
         args.require_xemm_journal_paths = True
-    else:
-        args.xemm_journal_selection = "runs_dir_mtime_since"
-        args.require_xemm_journal_paths = False
     if args.orchestrator_state is None:
         args.orchestrator_state = default_state_path(roots, args.market)
     args.include_untimestamped_xemm = args.xemm_untimestamped == "include"

@@ -29,7 +29,7 @@ struct SymbolInfo {
     filters: Vec<serde_json::Value>,
 }
 
-fn client() -> Result<reqwest::Client> {
+pub(crate) fn client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()

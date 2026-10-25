@@ -57,11 +57,6 @@ pub enum Commands {
         #[arg(long, default_value_t = 5_000)]
         reduce_cooldown_ms: u64,
     },
-    /// Fetch Aster/Lighter route specs (this standalone command excludes Hyperliquid).
-    FetchSpecs {
-        #[arg(long)]
-        markets: Option<String>,
-    },
     /// Signed Aster/Lighter read-only diagnostics: positions, available USDC and open orders.
     Probe {
         #[arg(long, default_value = "HYPE")]
@@ -154,34 +149,6 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 stop,
             )
             .await
-        }
-        Commands::FetchSpecs { markets } => {
-            let selected = cfg.select_markets(markets.as_deref());
-            let specs = rest_specs::build_market_specs(
-                &selected,
-                &cfg.venues.aster_base_url,
-                &cfg.venues.lighter_base_url,
-                None,
-            )
-            .await?;
-            println!(
-                "{:<8} {:<12} {:<12} {:>8} {:>12} {:>12} {:>12} {:>12}",
-                "id", "aster", "lighter", "mkt_id", "a_step", "l_step", "a_min_notl", "l_min_notl"
-            );
-            for s in specs {
-                println!(
-                    "{:<8} {:<12} {:<12} {:>8} {:>12} {:>12} {:>12} {:>12}",
-                    s.market_id.0,
-                    s.aster_symbol,
-                    s.lighter_symbol,
-                    s.lighter_market_id,
-                    s.step,
-                    s.lighter_qty_step,
-                    s.aster_min_notional,
-                    s.lighter_min_notional
-                );
-            }
-            Ok(())
         }
         Commands::Probe { market } => {
             let spec = first_spec(&cfg, market.as_deref()).await?;

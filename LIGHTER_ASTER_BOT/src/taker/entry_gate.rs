@@ -229,10 +229,9 @@ impl OpportunityGate {
         let worker_changed = changed.clone();
         let mut writer = if cfg.active() { Some(crate::taker::pnl::LockedJournal::open(&path)?) } else { None };
         std::thread::Builder::new().name("taker-history".to_string()).spawn(move || {
-            let mut sequence = 0;
             while let Some(command) = rx.blocking_recv() {
                 match command {
-                    HistoryCommand::Sample(next, sample) => {
+                    HistoryCommand::Sample(sequence, sample) => {
                         if let Err(error) = writer.as_mut().expect("active history writer").append(&sample, false) {
                             if worker_health.swap(false, Ordering::AcqRel) {
                                 warn!("opportunity journal failed; entries blocked until a write succeeds: {error:#}");
@@ -243,12 +242,11 @@ impl OpportunityGate {
                             window.insert(sample.timestamp, sample.gross_edge_bps);
                             window.prune(sample.timestamp);
                         }
-                        sequence = next;
+                        worker_snapshot.store(Arc::new(window.snapshot(sequence)));
+                        worker_changed.notify_one();
                     }
                     HistoryCommand::Stop(ack) => { let _ = ack.send(()); break; }
                 }
-                worker_snapshot.store(Arc::new(window.snapshot(sequence)));
-                worker_changed.notify_one();
             }
         })?;
         Ok(Self { cfg: cfg.clone(), market: market.clone(), path, snapshot, tx, healthy, changed,

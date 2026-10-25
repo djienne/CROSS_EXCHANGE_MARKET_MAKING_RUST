@@ -51,7 +51,7 @@ stale Hyperliquid book invalidates only its own pairs. No credentials or order c
 ## Run
 
 ```bash
-docker compose up -d --build screener               # collect here (the Tokyo VPS collects since 2026-10-10)
+docker compose up -d --build screener               # collect on this PC (the Tokyo VPS already does)
 docker compose logs -f                              # traffic and memory every 5 min
 docker compose run --rm screener universe           # today's pairs, with their Aster taker fee
 docker compose run --rm report                      # the ranking, from all the data
@@ -161,8 +161,7 @@ other feed delays than this host's could produce. Version 4 (the same day) adds 
 stall spans; scenarios need it.
 A new run reads the last 72 h of summaries back for its gate.
 
-Since 2026-10-10 the collector also runs permanently on the Tokyo VPS, whose feeds do not stall
-(VPS.md), and `python vps.py pull` copies its closed files to `data-tokyo/` daily.
+The collector runs permanently on the Tokyo VPS, whose feeds do not stall (VPS.md), and `python vps.py pull` copies its closed files to `data-tokyo/` daily.
 `python screener_summary.py` scores `data-tokyo/` by default (`--local` for `data/`); the report
 reads either with `--data`.
 
