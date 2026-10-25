@@ -1,7 +1,7 @@
 //! A replay copies its log into its own directory (`replay.log`), so its container can run with
 //! `--rm` and leave nothing behind but its results: kept containers piled up in Docker, and two
 //! cleanups saving their logs raced and lost 12 of them (2026-10-16). Lines logged before the
-//! directory exists (the first second of startup) are on stdout only.
+//! directory exists (opening the tape, ~2 s, which logs nothing unless it fails) are on stdout only.
 
 use std::fs::File;
 use std::io::{self, Write};

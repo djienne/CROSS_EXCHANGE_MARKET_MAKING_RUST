@@ -9,8 +9,14 @@ code change.
 - 2026-09-30 (`3472012`): `[dry_run] hyperliquid_rtt_ms` went from `[200, 500]` to
   `[200, 900]` for both Hyperliquid routes. Regular dry runs adopted it at 10:11:52 UTC;
   reports across that restart mix models, so pass `--since` after it.
+- 2026-10-19 05:56 UTC (`870ceec`): the Tokyo dry runs adopted two simulator fixes, so reports
+  across that restart mix models. `e1dc383`: a taker or hedge IOC fills against the worse book
+  state per quantity; ~15% of simulated Hyperliquid hedges had failed as no-match (2026-10-12).
+  `175d7e5`: a resubscribe snapshot no longer runs before its break, which had left the Lighter
+  book unknown until the next snapshot.
 - The simulator gives Lighter separate 60/min read and transaction buckets; Standard shares one,
-  and idle reads already use ~46/min, so the model can miss 429s caused by combined traffic.
+  and idle reads use ~26/min (~46 before 2026-10-10), so the model can miss 429s caused by
+  combined traffic.
 - A live-vs-twin comparison should run the twin with the live host's measured latencies (from
   Windows: Aster ~350 ms per order call, Hyperliquid ~950 ms per action), not the Tokyo profile;
   otherwise fill-rate differences mix location with simulator fidelity. With a handful of fills

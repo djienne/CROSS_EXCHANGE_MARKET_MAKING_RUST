@@ -61,11 +61,11 @@ docker compose run --rm report --since 2026-10-11 --scenario tokyo   # on the ve
 ```
 
 `report` is its own service (profile `report`, never started by `up`): it holds every recorded
-state of the days it scores in memory, ~75 bytes a row: ~1 GB a day at the three-venue rate below
-(0.4 GB for Aster-Lighter alone). Parsing/replay buffers add to peak memory, so the history
-that fits under the 8 GB cap varies with market activity. `--pair-groups N` reads the files N
-times, scoring 1/N of the pairs each time: the same report in N times the time, with less memory
-(10-17 at N=3: 0.67 GB instead of 1.36).
+state of the days it scores in memory, ~75 bytes a row: 1.4 GB for one Tokyo day (2026-10-17),
+and 2026-10-12 to 10-18 (~236 M lines) went over 16 GB. Parsing/replay buffers add to peak memory,
+so the history that fits under the 8 GB cap varies with market activity. `--pair-groups N` reads
+the files N times, scoring 1/N of the pairs each time: the same report in N times the time, with
+less memory (10-17 at N=3: 0.67 GB instead of 1.36). `screener_summary.py` picks N itself.
 
 ## Reading the report
 
@@ -110,8 +110,9 @@ or trading connector is imported.
   bot samples only outside its cooldown and when it could size a trade, so it misses the peaks it
   trades on: on busy pairs its gate sits lower (2026-09-26: TAO 7.25 vs 9.05 bps, WLD 11.4 vs 14.7)
   and the report trades less often than it would.
-- **Arrival times.** By default the replay uses arrival times on this host (Europe), not the
-  venues' clocks. Venue/feed delays need not cancel; neither ping RTT nor an old local model
+- **Arrival times.** By default the replay uses arrival times on the recording host (the Tokyo
+  VPS for `data-tokyo/`, this PC in Europe for `data/`), not the venues' clocks. The figures below
+  are this PC's. Venue/feed delays need not cancel; neither ping RTT nor an old local model
   establishes order execution latency. Measured 2026-09-27, venue timestamp to arrival (median /
   p99): Aster book 145 / 239 ms, Lighter trades 214 / 568 ms, Hyperliquid bbo 361 / 682 ms, and
   this host's path to Tokyo stalls for tens of seconds now and then (2026-10-10). Such lag can make
@@ -124,10 +125,10 @@ or trading connector is imported.
   orders and hedges meet the venues' own books, and a print sits at its stamp. `--scenario host`
   rebuilds this host's own delays from the stamps: the arrival result, a check. Every report prints
   this host's feed delays per venue (books, prints). A scenario leaves out, and counts, the time
-  around a stall here (`days` and the $/day rates leave it out too) (a book change over 0.7 s late, plus the 1 s pre-roll either side: 2026-10-10
-  a single one somewhere in two thirds of the 5-minute pair windows), and refuses delays more than
-  0.3 s apart; a quote older than the pre-roll before its print arrived meets an
-  unrecorded book, an `unres` fill (the Hyperliquid quote age at `--latency 2`). Delays are
+  around a stall here (a book change over 0.7 s late, plus the 1 s pre-roll either side: 2026-10-10
+  a single one somewhere in two thirds of the 5-minute pair windows); `days` and the $/day rates
+  leave it out too. It refuses delays more than 0.3 s apart; a quote older than the pre-roll
+  before its print arrived meets an unrecorded book, an `unres` fill (the Hyperliquid quote age at `--latency 2`). Delays are
   constants: jitter is second order. Exchange clocks may differ by a few ms. The gate's samples
   stay those counted at arrival here. Checked 2026-10-10 12:18–21:28Z against the Tokyo
   recording of the same hours: this PC's data scored as recorded came closer to Tokyo than with
@@ -165,10 +166,11 @@ Since 2026-10-10 the collector also runs permanently on the Tokyo VPS, whose fee
 `python screener_summary.py` scores `data-tokyo/` by default (`--local` for `data/`); the report
 reads either with `--data`.
 
-With Hyperliquid, files take ~60 MB a day for ~155 pairs (18:03–20:07 UTC on 2026-09-26; twice
-that in the first hours, while the new pairs' gates warmed up at their floors). Aster-Lighter
-alone took ~23 MB for 64 pairs. A burst on one pair can double a 5-minute window. Nothing deletes them:
-remove old days by hand, keeping the last 3 for the gate.
+The Tokyo recording takes 0.09–0.37 GB a day (median 0.24, 2026-10-12 to 10-24); this PC's took
+~60 MB a day for ~155 pairs on 2026-09-26, Aster-Lighter alone ~23 MB for 64 pairs. A burst on one
+pair can double a 5-minute window. On the VPS, `pull` deletes a file once copied and 7 days old;
+nothing deletes the copies here or this PC's own `data/`: remove old days by hand, keeping the
+last 3 for the gate.
 
 The image build runs `cargo test --release --locked` before building the release binary. Checks
 cover all three venue combinations, compressed-vs-full replay, units, public frame handling,

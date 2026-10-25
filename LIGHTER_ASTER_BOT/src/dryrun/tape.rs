@@ -201,7 +201,7 @@ pub struct Replay {
 }
 
 impl Replay {
-    /// Finds where in `dir` (`data/<MARKET>`) a replay from `from_us` starts.
+    /// Finds where in `dir` (`data-tokyo/<MARKET>` or `data/<MARKET>`) a replay from `from_us` starts.
     pub fn open(dir: &Path, from_us: i64, until_us: i64, lead_us: i64, stop: CancellationToken) -> Result<Self> {
         ensure!(from_us < until_us, "--from must come before --until");
         let mut files: Vec<(i64, PathBuf)> = std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?

@@ -178,8 +178,9 @@ impl Variant {
     }
 }
 
-/// `replay`: `run --mode dry-run` against the tape in `tape` (`data/<M>`) from `from` to `until`
-/// (venue time) instead of the live market, as `variant` changes it, in a new
+/// `replay`: `run --mode dry-run` against the tape in `tape` (`data-tokyo/<M>` or `data/<M>`,
+/// `tape::default_dir`) from `from` to `until` (venue time) instead of the live market, as
+/// `variant` changes it, in a new
 /// `runs/replay/<M>-<from>-<until>-k<latency>-<tier>-s<seed>[-<config>]/`. It ends with the bot's
 /// drain once the tape passes `until`.
 pub async fn replay(market: &str, tape: &Path, from: DateTime<Utc>, until: DateTime<Utc>, variant: &Variant, stop: CancellationToken) -> Result<()> {

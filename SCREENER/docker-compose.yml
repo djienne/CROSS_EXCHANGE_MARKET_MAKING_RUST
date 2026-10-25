@@ -35,7 +35,7 @@ services:
 
   # The ranking, on demand: `docker compose run --rm report [--since YYYY-MM-DD ...]`. Its profile
   # keeps `up` (and start_all.bat) from starting it. It holds every recorded state of the days it
-  # scores in memory (~1 GB a day with Hyperliquid, measured 2026-09-26): past ~a week, add
+  # scores in memory (1.4 GB for one Tokyo day, 2026-10-17): past a few days, add
   # --pair-groups N (README).
   report:
     # Its own `build:` too: a missing image is built here (`docker compose build report`), not

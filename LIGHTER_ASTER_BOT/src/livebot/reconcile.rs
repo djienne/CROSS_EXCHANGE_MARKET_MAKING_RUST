@@ -224,8 +224,9 @@ impl Reconciler {
         }
     }
 
-    /// For the engine's 2 s loop: nothing it drives reads resting Lighter orders (XEMM only
-    /// sends IOCs there), and the read cost half of Lighter's 60 requests/min.
+    /// For the engine's reconcile loop (every 6 s idle, 2 s while a read is awaited): nothing it
+    /// drives reads resting Lighter orders (XEMM only sends IOCs there), and each loop's read would
+    /// cost another ~10 of Lighter's 60 requests/min.
     pub fn without_hedge_orders(mut self) -> Self {
         self.hedge_orders = false;
         self

@@ -6,8 +6,8 @@
 //! reads a clock or does I/O: a run is a pure function of its inputs and seed.
 //!
 //! Matching, pessimistic where the data cannot decide:
-//! - A taker order fills against the worse (per level) of the two book states around its
-//!   effect time, less what we took before. The later state is in hand because matching runs
+//! - A taker order fills against the worse of the two book states around its effect time (at
+//!   every quantity: `book::worse`), less what we took before. The later state is in hand because matching runs
 //!   D behind reality ([`LOOKAHEAD_US`]).
 //! - A post-only order expires only if it crosses the book it arrives at. If the book crosses it
 //!   later, it rests and the crossing size trades against it (the adverse outcome; expiring

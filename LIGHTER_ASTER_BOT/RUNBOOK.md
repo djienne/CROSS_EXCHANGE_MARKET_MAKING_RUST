@@ -308,13 +308,14 @@ python ../dryrun_summary.py --runs LIGHTER_ASTER_BOT/runs/replay/HYPE-20260928T0
 ```
 
 Always `--rm`: a finished replay's container then goes by itself. Its log is copied into its
-directory as `replay.log` (all but its first second of startup), so nothing is lost with it; kept containers
-piled up in Docker and two cleanups saving their logs lost 12 of them (2026-10-16).
+directory as `replay.log` (all but a failure to open the tape, ~2 s at startup: rerun that one in
+the foreground), so nothing is lost with it; kept containers piled up in Docker and two cleanups
+saving their logs lost 12 of them (2026-10-16).
 
 - **Pace.** It runs at the market's own pace (a day takes a day, after ~2 minutes of warm-up),
-  at ~30 MB and a few % of a core; windows run side by side on free ports. Its start reads the
-  tape up to `--from` and replays the Lighter book from its last snapshot (2026-09-28 06:00: 9.7
-  hours of updates, a minute). It ends by itself: the bot drains once its clock passes `--until`
+  at ~60-75 MB and a few % of a core (2026-10-20); windows run side by side on free ports. Its
+  start reads the tape up to `--from` and replays the Lighter book from its last snapshot
+  (2026-09-28 06:00: 9.7 hours of updates, a minute). It ends by itself: the bot drains once its clock passes `--until`
   while the tape keeps feeding, or once the tape ends, two minutes of market ahead of the bot.
   It runs on wall time, so a busy host delays the simulated venues as it delays the bot: the
   summary's `scheduler` line should read a few ms (2026-10-10: 0.2-1.6 s p99 while heavy jobs
@@ -347,9 +348,12 @@ piled up in Docker and two cleanups saving their logs lost 12 of them (2026-10-1
   replayed yet. A recorder restart without
   `A-`/`L-` freezes the feeds (the replay warns about silences over 30 s), and a Lighter sequence
   break (a dropped line) closes the book until the next snapshot, which the tape has only after a
-  reconnect. The simulator's `lag_ms` and the first window's `late_frames` measure the shift and
-  the catch-up, not feed health. Latencies are drawn with the seed but the bot runs on this
-  host's scheduler, so two runs of a window differ: compare them as distributions.
+  reconnect. This PC's tapes (`data/`) have holes where its connection was down, and those replay
+  as books rejected `Unavailable`: 2026-10-01 has 78 minutes of Lighter, 2026-09-28 11 of both
+  venues (14:39-14:49), the same in every run of the day. The simulator's `lag_ms` and the first
+  window's `late_frames` measure the shift and the catch-up, not feed health. Latencies are drawn
+  with the seed but the bot runs on this host's scheduler, so two runs of a window differ: compare
+  them as distributions.
 
 ## Runtime files (`runs/`)
 
@@ -457,7 +461,8 @@ the per-venue buffers ($26 shipped); reductions stay possible.
 
 ## Deploy
 
-The VPS does not compile. Build the image locally and ship it:
+A live VPS does not compile (unlike the Tokyo dry-run VPS, which builds natively: `../VPS.md`).
+Build the image locally and ship it:
 
 ```bash
 export VPS_HOST='ubuntu@<host>' KEY="$HOME/.ssh/<deploy-key>.pem"

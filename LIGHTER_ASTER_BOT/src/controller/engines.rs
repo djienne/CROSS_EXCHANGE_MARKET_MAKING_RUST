@@ -26,7 +26,7 @@ pub struct LiveEngines {
     xemm_status: Option<crate::livebot::status::StatusPoller>,
     /// The lone taker's status, from its own account snapshots, and when it was taken.
     taker_status: watch::Sender<Option<(tokio::time::Instant, Value)>>,
-    /// XEMM's account snapshot, refreshed by its reconciler every ~2 s.
+    /// XEMM's account snapshot, refreshed by its reconciler every ~6 s (2 s while a read is awaited).
     xemm_account: crate::livebot::account::AccountState,
     /// An older snapshot is a failed status read: XEMM's own reads keep failing.
     max_status_age_ms: i64,
@@ -98,7 +98,7 @@ impl Engines for LiveEngines {
             return if age <= self.max_status_age_ms { Ok(status) } else { bail!("the taker's account snapshot is {age} ms old") };
         };
         // Once XEMM publishes, its own snapshot: every venue read here again would come out
-        // of Lighter's 60 requests/min, which XEMM's 2 s loop already half fills.
+        // of Lighter's 60 requests/min, of which XEMM's own reads already take ~10 (every 6 s idle).
         match self.xemm_account.age_ms(crate::hotpath::clock::mono_now_ns()) {
             i64::MAX => Ok(serde_json::to_value(xemm_status.report().await?)?),
             age if age <= self.max_status_age_ms => Ok(xemm_status.from_snapshot(&self.xemm_account.load())),

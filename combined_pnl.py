@@ -546,10 +546,10 @@ def print_human(result: dict[str, Any]) -> None:
 def parse_args() -> argparse.Namespace:
     stack_root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="Combined execution economics report for taker arb + XEMM.")
-    parser.add_argument("--dry-run", action="store_true", help="Report the dry run (LIGHTER_ASTER_BOT/runs/dry-run/) instead of live.")
+    parser.add_argument("--dry-run", action="store_true", help="Report the dry run (the VPS's, copied to LIGHTER_ASTER_BOT/runs/tokyo/dry-run/) instead of live.")
     parser.add_argument("--runs", type=Path, default=None, help="Read this runs directory (a replay's: runs/replay/<run>/dry-run, with --dry-run) instead.")
     parser.add_argument("--since", default=None, help=f"UTC/RFC3339 start time. Default: {DEFAULT_SINCE}; with --dry-run, the dry run's first start.")
-    parser.add_argument("--now", default=None, help="Override report end time. Defaults to current UTC time.")
+    parser.add_argument("--now", default=None, help="Override report end time. Default: a replay's window end, else the Tokyo copy's pull time, else now.")
     parser.add_argument("--market", default="HYPE")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--capital-usdc", type=Decimal, default=None, help="Capital denominator for projected CAGR. Defaults to the latest active bot equity in the controller state file.")

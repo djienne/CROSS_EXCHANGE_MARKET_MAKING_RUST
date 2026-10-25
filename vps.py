@@ -14,7 +14,7 @@ ever matters, wipe ~/xemm/LIGHTER_ASTER_BOT/src before extracting.
 
 Since 2026-10-10 the VPS collects and this PC stores (this PC's route to Tokyo stalls for tens of
 seconds): the three dry runs, the tape recorder (`record --market HYPE`: Aster, Lighter and
-Hyperliquid, ~0.19 GB/day) and the screener's collector (full pair list, ~0.1-0.2 GB/day) run
+Hyperliquid, ~0.19 GB/day) and the screener's collector (full pair list, ~0.24 GB/day) run
 permanently there and nowhere else, and a Windows
 scheduled task runs `pull` daily (VPS.md). Disk stays bounded: journald 200 MB, the build dir
 <= 3 GB, a daily timer gzips the dry run's logs past 1 GB and stops the collectors below 4 GB
@@ -111,15 +111,15 @@ CPUWeight=50
 WantedBy=multi-user.target
 """
 
-# The dry run's append-only logs (~37 MB/day for HYPE, mostly the journal). The bot appends to them
+# The dry runs' append-only logs (~75 MB/day for the three, mostly HYPE's journal). The bot appends to them
 # without reopening and reads none back at startup (the risk monitor starts at the session start),
 # so they move only while it is stopped: copy-and-truncate could drop a line written in between,
 # such as a fill. Runs daily; acts only past 1 GB of logs (or the MB given as its argument), about
-# monthly, at the cost of one restart (drain, then the shift's warm-up). The archive grows
-# ~4 MB/day, which the 25 GB disk holds for years; nothing is deleted.
+# every two weeks (e.g. 2026-10-24), at the cost of one restart (drain, then the shift's warm-up).
+# The archive grows ~6 MB/day (gzip 13x), which the 25 GB disk holds for years; nothing is deleted.
 ARCHIVE = f"""#!/bin/sh
 set -eu
-# Ponytail: checked daily against ~0.45 GB/day written, so a 4 GB floor leaves days of slack;
+# Ponytail: checked daily against ~0.5 GB/day written, so a 4 GB floor leaves days of slack;
 # `vps.py pull` starts the collectors again once there is room.
 free=$(df -m --output=avail / | tail -1 | tr -d ' ')
 [ "$free" -ge {FLOOR_MB} ] || {{ systemctl stop {RECORDER} {SCREENER}; echo "stopped the collectors: $free MB free"; }}
@@ -318,8 +318,8 @@ def pull(dry_run):
 def pull_runs(dry_run):
     """Copies the dry runs' files (the VPS's runs/dry-run/, and each runs/archive/ batch not here
     yet) over RUNS_COPY, then writes the copy's time to pulled_at.txt: the reports end their
-    window there. Ponytail: the logs come whole each day, gzipped (~10x); they reach ~1 GB before
-    the archive moves them (~10 days for three markets), so up to ~100 MB, ~1 min at 2 MB/s.
+    window there. Ponytail: the logs come whole each day, gzipped (13x); they reach ~1 GB before
+    the archive moves them (~2 weeks for three markets), so up to ~80 MB, ~1 min at 2 MB/s.
     Past that, rsync --append would send only the new bytes."""
     have = [p.name for p in (RUNS_COPY / "archive").glob("*")]
     if dry_run:

@@ -1,12 +1,13 @@
 # Aster/Lighter/Hyperliquid bot: on Aster routes XEMM grants execution rights to the taker;
 # Lighter/Hyperliquid routes run the taker alone.
 #
-# One Dockerfile, two tags: lighter_aster_bot:live and :dryrun. Secrets are mounted read-only,
-# never baked. The runs/ dir (journals, ledgers, latches, controller state) is a persistent
-# bind mount.
+# One Dockerfile, three tags: lighter_aster_bot:live, :dryrun (also `replay`'s) and :recorder.
+# Secrets are mounted read-only, never baked. The runs/ dir (journals, ledgers, latches,
+# controller state) is a persistent bind mount.
 #
-# `docker compose build` / `up -d` touch only `dryrun`, `dryrun-hl` and `dryrun-lh`, the same bot
-# against simulated venues (no credentials, files in runs/dry-run/, image lighter_aster_bot:dryrun;
+# Every service sits behind a profile, so a bare `docker compose build` / `up -d` touches none;
+# name one to run it. `dryrun`, `dryrun-hl` and `dryrun-lh` are the same bot against simulated
+# venues (no credentials, files in runs/dry-run/, image lighter_aster_bot:dryrun;
 # `dryrun-hl` trades HYPE-HL, hedged on Hyperliquid; `dryrun-lh` HYPE-LH, taker only on Lighter
 # against Hyperliquid). The market-data tape for backtests is recorded on the Tokyo VPS since
 # 2026-10-10 (VPS.md; `python vps.py pull` brings it to data-tokyo/); `recorder`, this PC's old
@@ -14,7 +15,7 @@
 # `bot` service sits behind the `live` profile: only a command naming it builds or starts it,
 # so never set COMPOSE_PROFILES=live here.
 #
-# ---- Dry run (safe unattended; the fleet's start_all.bat starts it) ---------------
+# ---- Dry run (safe unattended; on the Tokyo VPS since 2026-10-10, here only by name) ---
 #   docker compose up -d --build dryrun dryrun-hl dryrun-lh
 #   docker compose logs -f dryrun
 #   docker compose restart dryrun     # after a halt: the restart is the review
@@ -99,8 +100,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args: [GIT_COMMIT]
-    # Its own tag: the fleet's start_all.bat rebuilds this from the working tree, which must
-    # never retag the live image.
+    # Its own tag: a build from the working tree must never retag the live image.
     image: lighter_aster_bot:dryrun
     container_name: lighter-aster-dryrun
     working_dir: /app
