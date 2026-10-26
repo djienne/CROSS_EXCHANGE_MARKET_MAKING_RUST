@@ -135,6 +135,7 @@ pub struct Xemm {
     pub cooldown_ms: i64,
     pub min_hedge_usd: f64,
     pub pending_age_ms: i64,
+    pub max_position_usd: f64,
     pub sweep_bps: Vec<f64>,
 }
 
@@ -157,7 +158,7 @@ impl Report {
             self.aster.group_b_taker_bps, self.aster.rwa_taker_bps, self.lighter.standard.maker_bps,
             self.lighter.standard.taker_bps, self.lighter.standard.taker_delay_ms, self.lighter.premium.maker_bps,
             self.lighter.premium.taker_bps, self.lighter.premium.taker_delay_ms, h.maker_bps, h.taker_bps,
-            h.taker_ms, h.fill_notice_ms, h.quote_age_ms, self.taker.margin_bps, self.xemm.required_bps, self.xemm.min_hedge_usd];
+            h.taker_ms, h.fill_notice_ms, h.quote_age_ms, self.taker.margin_bps, self.xemm.required_bps, self.xemm.min_hedge_usd, self.xemm.max_position_usd];
         let delays = self.scenario.values().flat_map(|s| [s.aster_ms, s.lighter_ms, s.hyperliquid_ms]);
         ensure!(values.iter().copied().chain(self.xemm.sweep_bps.iter().copied()).chain(delays).all(|x| x.is_finite() && x >= 0.0), "fees, latencies, delays and thresholds must be finite and nonnegative (rebates require a different recording floor)");
         ensure!(!self.scenario.contains_key("host"), "`host` is the built-in scenario of this host's delays");

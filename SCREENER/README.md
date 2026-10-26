@@ -18,9 +18,11 @@ runs apart from the bot, with its own crate, image, container and data.
   - **Taker-taker:** the entry gate, cooldown, inventory cap and each leg's latency.
   - **XEMM:** the quote price, a fill only when trades print through the quote (those of one ms
     add up), the hedge latency and the distance gate (skipped behind a maker top thinner than the
-    bot's depth). After a fill the market pauses 3 s; with inventory, only the side that reduces it
-    is quoted (`reduce_position_only`, which the bot now ships off). A fill under the hedge venue's $10 minimum is held, then
-    corrected by a taker order, from flat on the maker venue, and the market pauses 6 s more.
+    bot's depth). Both sides quote a clip, as the bot (`reduce_position_only = false`); the side that
+    would grow the inventory past $161 (the bot's cap under its margin guard at the dry run's $200
+    accounts; a live account's free margin is not modelled) is full. After a fill the market pauses
+    3 s. A fill under the hedge venue's $10 minimum is held, then corrected by a taker order (on the
+    maker venue if it grew the inventory), and the market pauses 6 s more.
   - Both close their leftover inventory at the last window's mean basis, without fees or spread: a
     standing basis is paid back, not earned.
 

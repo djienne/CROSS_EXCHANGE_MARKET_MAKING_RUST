@@ -70,6 +70,10 @@ cooldown_ms            = 3000   # [maker.live] post_trade_cooldown_ms, cooldown_
 # (Hyperliquid's minimum is also $10; Aster's $5, so the reverse direction holds a few it could hedge).
 min_hedge_usd          = 10.0   # lighter_min_notional
 pending_age_ms         = 6000   # max_pending_age_ms
+# Both sides quote ([maker.live.quote] reduce_position_only = false) within the inventory cap:
+# [maker.capital] 200 x leverage 1, bound first by [maker.live.margin_guard] on the dry run's and
+# replay's $200 accounts: 200 - its 26 buffer - the resting clip's margin, 13.
+max_position_usd       = 161.0
 sweep_bps = [5.0, 8.0, 10.0, 12.0, 15.0, 18.5, 22.0, 26.0, 30.0, 40.0, 50.0, 60.0]
 
 # Native perps, base tier without discounts. Fees checked 2026-09-26:

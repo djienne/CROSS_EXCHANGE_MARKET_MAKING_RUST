@@ -1,5 +1,5 @@
 //! `report`: ranks pairs using a simplified replay model derived from the bot's rules.
-//! Top-of-book depth, queue-free fills, inventory reduction and reverse-maker routes are model
+//! Top-of-book depth, queue-free fills, the XEMM inventory cap and reverse-maker routes are model
 //! assumptions, not identical bot execution paths (see README.md, Known limits).
 //!
 //! - **Taker-taker**, as `taker/arb.rs` and `entry_gate.rs` decide: the better direction's edge at
@@ -10,11 +10,11 @@
 //! - **XEMM**, maker on one venue and a taker hedge on the other, as `quote_engine.rs` prices it:
 //!   the quote is priced from the state `quote_age` before the trade (an Aster print is moved back
 //!   to the book change it made); the prints of one ms *through* it fill min(their sum, clip)
-//!   (queue position ignored); a fill pauses the market for the cooldown, and with inventory only
-//!   the side that reduces it is quoted; the hedge fills at the recorded state after the fill notice
-//!   and the hedge latency, and a fill below the hedge's minimum, held then corrected by the bot, at
-//!   the same time (from flat, flattened on the maker venue); the leftover inventory closes as the
-//!   taker's. Run in both directions with the bot's settings (required edge, distance gate, skipped
+//!   (queue position ignored); both sides quote, the one that would grow the inventory past the cap
+//!   full; a fill pauses the market for the cooldown; the hedge fills at the recorded state after
+//!   the fill notice and the hedge latency, and a fill below the hedge's minimum, held then
+//!   corrected by the bot, at the same time (one that grew the inventory, flattened on the maker
+//!   venue); the leftover inventory closes as the taker's. Run in both directions with the bot's settings (required edge, distance gate, skipped
 //!   behind a thin maker top), and as a sweep of the required edge without the gate.
 //! - **Timing.** By default the states and prints replay at their arrival here, as recorded.
 //!   `--scenario` rebuilds them on the venues' clocks (`timeline`): decisions and quotes on the bot's
@@ -426,6 +426,8 @@ pub struct XemmResult {
     pub edge_bps: f64,
     pub pnl_usd: f64,
     pub inventory_clips: f64,
+    /// The largest inventory held, in clips: at the cap, the side that grows it was full.
+    pub peak_inventory_clips: f64,
     #[serde(skip)]
     pub by_day: BTreeMap<i64, f64>,
 }
@@ -450,6 +452,8 @@ pub struct XemmSim {
     pub notice: i64,
     pub hedge_lag: i64,
     pub cooldown: i64,
+    /// The inventory cap, either way: a side that would grow past it is full.
+    pub max_position_usd: f64,
     /// As in `TakerSim`.
     pub close_basis_bps: Option<f64>,
 }
@@ -467,9 +471,8 @@ pub fn simulate_xemm(states: &[State], fills: &[State], trades: &[Trade], sim: &
         let t = trade.t - sim.print_delay;
         // A buyer lifts our ask: we sell on the maker venue and buy the hedge. Our left leg:
         let signed = if trade.buy == (sim.maker == Leg::Left) { -1.0 } else { 1.0 };
-        // As the bot: a fill pauses the market ([maker.live] cooldown_scope), and with inventory
-        // only the side that reduces it is quoted ([maker.live.quote] reduce_position_only).
-        if t - last_fill < sim.cooldown || position * signed > 0.0 {
+        // As the bot: a fill pauses the market ([maker.live] cooldown_scope).
+        if t - last_fill < sim.cooldown {
             continue;
         }
         let Some(quoted) = state_at(states, t - sim.quote_age) else { continue };
@@ -482,6 +485,15 @@ pub fn simulate_xemm(states: &[State], fills: &[State], trades: &[Trade], sim: &
             continue;
         }
         let reference = (quoted.a.mid() + quoted.l.mid()) / 2.0;
+        // As the bot, both sides quote a clip within the cap: the side that grows the inventory has
+        // what is left under it, the other can unwind to the opposite cap; a side left under the
+        // hedge's minimum is full (`quote_engine.rs`'s cap reject). Ponytail: the cap stands for the
+        // margin guard at the dry run's balances; a live account's free margin, which moves with
+        // its PnL and its other markets, is not modelled.
+        let headroom = sim.max_position_usd / reference - signed * position;
+        if headroom * reference < sim.min_hedge_usd {
+            continue;
+        }
         let required = sim.required_bps / 1e4 * reference;
         // The bot's price, joining the touch at best (post-only).
         let price = if trade.buy {
@@ -507,13 +519,13 @@ pub fn simulate_xemm(states: &[State], fills: &[State], trades: &[Trade], sim: &
         if through == 0.0 {
             continue;
         }
-        // A clip when flat, else at most what flattens.
-        let qty = through.min(if position == 0.0 { sim.clip_usd / reference } else { position.abs() });
+        let qty = through.min(sim.clip_usd / reference).min(headroom);
         // Below the hedge venue's minimum the bot holds the fill ([maker.live.partials]); `pending_age`
-        // later it freezes and corrects it by a taker order on the leg the fill grew: the maker's from
-        // flat, else the hedge's. Priced at the hedge's time: the recording ends 2 s after a print.
+        // later it freezes and corrects it by a taker order on the leg the fill grew: the maker's if
+        // it grew the inventory (or from flat), the hedge's if it reduced it. Priced at the hedge's
+        // time: the recording ends 2 s after a print.
         let small = qty * reference < sim.min_hedge_usd;
-        let flatten = small && position == 0.0;
+        let flatten = small && position * signed >= 0.0;
         let exit = |s: &State| if flatten { books(s).0 } else { books(s).1 };
         let Some(hedged) = state_at(fills, t + sim.notice + sim.hedge_lag).map(exit).filter(Bbo::known) else {
             r.unresolved += 1;
@@ -531,6 +543,7 @@ pub fn simulate_xemm(states: &[State], fills: &[State], trades: &[Trade], sim: &
         last_fill = if small { t + sim.pending_age } else { t };
         if !flatten {
             position += signed * qty;
+            r.peak_inventory_clips = r.peak_inventory_clips.max(position.abs() * reference / sim.clip_usd);
         }
     }
     if r.fills > 0 {
@@ -645,6 +658,7 @@ fn score(cfg: &Report, latency: f64, pair: &Pair, series: &Series, timing: Timin
             notice: ms(own.notice_ms),
             hedge_lag: ms(hedge.taker_ms),
             cooldown: cfg.xemm.cooldown_ms,
+            max_position_usd: cfg.xemm.max_position_usd,
             close_basis_bps,
         };
         simulate_xemm(states, fills, trades, &sim)
@@ -973,6 +987,7 @@ mod tests {
             notice: 100,
             hedge_lag: 300,
             cooldown: 3_000,
+            max_position_usd: 200.0,
             close_basis_bps: None,
         };
         // Our bid: 100.00 - 10 bps x 100.01 = 99.89999. A sale at 99.90 is not through it.
@@ -1010,13 +1025,28 @@ mod tests {
         let lighter = XemmSim { maker: Leg::Right, ..sim };
         let mirror = simulate_xemm(&states, &states, &[Trade { venue: Leg::Right, ..at(1_000, 99.85) }], &lighter);
         assert!(open.inventory_clips > 0.0 && (mirror.inventory_clips + open.inventory_clips).abs() < 1e-12);
-        // Holding it, the bot quotes only the side that reduces it, and not in the cooldown: a
-        // purchase at 2 s, then a sale at 4.5 s, do not fill; a purchase at 5 s through our ask
-        // (100.01 + 10 bps x 99.955) flattens it.
-        let r = simulate_xemm(&states, &states, &[at(1_000, 99.85), buy(2_000, 100.2), at(4_500, 99.5), buy(5_000, 100.2)], &sim);
-        assert_eq!((r.fills, r.inventory_clips), (2, 0.0));
+        // Holding it, both sides quote, not in the cooldown: a purchase at 2 s does not fill; a sale
+        // at 4.5 s through our bid (Aster's 99.80, priced at 4.25 s) buys a clip more.
+        let qty2 = 100.0 / 99.955;
+        let r = simulate_xemm(&states, &states, &[at(1_000, 99.85), buy(2_000, 100.2), at(4_500, 99.5)], &sim);
+        assert_eq!(r.fills, 2);
+        assert!((r.pnl_usd - qty * (99.99 - price) - qty2 * (99.99 - 99.8)).abs() < 1e-9);
+        assert!((r.inventory_clips - (qty + qty2) * 99.91 / 100.0).abs() < 1e-9);
+        assert!((r.peak_inventory_clips - (qty + qty2) * 99.955 / 100.0).abs() < 1e-9);
+        // At a one-clip cap that bid is full ($0.05 left under it); a purchase at 5 s through our ask
+        // (100.01 + 10 bps x 99.955) sells a full clip, leaving a sliver short.
         let ask = 100.01 + 10e-4 * 99.955;
-        assert!((r.pnl_usd - qty * (99.99 - price) - qty * (ask - 100.01)).abs() < 1e-9);
+        let prints = [at(1_000, 99.85), buy(2_000, 100.2), at(4_500, 99.5), buy(5_000, 100.2)];
+        let capped = simulate_xemm(&states, &states, &prints, &XemmSim { max_position_usd: 100.0, ..sim });
+        assert_eq!(capped.fills, 2);
+        assert!((capped.pnl_usd - qty * (99.99 - price) - qty2 * (ask - 100.01)).abs() < 1e-9);
+        assert!((capped.inventory_clips - (qty - qty2) * 99.91 / 100.0).abs() < 1e-9);
+        // A $5 sale at 4.5 s grows the inventory under the hedge minimum: held, then flattened on
+        // Aster (bid 99.80, 4 bps taker); the inventory stays one clip.
+        let grown = simulate_xemm(&states, &states, &[at(1_000, 99.85), Trade { size: 0.05, ..at(4_500, 99.5) }], &sim);
+        assert_eq!(grown.fills, 2);
+        assert!((grown.pnl_usd - qty * (99.99 - price) + 0.05 * 99.8 * 4e-4).abs() < 1e-9);
+        assert!((grown.inventory_clips - qty * 99.91 / 100.0).abs() < 1e-9);
         // The bot's gate: our bid sits 10 bps behind Aster's 100.00 bid, inside the 18 bps minimum;
         // within a 5 bps one it fills, unless that bid is thinner than the bot's depth.
         let gate = |min_bps: f64, bid_size: f64| {
