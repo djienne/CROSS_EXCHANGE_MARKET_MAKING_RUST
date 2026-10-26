@@ -1676,6 +1676,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
             &spec,
             &aster,
             &lighter,
+            &http,
             &opp,
             pos,
             margins,
@@ -2631,7 +2632,7 @@ async fn wait_position_evidence(
 }
 
 async fn execute_opportunity(
-    cfg: &Config, spec: &MarketSpec, aster: &FirstLeg, lighter: &OtherLeg,
+    cfg: &Config, spec: &MarketSpec, aster: &FirstLeg, lighter: &OtherLeg, http: &reqwest::Client,
     opp: &Opportunity, pre_position: PositionSnapshot, margin_before: MarginSnapshot,
     reduce_only: bool, journal: &ExecutionJournal, session: &ActiveSession,
 ) -> std::result::Result<TradeReport, ExecutionError> {
@@ -2712,7 +2713,7 @@ async fn execute_opportunity(
         _ => 0,
     };
     if position.net_qty().abs() * opp.ref_px > cfg.risk.max_position_mismatch_usd {
-        let retry = try_missing_hedge_retry(cfg, spec, aster, lighter, opp, pre_position, position, reduce_only).await;
+        let retry = try_missing_hedge_retry(cfg, spec, aster, lighter, http, opp, pre_position, position, reduce_only).await;
         hedge_retry_action_taken = retry.attempted;
         for attempt in &retry.attempts {
             orders.push(attempt.identity.clone());
@@ -3005,20 +3006,15 @@ fn expected_post_position(
     }
 }
 
-fn retry_price_bound(opp: &Opportunity, side: Side, slippage_bps: Decimal) -> Decimal {
-    let rate = bps_to_rate(slippage_bps);
-    match side {
-        Side::Buy => opp.buy_px * (Decimal::ONE + rate),
-        Side::Sell => opp.sell_px * (Decimal::ONE - rate),
-    }
-}
-
+/// `marks` are the legs' current mids. The missed IOC was bounded off the decision prices, so a
+/// retry bounded off them again repeats the miss whenever the book moved past it.
 fn hedge_retry_plan(
     cfg: &Config,
     spec: &MarketSpec,
     opp: &Opportunity,
     pre_position: PositionSnapshot,
     current_position: PositionSnapshot,
+    marks: (Decimal, Decimal),
 ) -> Option<HedgeRetryPlan> {
     let expected = expected_post_position(pre_position, opp.direction, opp.qty);
     let aster_missing = expected.aster_qty - current_position.aster_qty;
@@ -3030,13 +3026,14 @@ fn hedge_retry_plan(
     if aster_needs_retry == lighter_needs_retry {
         return None;
     }
-    let (venue, missing_qty, step, min_qty, min_notional) = if aster_needs_retry {
+    let (venue, missing_qty, step, min_qty, min_notional, mark) = if aster_needs_retry {
         (
             HedgeRetryVenue::Aster,
             aster_missing,
             spec.step,
             spec.aster_min_qty,
             spec.aster_min_notional,
+            marks.0,
         )
     } else {
         (
@@ -3045,6 +3042,7 @@ fn hedge_retry_plan(
             spec.lighter_qty_step,
             spec.lighter_min_qty,
             spec.lighter_min_notional,
+            marks.1,
         )
     };
     let qty = floor_to_step(missing_qty.abs(), step);
@@ -3064,7 +3062,7 @@ fn hedge_retry_plan(
         venue,
         side,
         qty,
-        price_bound: retry_price_bound(opp, side, cfg.arb.hedge_retry_slippage_bps),
+        price_bound: emergency_close_bound(mark, side, cfg.arb.hedge_retry_slippage_bps),
     })
 }
 
@@ -3110,6 +3108,7 @@ async fn try_missing_hedge_retry(
     spec: &MarketSpec,
     aster: &FirstLeg,
     lighter: &OtherLeg,
+    http: &reqwest::Client,
     opp: &Opportunity,
     pre_position: PositionSnapshot,
     mut current_position: PositionSnapshot,
@@ -3119,7 +3118,15 @@ async fn try_missing_hedge_retry(
     let deadline = tokio::time::Instant::now() + timeout;
     let mut report = HedgeRetryReport::empty(cfg.arb.hedge_retry_slippage_bps, None);
     for attempt_no in 1..=cfg.arb.max_hedge_retry_attempts {
-        let Some(plan) = hedge_retry_plan(cfg, spec, opp, pre_position, current_position) else {
+        let marks = match tokio::time::timeout_at(deadline, fetch_rest_books(http, cfg, aster, lighter, spec)).await {
+            Ok((Ok(a), Ok(l))) if !a.is_crossed() && !l.is_crossed() => a.mid().zip(l.mid()),
+            _ => None,
+        };
+        let Some(marks) = marks else {
+            report.error = Some("hedge retry: no valid REST books to price it".to_string());
+            return report;
+        };
+        let Some(plan) = hedge_retry_plan(cfg, spec, opp, pre_position, current_position, marks) else {
             report.error = Some(format!(
                 "no single missing hedge retry plan for current positions aster={} lighter={} expected_aster={} expected_lighter={}",
                 current_position.aster_qty,
@@ -3150,6 +3157,7 @@ async fn try_missing_hedge_retry(
             }
         };
         let unresolved = fill_status.as_deref() == Some("unresolved");
+        let filled = fill.as_ref().is_some_and(|f| f.qty > Decimal::ZERO);
         report.attempts.push(HedgeRetryAttempt {
             fee_evidence,
             identity,
@@ -3166,6 +3174,12 @@ async fn try_missing_hedge_retry(
         });
         if unresolved {
             report.error = Some("retry order terminal evidence unavailable".to_string());
+            return report;
+        }
+        // Terminal and unfilled: no position can reconcile, so recovery takes over now, not at
+        // the deadline (the leg stays unhedged meanwhile).
+        if !filled {
+            report.error = Some("hedge retry did not fill".to_string());
             return report;
         }
         let verified = tokio::time::timeout_at(deadline, async { tokio::join!(
@@ -4279,11 +4293,12 @@ mod tests {
             aster_qty: dec!(-0.80),
             lighter_qty: dec!(0.60),
         };
-        let plan = hedge_retry_plan(&cfg, &spec, &opp, pre, current).unwrap();
+        // Bounded 30 bps off the hedge venue's current mid, not the decision's 63.72 ask.
+        let plan = hedge_retry_plan(&cfg, &spec, &opp, pre, current, (dec!(64.00), dec!(64.10))).unwrap();
         assert_eq!(plan.venue, HedgeRetryVenue::Lighter);
         assert_eq!(plan.side, Side::Buy);
         assert_eq!(plan.qty, dec!(0.20));
-        assert_eq!(plan.price_bound, dec!(63.9111600));
+        assert_eq!(plan.price_bound, dec!(64.292300));
     }
 
     #[test]
@@ -4299,11 +4314,11 @@ mod tests {
             aster_qty: dec!(-0.60),
             lighter_qty: dec!(0.40),
         };
-        let plan = hedge_retry_plan(&cfg, &spec, &opp, pre, current).unwrap();
+        let plan = hedge_retry_plan(&cfg, &spec, &opp, pre, current, (dec!(64.00), dec!(64.10))).unwrap();
         assert_eq!(plan.venue, HedgeRetryVenue::Aster);
         assert_eq!(plan.side, Side::Buy);
         assert_eq!(plan.qty, dec!(0.20));
-        assert_eq!(plan.price_bound, dec!(63.9111600));
+        assert_eq!(plan.price_bound, dec!(64.192000));
     }
 
     #[test]
@@ -4315,7 +4330,7 @@ mod tests {
             aster_qty: dec!(-0.60),
             lighter_qty: dec!(0.60),
         };
-        assert!(hedge_retry_plan(&cfg, &spec, &opp, pre, pre).is_none());
+        assert!(hedge_retry_plan(&cfg, &spec, &opp, pre, pre, (dec!(64), dec!(64))).is_none());
     }
 
     #[test]

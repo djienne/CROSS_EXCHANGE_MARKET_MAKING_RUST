@@ -482,8 +482,10 @@ IOC limits; Lighter uses its native market/IOC path and Hyperliquid bounded IOCs
 
 An unknown submission outcome keeps its order and client ids: a missing order row or a flat
 position does not prove no fill. A known missing hedge gets one retry within
-`hedge_retry_timeout_ms`; recovery then closes only the same-sign net residual, and an
-unresolved retry or close stops further submissions. The ledger's `actual_net_usd` is
+`hedge_retry_timeout_ms`, bounded `hedge_retry_slippage_bps` off the venue's current REST mid
+(the missed order's decision-price bound would miss again); one that ends unfilled hands over at
+once. Recovery then closes only the same-sign net residual, and an unresolved retry or close
+stops further submissions. The ledger's `actual_net_usd` is
 matched spread capture minus fees, and recovery rows are conservative equity-delta estimates.
 
 **XEMM.** Stale books block new exposure. A timeout, a balanced position snapshot or an empty
