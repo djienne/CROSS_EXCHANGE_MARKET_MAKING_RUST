@@ -1,19 +1,28 @@
 # Aster/Lighter/Hyperliquid Market Making and Arbitrage
 
-One Rust binary, `lighter_aster_bot` in `LIGHTER_ASTER_BOT/`, trades one market across Aster
-and Lighter (or Hyperliquid) with two engines: a taker–taker arbitrage engine and an XEMM
-engine that quotes on Aster and hedges on the other venue. Its `run` command holds both in one process and enforces a
-cross-engine loss stop: XEMM quotes, and when an arbitrage passes the taker's entry gate it
-pulls its quotes and hands the execution rights to the taker until the trade is done. A market
-with no Aster leg (`HYPE-LH`: Lighter against Hyperliquid) runs the taker alone. `run --mode dry-run`
-runs the same bot against simulated venues fed by live market data, with no credentials and no
-real orders.
+One Rust binary, `lighter_aster_bot` in `LIGHTER_ASTER_BOT/`, trades one market across two
+venues with two engines:
 
-This is a live trading codebase. `run --mode live`, `taker run` without `--observe-only`,
-`close`, `probe aster-place-cancel`, `probe hl-hedge`, `probe hl-place-cancel` and the
-`*-market`/`*-roundtrip` probes place real orders and can
-lose money through spread, fees, slippage and execution failures. Neither unit tests nor the
-dry run prove live venue acceptance, latency or profitability.
+- **XEMM** quotes on Aster and hedges each fill on the other venue.
+- **Taker–taker arbitrage** takes both venues' books when an edge passes its entry gate.
+
+Its `run` command holds both in one process under one cross-engine loss stop. XEMM quotes; when
+an arbitrage passes the taker's entry gate, XEMM pulls its quotes and hands the execution rights
+to the taker until the trade is done. The markets are `HYPE` (Aster–Lighter), `HYPE-HL`
+(Aster–Hyperliquid) and `HYPE-LH` (Lighter–Hyperliquid: no Aster leg, so the taker runs alone).
+`run --mode dry-run` runs the same bot against simulated venues fed by live market data, with no
+credentials and no real orders.
+
+**This is a live trading codebase.** These commands place real orders and can lose money through
+spread, fees, slippage and execution failures:
+
+- `run --mode live`;
+- `taker run` without `--observe-only`;
+- `close`;
+- `probe aster-place-cancel`, `probe hl-hedge`, `probe hl-place-cancel`, and the
+  `*-market`/`*-roundtrip` probes.
+
+Neither unit tests nor the dry run prove live venue acceptance, latency or profitability.
 
 The [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md) is the operating manual: how the rights are shared,
 configuration and secrets, the dry run, going live, runtime files, halts and recovery, deploy
@@ -53,20 +62,26 @@ The binary is `LIGHTER_ASTER_BOT/target/release/lighter_aster_bot`. `signers/` h
 signer for Linux (amd64, arm64) and macOS (arm64) only, so on Windows the bot runs in Docker.
 The reports need Python 3.
 
-## Dry run
+## Dry run and the Tokyo VPS
 
-The three dry runs (HYPE, HYPE-HL, HYPE-LH) and the recorder of HYPE's public feeds for backtests
-run only on the Tokyo VPS (VPS.md); `python vps.py pull` copies their files daily to
-`LIGHTER_ASTER_BOT/runs/tokyo/dry-run/` and `LIGHTER_ASTER_BOT/data-tokyo/HYPE/`. The model, halts,
-diagnostics and the going-live checklist are in the [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md#dry-run),
-the tape in its [Market data tape](LIGHTER_ASTER_BOT/RUNBOOK.md#market-data-tape) section.
+The three dry runs (`HYPE`, `HYPE-HL`, `HYPE-LH`), the recorder of HYPE's public feeds for
+backtests and the pair screener's collector run only on the Tokyo VPS ([VPS.md](VPS.md)).
+`python vps.py pull` copies their files home daily, to `LIGHTER_ASTER_BOT/runs/tokyo/dry-run/`,
+`LIGHTER_ASTER_BOT/data-tokyo/HYPE/` and `SCREENER/data-tokyo/`.
+
+The runbook covers the [dry run](LIGHTER_ASTER_BOT/RUNBOOK.md#dry-run) (model, halts,
+diagnostics), [going live](LIGHTER_ASTER_BOT/RUNBOOK.md#going-live) and the
+[market data tape](LIGHTER_ASTER_BOT/RUNBOOK.md#market-data-tape).
 
 ## Reports
 
-Run from the repository root. The reports read the bot's records in `LIGHTER_ASTER_BOT/runs/`
-(`trade_history.py` keeps its database in the root `runs/`). With `--dry-run` they read only the Tokyo copy,
-`LIGHTER_ASTER_BOT/runs/tokyo/dry-run/` (`--runs LIGHTER_ASTER_BOT/runs/dry-run` for this PC's),
-and, without `--since`, count from the dry run's first start; their window ends at the copy.
+Run them from the repository root.
+
+- By default they read the live bot's records in `LIGHTER_ASTER_BOT/runs/`; `trade_history.py`
+  keeps its database in the root `runs/`.
+- With `--dry-run` they read only the Tokyo copy, `LIGHTER_ASTER_BOT/runs/tokyo/dry-run/`
+  (`--runs LIGHTER_ASTER_BOT/runs/dry-run` for this PC's). Without `--since` they count from the
+  dry run's first start, and their window ends at the copy's time (`pulled_at.txt`).
 
 ```bash
 python3 dryrun_summary.py                       # every dry-run market on one screen
@@ -78,11 +93,14 @@ python3 trade_history.py --market HYPE --dry-run  # its own database, in the dry
 python3 bot_stats.py --market HYPE --dry-run      # execution quality and health; add --json
 ```
 
-`bot_stats.py` explains the totals. For taker trades it reports expected vs realized edge, how much
-each leg filled worse than the decision price, book ages and fill delays. It also covers the entry
-gate's decisions, XEMM edge and hedge delay, XEMM's hand-overs to the taker, and controller halts and network pauses. For
-a dry run it adds the simulator's late frames (with host freezes separated), latencies against the
-`[dry_run]` model, request rates and rejects.
+`bot_stats.py` explains the totals:
+
+- **Taker:** expected vs realized edge, how much each leg filled worse than the decision price,
+  book ages, fill delays and the entry gate's decisions.
+- **XEMM and controller:** XEMM edge and hedge delay, XEMM's hand-overs to the taker, controller
+  halts and network pauses.
+- **Dry run:** the simulator's late frames (host freezes separated), latencies against the
+  `[dry_run]` model, request rates and rejects.
 
 What the numbers mean:
 

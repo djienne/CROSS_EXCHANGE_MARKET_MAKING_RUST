@@ -14,9 +14,6 @@ code change.
   state per quantity; ~15% of simulated Hyperliquid hedges had failed as no-match (2026-10-12).
   `175d7e5`: a resubscribe snapshot no longer runs before its break, which had left the Lighter
   book unknown until the next snapshot.
-- The simulator gives Lighter separate 60/min read and transaction buckets; Standard shares one,
-  and idle reads use ~26/min (~46 before 2026-10-10), so the model can miss 429s caused by
-  combined traffic.
 - A live-vs-twin comparison should run the twin with the live host's measured latencies (from
   Windows: Aster ~350 ms per order call, Hyperliquid ~950 ms per action), not the Tokyo profile;
   otherwise fill-rate differences mix location with simulator fidelity. With a handful of fills
@@ -85,19 +82,24 @@ and trade-history reports agree on the journal economics. Both streams stayed co
 through their 25-minute keepalive cadence. One HYPE stale-account sweep cleared in 2.54 s;
 the pre-fill-snapshot mismatch and missing-amend false uncertainty did not recur.
 
-Aster's ~250 ms network floor leaves ~95–101 ms per amend, consistent with the Tokyo model.
-Lighter's 562 ms observed hedge includes a ~252 ms reply and its documented 300 ms Standard
-delay ([account types](https://apidocs.lighter.xyz/docs/account-types)); its twin's 323 ms is
-consistent with that delay and the configured short RTT. Hyperliquid's original per-attempt
-first-fill timings were 942/973 ms with a 290 ms info round trip. Its API forwards actions to a node and waits for
-commitment ([API servers](https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/api-servers)),
-so subtracting an info ping also leaves forwarding/consensus time. The normal simulation's
-Hyperliquid tail is widened to `[200, 900]`, matching the published co-located median/p99
-([HyperCore](https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/overview)); these two
-Windows samples do not estimate a Tokyo median or p99. Fill counts and unequal resting
-uptime are insufficient to fit `hidden_queue_multiplier`, which remains 0.5. Gross/net
-capture includes adverse selection and hedge price movement; the journal lacks a separate
-submission-time hedge VWAP, so it cannot identify hedge slippage independently.
+What the trials say about the model:
+
+- **Aster:** its ~250 ms network floor leaves ~95–101 ms per amend, consistent with the Tokyo
+  model.
+- **Lighter:** the 562 ms observed hedge includes a ~252 ms reply and its documented 300 ms
+  Standard delay ([account types](https://apidocs.lighter.xyz/docs/account-types)); its twin's
+  323 ms is consistent with that delay and the configured short RTT.
+- **Hyperliquid:** the original per-attempt first-fill timings were 942/973 ms with a 290 ms info
+  round trip. Its API forwards actions to a node and waits for commitment
+  ([API servers](https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/api-servers)), so
+  subtracting an info ping also leaves forwarding/consensus time. The normal simulation's
+  Hyperliquid tail is widened to `[200, 900]`, matching the published co-located median/p99
+  ([HyperCore](https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/overview)); these two
+  Windows samples do not estimate a Tokyo median or p99.
+- **Not fitted:** fill counts and unequal resting uptime are insufficient to fit
+  `hidden_queue_multiplier`, which remains 0.5. Gross/net capture includes adverse selection and
+  hedge price movement; the journal lacks a separate submission-time hedge VWAP, so it cannot
+  identify hedge slippage independently.
 
 The 15-minute standalone HYPE and HYPE-HL taker trials had no qualifying opportunity.
 HYPE-LH executed one matched 0.15 entry: expected/realized gross 4.666/2.802 bps, edge kept
