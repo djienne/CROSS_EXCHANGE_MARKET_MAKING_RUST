@@ -14,8 +14,9 @@
 //!   full; a fill pauses the market for the cooldown; the hedge fills at the recorded state after
 //!   the fill notice and the hedge latency, and a fill below the hedge's minimum, held then
 //!   corrected by the bot, at the same time (one that grew the inventory, flattened on the maker
-//!   venue); the leftover inventory closes as the taker's. Run in both directions with the bot's settings (required edge, distance gate, skipped
-//!   behind a thin maker top), and as a sweep of the required edge without the gate.
+//!   venue); the leftover inventory closes as the taker's. Run in both directions with the bot's
+//!   settings (required edge, distance gate, skipped behind a thin maker top), and as a sweep of the
+//!   required edge without the gate.
 //! - **Timing.** By default the states and prints replay at their arrival here, as recorded.
 //!   `--scenario` rebuilds them on the venues' clocks (`timeline`): decisions and quotes on the bot's
 //!   view (each venue a constant delay after its stamp), fills and hedges on the venues' books.
@@ -485,11 +486,8 @@ pub fn simulate_xemm(states: &[State], fills: &[State], trades: &[Trade], sim: &
             continue;
         }
         let reference = (quoted.a.mid() + quoted.l.mid()) / 2.0;
-        // As the bot, both sides quote a clip within the cap: the side that grows the inventory has
-        // what is left under it, the other can unwind to the opposite cap; a side left under the
-        // hedge's minimum is full (`quote_engine.rs`'s cap reject). Ponytail: the cap stands for the
-        // margin guard at the dry run's balances; a live account's free margin, which moves with
-        // its PnL and its other markets, is not modelled.
+        // The growing side has what is left under the cap, the other unwinds to the opposite cap;
+        // under the hedge's minimum a side is full (`quote_engine.rs`'s cap reject).
         let headroom = sim.max_position_usd / reference - signed * position;
         if headroom * reference < sim.min_hedge_usd {
             continue;

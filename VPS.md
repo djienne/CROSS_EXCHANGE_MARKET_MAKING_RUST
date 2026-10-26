@@ -26,7 +26,8 @@ set up by `sync` and `pull`:
   ~2 MB/s, file by file, and accepts a copy only when its SHA-256 equals the VPS's
   (`pulled.json` beside them lists the verified files). It deletes a VPS file only once verified
   here and started more than 7 days ago (the screener's gate reads 72 h back). `--dry-run` lists
-  what it would copy and delete.
+  what it would copy and delete. A dropped connection (ssh gives up after ~1 min) restarts it, up
+  to three times, 5 min apart; every step is idempotent.
 - `pull` then copies the VPS's `runs/dry-run/` (and each `runs/archive/` batch not here yet) whole,
   gzipped, to `LIGHTER_ASTER_BOT/runs/tokyo/` and writes the time to `pulled_at.txt`, where the
   reports end their window.

@@ -28,6 +28,7 @@ import shlex
 import subprocess
 import sys
 import tarfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -183,7 +184,10 @@ for host, path in hosts:
 '''
 
 
-OPTS = ["-i", str(KEY), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes"]
+# A dead route fails in ~1 min instead of hanging (a pull once hung 3 h); stalls of tens of seconds
+# are ridden out.
+OPTS = ["-i", str(KEY), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=30",
+        "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"]
 
 
 def ssh(cmd, stdin=None, capture=False):
@@ -305,7 +309,7 @@ def pull(dry_run):
               f"{'' if dry_run else f' ({copied} copied, {failed} failed)'}, {len(old)} past {KEEP_DAYS} days", flush=True)
     try:
         pull_runs(dry_run)
-    except (subprocess.CalledProcessError, OSError, tarfile.TarError) as e:
+    except (OSError, tarfile.TarError) as e:
         print(f"  FAILED runs/ copy ({e}); the next pull retries it", flush=True)
     if not dry_run:
         ssh(f"free=$(df -m --output=avail / | tail -1 | tr -d ' '); echo \"  VPS: $free MB free\";"
@@ -351,7 +355,15 @@ def main():
     elif cmd == "screener":
         screener()
     elif cmd == "pull":
-        pull("--dry-run" in sys.argv[2:])
+        # It starts over after a dropped connection: every step is idempotent.
+        for attempt in range(3):
+            if attempt:
+                time.sleep(300)
+            try:
+                return pull("--dry-run" in sys.argv[2:])
+            except subprocess.CalledProcessError as e:
+                print(f"  attempt {attempt + 1} failed ({e.returncode}: {e.cmd[-1][:60]})", flush=True)
+        sys.exit(1)
     elif cmd == "logs":
         n = sys.argv[2] if len(sys.argv) > 2 else "50"
         market = sys.argv[3].upper() if len(sys.argv) > 3 else "HYPE"
