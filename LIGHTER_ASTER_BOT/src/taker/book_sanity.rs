@@ -512,6 +512,7 @@ mod tests {
             aster_min_notional: dec!(5),
             lighter_qty_step: dec!(0.01),
             lighter_min_notional: dec!(10),
+            lighter_min_qty: dec!(0.01),
         }
     }
 

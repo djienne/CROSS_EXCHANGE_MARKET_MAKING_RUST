@@ -2377,7 +2377,7 @@ impl Strategy {
         self.last_hot_action_ns.insert(fill.market.clone(), now_ns);
         self.cooldown.trigger(now_ns, self.cooldown_ns, &fill.market);
         let Some(ctx) = self.ctx.get(&fill.market) else { self.freeze_and_sweep(now_ns, "unknown_fill_market"); return };
-        let rules = HedgeabilityRules { hedge_min_notional: ctx.spec.hl_min_notional, hedge_qty_step: ctx.spec.hl_qty_step };
+        let rules = HedgeabilityRules { hedge_min_notional: ctx.spec.hl_min_notional, hedge_qty_step: ctx.spec.hl_qty_step, hedge_min_qty: ctx.spec.hl_min_qty };
         let step = ctx.spec.hl_qty_step;
         let mark = self.fresh_hl_quote_book(&fill.market, now_ns).and_then(|b| b.book.mid()).unwrap_or(fill.last_fill_px);
         let previous = self.pending.remove(&fill.market);
@@ -2877,7 +2877,7 @@ impl Strategy {
         let a_qty = if same_sign(aster) { crate::decimal::floor_to_step(net.abs().min(aster.abs()), aster_step) } else { Decimal::ZERO };
         let h_qty = if same_sign(lighter) { crate::decimal::floor_to_step(net.abs().min(lighter.abs()), lighter_step) } else { Decimal::ZERO };
         let slip = self.cfg.live.lighter.emergency_slippage_bps;
-        let hedge_rules = HedgeabilityRules { hedge_min_notional: ctx.spec.hl_min_notional, hedge_qty_step: lighter_step };
+        let hedge_rules = HedgeabilityRules { hedge_min_notional: ctx.spec.hl_min_notional, hedge_qty_step: lighter_step, hedge_min_qty: ctx.spec.hl_min_qty };
         let selected = if a_qty > Decimal::ZERO {
             self.fresh_aster_touch_book(market, now_ns).and_then(|b| b.book.mid().map(|p| (Venue::Aster, a_qty, p, b.source.as_str(), b.age_ms)))
         } else { None }.or_else(|| {
@@ -3144,6 +3144,7 @@ mod tests {
             hl_sz_decimals: 3,
             hl_qty_step: dec!(0.001),
             hl_min_notional: dec!(5),
+            hl_min_qty: dec!(0.001),
         }
     }
     fn books() -> (OrderBook, OrderBook) {

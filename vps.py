@@ -6,10 +6,11 @@
   python vps.py logs [N] [MARKET]  # last N journal lines of a dry run (default 50, HYPE)
   python vps.py screener  # upload, build and (re)start the pair screener's collector
   python vps.py pull [--dry-run]  # copy closed data files home, verify, prune the VPS's old ones;
-                                  # copy the dry runs' runs/ to LIGHTER_ASTER_BOT/runs/tokyo/
+                                  # copy the VPS's runs/ (live and dry runs) to LIGHTER_ASTER_BOT/runs/tokyo/
+  python vps.py live creds|start|stop|logs|status  # the live bot, its own unit apart from the dry runs
 
-Only git-tracked files go up (uncommitted edits included, untracked files and *.env never), so no
-credentials or runs/ leave this machine. Ponytail: files deleted locally stay on the VPS; if that
+Only git-tracked files go up (uncommitted edits included, untracked files and *.env never); the
+live bot's Lighter and Hyperliquid env files go up only by `live creds`, at mode 600. Ponytail: files deleted locally stay on the VPS; if that
 ever matters, wipe ~/xemm/LIGHTER_ASTER_BOT/src before extracting.
 
 Since 2026-10-10 the VPS collects and this PC stores (this PC's route to Tokyo stalls for tens of
@@ -40,7 +41,7 @@ KEY = Path.home() / ".ssh" / "id_rsa"
 REMOTE = "~/xemm/LIGHTER_ASTER_BOT"
 SERVICE = "xemm-dryrun"
 # Each dry run's unit and market: Aster-Lighter, Aster-Hyperliquid, Lighter-Hyperliquid.
-DRY_RUNS = {SERVICE: "HYPE", f"{SERVICE}-hl": "HYPE-HL", f"{SERVICE}-lh": "HYPE-LH"}
+DRY_RUNS = {SERVICE: "HYPE", f"{SERVICE}-hl": "HYPE-HL", f"{SERVICE}-lh": "HYPE-LH", f"{SERVICE}-cashcat-lh": "CASHCAT-LH"}
 UNITS = " ".join(DRY_RUNS)
 SCREENER = "xemm-screener"
 RECORDER = "xemm-recorder"
@@ -51,7 +52,8 @@ KEEP_DAYS = 7
 # Remote data dir, local copy, file pattern; names start with their UTC start (YYYY-MM-DDTHHMMSSZ).
 PULLS = [("/root/xemm/LIGHTER_ASTER_BOT/data", ROOT / "LIGHTER_ASTER_BOT" / "data-tokyo", "*/*.tape.zst"),
          ("/root/xemm/SCREENER/data", ROOT / "SCREENER" / "data-tokyo", "*.screen.zst")]
-# The dry runs' runs/ comes whole to here; the reports read its dry-run/ by default.
+# The VPS's runs/ comes here: the live bot's files at its top, the dry runs' in dry-run/ (the
+# reports' default).
 RUNS_COPY = ROOT / "LIGHTER_ASTER_BOT" / "runs" / "tokyo"
 
 UNIT = """[Unit]
@@ -90,6 +92,24 @@ CPUWeight=20
 
 [Install]
 WantedBy=multi-user.target
+"""
+
+# The live bot: sync never starts or restarts it, and a halt or a reboot leaves it stopped until
+# `live start`, after review. Above the dry runs and collectors: its timing is real money.
+LIVE, LIVE_MARKET = "xemm-live", "CASHCAT-LH"
+LIVE_UNIT = """[Unit]
+Description=XEMM {market} LIVE (real orders)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/root/xemm/LIGHTER_ASTER_BOT
+ExecStart=/root/xemm/LIGHTER_ASTER_BOT/target/release/lighter_aster_bot run --market {market} --mode live
+Restart=no
+KillSignal=SIGINT
+TimeoutStopSec=460
+MemoryMax=512M
+Nice=-5
 """
 
 RECORDER_UNIT = """[Unit]
@@ -216,7 +236,8 @@ def sync():
     # peaked at 1.27 of its 2.5 GB (2026-10-10); the running services use < 100 MB together.
     # The binary logs the commit it was built from (`-dirty`: uncommitted edits went up too).
     commit = subprocess.run(["git", "describe", "--always", "--dirty"], cwd=ROOT, check=True, capture_output=True, text=True).stdout.strip()
-    ssh(f". ~/.cargo/env && cd {REMOTE} && GIT_COMMIT={shlex.quote(commit)} CARGO_BUILD_JOBS=1 cargo build --release")
+    # Niced: a live bot may be trading on the one CPU.
+    ssh(f". ~/.cargo/env && cd {REMOTE} && GIT_COMMIT={shlex.quote(commit)} CARGO_BUILD_JOBS=1 nice cargo build --release")
     # The bot logs to stdout -> journald; cap it so the small disk only grows by runs/dry-run.
     ssh("mkdir -p /etc/systemd/journald.conf.d && printf '[Journal]\\nSystemMaxUse=200M\\n'"
         " > /etc/systemd/journald.conf.d/size.conf && systemctl restart systemd-journald")
@@ -234,6 +255,31 @@ def sync():
 def unit_files():
     """Shell lines that write each dry run's unit file."""
     return "".join(f"cat > /etc/systemd/system/{u}.service <<'EOF'\n{UNIT.format(market=m)}EOF\n" for u, m in DRY_RUNS.items())
+
+
+def live(action):
+    """`creds` uploads lighter.env and hyperliquid.env at mode 600 (never printed); `start` (re)writes
+    the unit and starts it unless it runs; `stop` drains it (SIGINT, up to 460 s)."""
+    if action == "creds":
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            for name in ("lighter.env", "hyperliquid.env"):
+                path = ROOT / "LIGHTER_ASTER_BOT" / name
+                info = tar.gettarinfo(path, arcname=name)
+                info.mode = 0o600
+                with open(path, "rb") as f:
+                    tar.addfile(info, f)
+        ssh(f"umask 077 && tar -x --no-same-owner -C {REMOTE} && chmod 600 {REMOTE}/*.env && ls -l {REMOTE}/*.env", stdin=buf.getvalue())
+    elif action == "start":
+        ssh(f"cat > /etc/systemd/system/{LIVE}.service <<'EOF'\n{LIVE_UNIT.format(market=LIVE_MARKET)}EOF\n"
+            f"systemctl daemon-reload && if systemctl is-active -q {LIVE}; then echo already running; else systemctl start {LIVE}; fi"
+            f" && sleep 5 && systemctl --no-pager status {LIVE} | head -5")
+    elif action == "stop":
+        ssh(f"systemctl stop {LIVE}; systemctl --no-pager status {LIVE} | head -3")
+    elif action == "logs":
+        ssh(f"journalctl -u {LIVE} --no-pager -n 100")
+    else:
+        ssh(f"systemctl --no-pager status {LIVE} | head -5; true")
 
 
 def screener():
@@ -317,19 +363,20 @@ def pull(dry_run):
 
 
 def pull_runs(dry_run):
-    """Copies the dry runs' files (the VPS's runs/dry-run/, and each runs/archive/ batch not here
-    yet) over RUNS_COPY, then writes the copy's time to pulled_at.txt: the reports end their
-    window there. Ponytail: the logs come whole each day, gzipped (13x); they reach ~1 GB before
+    """Copies the VPS's runs/ (the live bot's files at its top, runs/dry-run/, and each runs/archive/
+    batch not here yet) over RUNS_COPY, then writes the copy's time to pulled_at.txt: the reports
+    end their window there. Ponytail: the logs come whole each day, gzipped (13x); they reach ~1 GB before
     the archive moves them (~2 weeks for three markets), so up to ~80 MB, ~1 min at 2 MB/s.
     Past that, rsync --append would send only the new bytes."""
     have = [p.name for p in (RUNS_COPY / "archive").glob("*")]
     if dry_run:
-        print(f"  would copy {REMOTE}/runs/dry-run (and archive/ but {len(have)} batches here) to {RUNS_COPY}")
+        print(f"  would copy {REMOTE}/runs (archive/ but {len(have)} batches here) to {RUNS_COPY}")
         return
     at = datetime.now(timezone.utc)
     skip = " ".join(shlex.quote(f"--exclude=archive/{name}") for name in have)
     # tar exits 1 when a log grew while read: the copy holds it up to then.
-    ssh(f"rm -f /tmp/runs.tgz; cd {REMOTE}/runs || exit 2; nice tar -czf /tmp/runs.tgz --exclude='*.lock' {skip} dry-run archive; [ $? -le 1 ]")
+    ssh(f"rm -f /tmp/runs.tgz; cd {REMOTE}/runs || exit 2; nice tar -czf /tmp/runs.tgz --exclude='*.lock' {skip} dry-run archive"
+        " $(find . -maxdepth 1 -type f ! -name '*.lock'); [ $? -le 1 ]")
     RUNS_COPY.mkdir(parents=True, exist_ok=True)
     part = RUNS_COPY / "runs.tgz.part"
     subprocess.run(["scp", "-q", "-l", "16000", *OPTS, f"{HOST}:/tmp/runs.tgz", part.name], cwd=RUNS_COPY, check=True)
@@ -348,12 +395,14 @@ def main():
     elif cmd == "latency":
         ssh("python3 -", stdin=LATENCY.encode())
     elif cmd == "status":
-        ssh(f"systemctl --no-pager status {UNITS} | grep -E '^. |Active:|Memory:'; free -h; df -h /; du -sh {REMOTE}/runs/*; "
+        ssh(f"systemctl --no-pager status {UNITS} {LIVE} | grep -E '^. |Active:|Memory:'; free -h; df -h /; du -sh {REMOTE}/runs/*; "
             f"systemctl list-timers {SERVICE}-archive.timer --no-pager | head -2; "
             f"echo recorder: $(systemctl is-active {RECORDER}) screener: $(systemctl is-active {SCREENER}); "
             f"du -sh {REMOTE}/data/* ~/xemm/SCREENER/data 2>/dev/null; true")
     elif cmd == "screener":
         screener()
+    elif cmd == "live":
+        live(sys.argv[2] if len(sys.argv) > 2 else "status")
     elif cmd == "pull":
         # It starts over after a dropped connection: every step is idempotent.
         for attempt in range(3):

@@ -24,13 +24,11 @@ pub async fn build_market_specs(
     } else {
         HashMap::new()
     };
-    let needs_lighter_rest = markets.iter().any(|m| {
-        (m.hedge_venue == HedgeVenue::Lighter || m.first_venue == FirstVenue::Lighter) && manual_lighter_meta(m).is_none()
-    });
-    // An unreadable or zero Lighter minimum is $10 here (the shared fetch leaves 0).
+    let needs_lighter_rest = markets.iter().any(|m| m.hedge_venue == HedgeVenue::Lighter || m.first_venue == FirstVenue::Lighter);
+    // An unreadable or zero Lighter minimum is $10 here, buffered (the shared fetch leaves 0).
     let lighter = if needs_lighter_rest {
         let mut meta = shared::fetch_lighter_meta_from_base(&client, lighter_base_url).await?;
-        meta.values_mut().filter(|m| m.min_quote_amount <= Decimal::ZERO).for_each(|m| m.min_quote_amount = Decimal::from(10));
+        meta.values_mut().filter(|m| m.min_quote_amount <= Decimal::ZERO).for_each(|m| m.min_quote_amount = rust_decimal_macros::dec!(10.5));
         meta
     } else {
         HashMap::new()
@@ -39,11 +37,11 @@ pub async fn build_market_specs(
     let mut specs = Vec::new();
     for m in markets {
         let lighter_meta = || {
-            manual_lighter_meta(m)
-                .or_else(|| lighter.get(&m.lighter_symbol.to_ascii_uppercase()).cloned())
-                .ok_or_else(|| anyhow!("Lighter symbol {} not configured and not found in orderBooks", m.lighter_symbol))
+            lighter.get(&m.lighter_symbol.to_ascii_uppercase()).cloned()
+                .ok_or_else(|| anyhow!("Lighter symbol {} not found in orderBooks", m.lighter_symbol))
         };
-        // Lighter's minimum size is one size step, as its hedges assume.
+        // A leg's minimum size is one size step, or Lighter's minimum base amount if larger.
+        let min_size = |lm: &LighterMarketMeta| lm.min_base_amount.max(Decimal::new(1, lm.size_decimals));
         let (symbol, (tick, step, min_qty, min_notional), first_market_index) = match m.first_venue {
             FirstVenue::Aster => {
                 let symbol = m.aster_symbol.to_ascii_uppercase();
@@ -55,8 +53,7 @@ pub async fn build_market_specs(
             }
             FirstVenue::Lighter => {
                 let lm = lighter_meta()?;
-                let step = Decimal::new(1, lm.size_decimals);
-                (lm.symbol, (Decimal::new(1, lm.price_decimals), step, step, lm.min_quote_amount), lm.market_id)
+                (lm.symbol.clone(), (Decimal::new(1, lm.price_decimals), Decimal::new(1, lm.size_decimals), min_size(&lm), lm.min_quote_amount), lm.market_id)
             }
         };
         let lm = match (m.hedge_venue, hyperliquid_base_url) {
@@ -67,7 +64,7 @@ pub async fn build_market_specs(
         specs.push(MarketSpec {
             market_id: m.id(),
             aster_symbol: symbol,
-            lighter_symbol: lm.symbol,
+            lighter_symbol: lm.symbol.clone(),
             lighter_market_id: lm.market_id,
             lighter_price_decimals: lm.price_decimals,
             lighter_size_decimals: lm.size_decimals,
@@ -78,6 +75,7 @@ pub async fn build_market_specs(
             aster_min_notional: min_notional,
             lighter_qty_step: Decimal::new(1, lm.size_decimals),
             lighter_min_notional: lm.min_quote_amount,
+            lighter_min_qty: min_size(&lm),
             hedge: m.hedge_venue,
             first: m.first_venue,
             first_market_index,
@@ -97,15 +95,6 @@ async fn hyperliquid_meta(client: &reqwest::Client, base_url: &str, coin: &str) 
         size_decimals: asset.sz_decimals,
         price_decimals: 6u32.saturating_sub(asset.sz_decimals),
         min_quote_amount: shared::HYPERLIQUID_MIN_NOTIONAL,
-    })
-}
-
-fn manual_lighter_meta(m: &MarketCfg) -> Option<LighterMarketMeta> {
-    Some(LighterMarketMeta {
-        market_id: m.lighter_market_index?,
-        symbol: m.lighter_symbol.clone(),
-        size_decimals: m.lighter_size_decimals?,
-        price_decimals: m.lighter_price_decimals?,
-        min_quote_amount: m.lighter_min_notional?,
+        min_base_amount: Decimal::ZERO,
     })
 }

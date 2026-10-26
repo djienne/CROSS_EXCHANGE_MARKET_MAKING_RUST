@@ -258,7 +258,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let bal_before = aster.available_usdc().await?;
             println!("balance_before={bal_before}");
             // XEMM's user stream watches the fills, and XEMM's reduce-only MARKET flatten closes.
-            let (xemm, xemm_stream, xspec) = crate::livebot::probe::xemm_aster(&cli.config, market.as_deref().unwrap_or("HYPE")).await?;
+            let (xemm, xemm_stream, xspec) = crate::livebot::probe::xemm_aster(&cli.config, &spec.market_id.0).await?;
             let stop = tokio_util::sync::CancellationToken::new();
             let stream = crate::livebot::probe::spawn_fill_printer(xemm_stream, &xspec, Arc::default(), stop.clone());
             tokio::time::sleep(Duration::from_secs(2)).await; // the stream subscribes before the first fill
@@ -331,7 +331,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             }
 
             let min_qty = ceil_to_step(spec.lighter_min_notional / ask.px, spec.lighter_qty_step);
-            let qty = min_qty.max(spec.lighter_qty_step);
+            let qty = min_qty.max(spec.lighter_min_qty);
             let notional = qty * ask.px;
             if qty <= Decimal::ZERO {
                 bail!(
@@ -869,7 +869,7 @@ mod tests {
         let spec = MarketSpec {market_id:"HYPE".into(),aster_symbol:"HYPEUSDT".to_string(),lighter_symbol:"HYPE".to_string(),
             lighter_market_id:24,lighter_price_decimals:4,lighter_size_decimals:2,lighter_price_tick:dec!(0.0001), hedge: Default::default(), first: Default::default(), first_market_index: 0,
             tick:dec!(0.01),step:dec!(0.01),aster_min_qty:dec!(0.01),aster_min_notional:dec!(10),
-            lighter_qty_step:dec!(0.01),lighter_min_notional:dec!(10)};
+            lighter_qty_step:dec!(0.01),lighter_min_notional:dec!(10),lighter_min_qty:dec!(0.01)};
         let aster = AsterRest::new(url,Arc::new(crate::taker::aster::sign::test_support::TestSigner::new()),std::slice::from_ref(&spec)).unwrap();
         let buy = crate::taker::aster::rest::SubmitOutcome::Accepted {venue_order_id:Some(1),client_order_id:"buy-fixture".to_string(),
             raw:serde_json::json!({"orderId":1,"clientOrderId":"buy-fixture","status":"FILLED","executedQty":"1","cumQuote":"100"}).to_string()};

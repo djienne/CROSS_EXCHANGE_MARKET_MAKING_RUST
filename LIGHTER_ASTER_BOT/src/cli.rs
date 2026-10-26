@@ -187,7 +187,15 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             crate::livebot::probe::run(&cfg, &check, market, i_understand_live, max_usd).await?;
         }
         Commands::Close { market, venue, i_understand_live } => {
-            let cfg = crate::config::Config::load(&cli.config)?;
+            let mut cfg = crate::config::Config::load(&cli.config)?;
+            // A taker-only market (no Aster leg) closes on its Lighter and Hyperliquid legs.
+            let taker = crate::taker::config::Config::load(&cli.config)?;
+            cfg.markets.extend(taker.markets.iter().filter(|m| m.aster_symbol.is_empty()).map(|m| crate::config::MarketCfg {
+                aster_symbol: String::new(),
+                hl_coin: m.lighter_symbol.clone(),
+                hedge_venue: m.hedge_venue,
+                market_id: Some(m.id().0),
+            }));
             crate::livebot::probe::close(&cfg, &market, &venue, i_understand_live).await?;
         }
         Commands::Status { market } => {

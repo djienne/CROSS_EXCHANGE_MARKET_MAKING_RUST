@@ -169,11 +169,12 @@ pub async fn info(http: &reqwest::Client, base: &str, body: Value) -> Result<Val
     Ok(reply.json().await?)
 }
 
-/// `coin`'s asset id (its place in the universe) and size decimals, from a `meta` reply.
+/// `coin`'s asset id (its place in the universe) and size decimals, from a `meta` reply. A
+/// delisted coin is refused: its name can be another venue's live token (AI, 2026-10-26).
 pub fn asset_in(meta: &Value, coin: &str) -> Result<Asset> {
     let universe = meta["universe"].as_array().context("meta without a universe")?;
-    let (index, entry) = universe.iter().enumerate().find(|(_, a)| a["name"] == coin)
-        .with_context(|| format!("{coin} is not a Hyperliquid perp"))?;
+    let (index, entry) = universe.iter().enumerate().find(|(_, a)| a["name"] == coin && a["isDelisted"] != true)
+        .with_context(|| format!("{coin} is not a listed Hyperliquid perp"))?;
     let sz_decimals = entry["szDecimals"].as_u64().context("meta without szDecimals")? as u32;
     Ok(Asset { index: index as u32, coin: coin.to_string(), sz_decimals })
 }
@@ -330,6 +331,13 @@ impl Client {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn a_delisted_coin_is_not_tradable() {
+        let meta = json!({"universe": [{"name": "AI", "szDecimals": 1, "isDelisted": true}, {"name": "HYPE", "szDecimals": 2}]});
+        assert!(asset_in(&meta, "AI").is_err());
+        assert_eq!(asset_in(&meta, "HYPE").unwrap().index, 1);
+    }
 
     #[test]
     fn the_order_action_packs_and_hashes_as_the_python_sdk() {

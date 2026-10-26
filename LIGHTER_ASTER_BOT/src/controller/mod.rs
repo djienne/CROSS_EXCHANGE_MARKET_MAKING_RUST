@@ -327,6 +327,9 @@ pub(crate) async fn run_with(
             std::fs::remove_file(&files.baseline)?;
             events.emit("baseline_reset", serde_json::json!({"path": files.baseline.display().to_string()}));
         }
+        if maker_markets.is_empty() {
+            crate::livebot::probe::hedge_leverage_gate(&cfg.maker, &taker_markets[0].lighter_symbol).await?;
+        }
         let taker_ledger = crate::taker::pnl::ledger_path(&cfg.taker.pnl, &taker_markets[0].id());
         let engines = engines::LiveEngines::new(&cfg, &market, taker_markets, maker_markets, files.xemm_stem.clone()).await?;
         supervisor::Supervisor::new(cfg.controller, market, mode, files, taker_ledger, engines, events, stop).run().await
@@ -499,7 +502,7 @@ mod tests {
         std::fs::write(&path, shipped).unwrap();
         let cfg = BotConfig::load(&path).unwrap();
         let (taker, maker) = cfg.select("HYPE").unwrap();
-        assert_eq!((taker[0].lighter_market_index, maker[0].aster_symbol.as_str()), (Some(24), "HYPEUSDT"));
+        assert_eq!((taker[0].lighter_symbol.as_str(), maker[0].aster_symbol.as_str()), ("HYPE", "HYPEUSDT"));
         let (taker, maker) = cfg.select("HYPE-HL").unwrap();
         assert!(taker[0].hedge_venue == maker[0].hedge_venue && maker[0].hedge_venue == crate::config::HedgeVenue::Hyperliquid);
         let (lh, maker) = cfg.select("HYPE-LH").unwrap();

@@ -735,7 +735,7 @@ mod tests {
             market_id: hype.clone(), aster_symbol: "HYPEUSDT".into(), lighter_symbol: "HYPE".into(),
             lighter_market_id: 24, lighter_price_decimals: 4, lighter_size_decimals: 2, lighter_price_tick: dec!(0.0001), hedge: Default::default(), first: Default::default(), first_market_index: 0,
             tick: dec!(0.001), step: dec!(0.01), aster_min_qty: dec!(0.01), aster_min_notional: dec!(5),
-            lighter_qty_step: dec!(0.01), lighter_min_notional: dec!(10),
+            lighter_qty_step: dec!(0.01), lighter_min_notional: dec!(10), lighter_min_qty: dec!(0.01),
         };
         let rest = AsterRest::new(world.aster.clone(), crate::dryrun::tests::aster_signer(), &[spec]).unwrap();
         let outcome = rest.submit_ioc_order(&hype, Side::Buy, dec!(0.1), dec!(101.5), false).await;

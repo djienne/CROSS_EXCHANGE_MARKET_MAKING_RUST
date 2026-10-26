@@ -203,6 +203,7 @@ struct MarketMathF64 {
     aster_min_qty: f64,
     aster_min_notional: f64,
     lighter_min_notional: f64,
+    lighter_min_qty: f64,
     desired_notional: f64,
     aster_taker_fee_rate: f64,
     lighter_taker_fee_rate: f64,
@@ -228,6 +229,8 @@ impl MarketMathF64 {
                 .context("Aster min notional is not representable as finite positive f64")?,
             lighter_min_notional: positive_decimal_to_f64(spec.lighter_min_notional)
                 .context("Lighter min notional is not representable as finite positive f64")?,
+            lighter_min_qty: non_negative_decimal_to_f64(spec.lighter_min_qty)
+                .context("Lighter min qty is not representable as finite f64")?,
             desired_notional: positive_decimal_to_f64(cfg.arb.desired_notional)
                 .context("desired notional is not representable as finite positive f64")?,
             aster_taker_fee_rate: non_negative_decimal_to_f64(cfg.arb.aster_taker_fee_bps)
@@ -868,6 +871,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
             markets.len()
         );
     }
+    cfg.size_for(&markets[0]);
 
     let specs = rest_specs::build_market_specs(
         &markets,
@@ -1039,6 +1043,16 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
     );
 
     let http = rest_book::client()?;
+    // Refuse a name the two venues price apart (two tokens), or a common size step worth more
+    // than the mismatch tolerance: a partial fill can leave up to a step unpaired, which recovery
+    // cannot always close (ZEC's Hyperliquid step is ~$12).
+    let (a_book, l_book) = fetch_rest_books(&http, &cfg, &aster, &lighter, &spec).await;
+    let (a_mid, l_mid) = (a_book?.mid().context("first leg REST book empty")?, l_book?.mid().context("second leg REST book empty")?);
+    anyhow::ensure!((a_mid - l_mid).abs() <= l_mid * Decimal::new(5, 2),
+        "{}: the legs' mids {a_mid} and {l_mid} are over 5% apart: two different tokens?", spec.market_id);
+    let step_usd = common_qty_step(spec.step, spec.lighter_qty_step)? * a_mid;
+    anyhow::ensure!(step_usd <= cfg.risk.max_position_mismatch_usd,
+        "{}: one common size step is worth ${step_usd:.2}, over the ${} mismatch tolerance", spec.market_id, cfg.risk.max_position_mismatch_usd);
     let book_sanity = crate::taker::book_sanity::start(
         cfg.clone(),
         spec.clone(),
@@ -2284,6 +2298,7 @@ fn min_trade_qty_f64(math: &MarketMathF64, aster_px: f64, lighter_px: f64) -> Op
     }
     Some(
         math.aster_min_qty
+            .max(math.lighter_min_qty)
             .max(math.aster_min_notional / aster_px)
             .max(math.lighter_min_notional / lighter_px),
     )
@@ -3028,7 +3043,7 @@ fn hedge_retry_plan(
             HedgeRetryVenue::Lighter,
             lighter_missing,
             spec.lighter_qty_step,
-            spec.lighter_qty_step,
+            spec.lighter_min_qty,
             spec.lighter_min_notional,
         )
     };
@@ -3312,13 +3327,9 @@ async fn recover_if_needed(
     let mut baseline = None;
     let result = tokio::time::timeout_at(deadline, async {
         for attempt in 0..=3 {
-            let (position, a_book, l_book) = tokio::join!(
+            let (position, (a_book, l_book)) = tokio::join!(
                 reconcile_positions(&spec.market_id, aster, lighter),
-                async { match aster {
-                    FirstLeg::Aster { .. } => rest_book::fetch_aster_book(http, &cfg.venues.aster_base_url, &spec.aster_symbol, 20).await,
-                    FirstLeg::Other(leg) => fetch_other_rest_book(http, cfg, leg, &spec.first_leg_view()).await,
-                } },
-                fetch_other_rest_book(http, cfg, lighter, spec),
+                fetch_rest_books(http, cfg, aster, lighter, spec),
             );
             let position = position?;
             if baseline.is_none() { baseline = Some(position); }
@@ -3447,7 +3458,7 @@ fn residual_close_qtys(position: PositionSnapshot, spec: &MarketSpec, hedge_px: 
     let l_qty = if same_sign(position.lighter_qty) {
         floor_to_step((net.abs() - a_qty).min(position.lighter_qty.abs()), spec.lighter_qty_step)
     } else { Decimal::ZERO };
-    let rules = crate::inventory::HedgeabilityRules { hedge_min_notional: spec.lighter_min_notional, hedge_qty_step: spec.lighter_qty_step };
+    let rules = crate::inventory::HedgeabilityRules { hedge_min_notional: spec.lighter_min_notional, hedge_qty_step: spec.lighter_qty_step, hedge_min_qty: spec.lighter_min_qty };
     let l_qty = crate::inventory::reduce_only_hedge_qty(spec.hedge, l_qty, position.lighter_qty, &rules, hedge_px);
     (side, a_qty, l_qty)
 }
@@ -3534,6 +3545,17 @@ async fn fetch_other_rest_book(http: &reqwest::Client, cfg: &Config, leg: &Other
         OtherLeg::Hyperliquid(_) => crate::connectors::rest_book::fetch_hyperliquid_book(http, &cfg.venues.hyperliquid_base_url, &spec.lighter_symbol)
             .await.map(crate::taker::venues::hyperliquid::taker_book),
     }
+}
+
+/// Both legs' REST books.
+async fn fetch_rest_books(http: &reqwest::Client, cfg: &Config, aster: &FirstLeg, lighter: &OtherLeg, spec: &MarketSpec) -> (Result<OrderBook>, Result<OrderBook>) {
+    tokio::join!(
+        async { match aster {
+            FirstLeg::Aster { .. } => rest_book::fetch_aster_book(http, &cfg.venues.aster_base_url, &spec.aster_symbol, 20).await,
+            FirstLeg::Other(leg) => fetch_other_rest_book(http, cfg, leg, &spec.first_leg_view()).await,
+        } },
+        fetch_other_rest_book(http, cfg, lighter, spec),
+    )
 }
 
 fn spawn_account_snapshot_refresher(
@@ -3878,6 +3900,7 @@ mod tests {
             aster_min_notional: dec!(10),
             lighter_qty_step: dec!(0.01),
             lighter_min_notional: dec!(10),
+            lighter_min_qty: dec!(0.01),
         }
     }
 
@@ -3905,6 +3928,13 @@ mod tests {
 
     fn test_math(cfg: &Config, spec: &MarketSpec) -> MarketMathF64 {
         MarketMathF64::from_config_spec(cfg, spec).unwrap()
+    }
+
+    #[test]
+    fn lighter_min_base_floors_the_trade_size() {
+        // QNT on Lighter: 0.1 coins minimum, ~$20 at $202.78, over its $10 minimum notional.
+        let spec = MarketSpec { step: dec!(0.001), aster_min_qty: dec!(0.001), lighter_qty_step: dec!(0.001), lighter_min_qty: dec!(0.1), ..test_spec() };
+        assert_eq!(min_trade_qty_f64(&test_math(&test_cfg(), &spec), 202.78, 202.78), Some(0.1));
     }
 
     fn pos_f64(pos: PositionSnapshot) -> PositionF64 {

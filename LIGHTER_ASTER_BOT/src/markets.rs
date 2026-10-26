@@ -27,4 +27,7 @@ pub struct MarketSpec {
     pub hl_sz_decimals: i32,
     pub hl_qty_step: Decimal,
     pub hl_min_notional: Decimal,
+    /// The hedge's smallest order: one step, or Lighter's minimum base amount if larger.
+    #[serde(default)]
+    pub hl_min_qty: Decimal,
 }

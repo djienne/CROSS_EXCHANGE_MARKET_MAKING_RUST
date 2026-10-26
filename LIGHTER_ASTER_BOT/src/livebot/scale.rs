@@ -419,6 +419,7 @@ pub(crate) mod tests {
             hl_sz_decimals: 3,
             hl_qty_step: dec!(0.001),
             hl_min_notional: dec!(10),
+            hl_min_qty: dec!(0.001),
         }
     }
 

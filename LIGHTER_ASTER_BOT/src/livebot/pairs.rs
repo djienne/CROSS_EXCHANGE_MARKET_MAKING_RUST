@@ -58,6 +58,7 @@ pub fn classify(spec: &MarketSpec, ref_px: Decimal, desired_notional: Decimal) -
     let rules = HedgeabilityRules {
         hedge_min_notional: spec.hl_min_notional,
         hedge_qty_step: spec.hl_qty_step,
+        hedge_min_qty: spec.hl_min_qty,
     };
     let hl_min = hl_min_hedge_qty(&rules, ref_px);
     // The smallest possible Aster fill is one lot (a large order can partial-fill a single
@@ -116,6 +117,7 @@ mod tests {
             hl_sz_decimals: 3,
             hl_qty_step,
             hl_min_notional,
+            hl_min_qty: hl_qty_step,
         }
     }
 

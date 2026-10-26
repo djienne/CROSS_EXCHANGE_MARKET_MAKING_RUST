@@ -1,4 +1,4 @@
-# VPS (Tokyo dry run and data collection)
+# VPS (Tokyo dry runs, data collection, the live bot)
 
 | | |
 |---|---|
@@ -6,9 +6,10 @@
 | Key | `~/.ssh/id_rsa` on the Windows box (never commit it) |
 | Host | Tokyo, Ubuntu 22.04 (kernel 5.15.0-198), 1 vCPU, ~1 GB RAM + 2.5 GB swap (`/swapfile2g` + a 0.5 GB partition), 25 GB disk; no snapd, fwupd masked (2026-10-19) |
 | Toolchain | rustup, Rust 1.92 (`. ~/.cargo/env`), build-essential; no Docker |
-| Code | `/root/xemm/LIGHTER_ASTER_BOT` (git-tracked files only; no `*.env`, no credentials) |
-| Services | `xemm-dryrun`, `xemm-dryrun-hl`, `xemm-dryrun-lh` (systemd): `run --market HYPE` / `HYPE-HL` / `HYPE-LH` `--mode dry-run --ack-breaker` (Aster-Lighter, Aster-Hyperliquid, Lighter-Hyperliquid), 512 MB cap each, SIGINT stop; their simulated venues take free ports (`[dry_run]` ports 0) |
-| Output | `/root/xemm/LIGHTER_ASTER_BOT/runs/dry-run/`, copied daily to `LIGHTER_ASTER_BOT/runs/tokyo/dry-run/` (the reports' default) |
+| Code | `/root/xemm/LIGHTER_ASTER_BOT` (git-tracked files only), plus `lighter.env` and `hyperliquid.env` at mode 600 once `vps.py live creds` sent them |
+| Services | `xemm-dryrun`, `xemm-dryrun-hl`, `xemm-dryrun-lh`, `xemm-dryrun-cashcat-lh` (systemd): `run --market HYPE` / `HYPE-HL` / `HYPE-LH` / `CASHCAT-LH` `--mode dry-run --ack-breaker` (Aster-Lighter, Aster-Hyperliquid, Lighter-Hyperliquid twice), 512 MB cap each, SIGINT stop; their simulated venues take free ports (`[dry_run]` ports 0) |
+| Live | `xemm-live`: `run --market CASHCAT-LH --mode live`, REAL orders. Only `vps.py live start` starts it, never `sync` or a boot; a halt leaves it stopped. 512 MB cap, SIGINT stop (460 s), niced above the rest |
+| Output | `/root/xemm/LIGHTER_ASTER_BOT/runs/dry-run/` and the live bot's `runs/`, copied daily to `LIGHTER_ASTER_BOT/runs/tokyo/` (`dry-run/` there is the reports' default) |
 | Collectors | `xemm-recorder` (`record --market HYPE`, 256 MB cap) → `LIGHTER_ASTER_BOT/data/HYPE/`; `xemm-screener` (`screener collect`, 400 MB cap) → `SCREENER/data/`; both enabled at boot, niced below the dry run |
 
 Since 2026-10-10 the VPS collects and the Windows PC stores: this PC's route to Tokyo stalls for
@@ -34,8 +35,8 @@ pull happens:
     06-09 UTC stall window. Its output is appended to `LIGHTER_ASTER_BOT/data-tokyo/pull.log`.
   - **Retries:** a dropped connection (ssh gives up after ~1 min) restarts it, up to three times,
     5 min apart; every step is idempotent.
-- `pull` then copies the VPS's `runs/dry-run/` (and each `runs/archive/` batch not here yet) whole,
-  gzipped, into `LIGHTER_ASTER_BOT/runs/tokyo/` and writes the time to `pulled_at.txt` there, where
+- `pull` then copies the VPS's `runs/` (the live bot's files, `runs/dry-run/` and each
+  `runs/archive/` batch not here yet) whole, gzipped, into `LIGHTER_ASTER_BOT/runs/tokyo/` and writes the time to `pulled_at.txt` there, where
   the reports end their window.
 - The daily 03:30 UTC script stops both collectors below 4 GB free, so the dry run keeps its disk;
   the next `pull` starts them again once there is room.
@@ -59,7 +60,12 @@ python vps.py status    # services, memory, disk, runs/ and data sizes
 python vps.py pull      # bring the collectors' closed files home (also daily, scheduled)
 python vps.py logs 100  # journal tail
 python vps.py latency   # TCP and HTTPS round trips to Aster, Lighter, Hyperliquid
+python vps.py live creds|start|stop|status|logs   # the live bot (REAL orders)
 ```
+
+`sync` never restarts the live bot: `live stop`, then `live start`, puts it on the new build.
+`live creds` sends the Lighter and Hyperliquid env files; never let one Lighter API key trade from
+two hosts at once (its nonces are per process).
 
 The release build (thin LTO, one job) takes a while on one CPU and leans on swap; the running dry
 run keeps going until the restart, but its timing is noisier while cargo runs.
@@ -88,7 +94,7 @@ All three venues are a few ms away, consistent with the Tokyo scenario `[dry_run
 ## By hand on the VPS
 
 ```
-systemctl status xemm-dryrun      # -hl, -lh: the Hyperliquid routes
+systemctl status xemm-dryrun      # -hl, -lh, -cashcat-lh: the Hyperliquid routes; xemm-live
 journalctl -u xemm-dryrun -f
 systemctl stop xemm-dryrun        # SIGINT, graceful
 ```

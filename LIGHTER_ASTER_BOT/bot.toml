@@ -97,10 +97,6 @@ min_reconcile_interval_ms = 500
 market_id = "HYPE"
 aster_symbol = "HYPEUSDT"
 lighter_symbol = "HYPE"
-lighter_market_index = 24
-lighter_size_decimals = 2
-lighter_price_decimals = 4
-lighter_min_notional = "10"
 
 [[taker.markets]]
 market_id = "HYPE-HL"
@@ -114,11 +110,15 @@ hedge_venue = "hyperliquid"
 market_id = "HYPE-LH"
 first_venue = "lighter"
 lighter_symbol = "HYPE"
-lighter_market_index = 24
-lighter_size_decimals = 2
-lighter_price_decimals = 4
-lighter_min_notional = "10"
 hedge_venue = "hyperliquid"
+
+# The screener's best long-history route (2026-10-26). Orders at twice the venues' $10 minimum.
+[[taker.markets]]
+market_id = "CASHCAT-LH"
+first_venue = "lighter"
+lighter_symbol = "CASHCAT"
+hedge_venue = "hyperliquid"
+desired_notional = "20"
 
 [maker.edge]
 # The required quoted edge is 14 + 1.5 + 2 + 1 = 18.5 bps above configured

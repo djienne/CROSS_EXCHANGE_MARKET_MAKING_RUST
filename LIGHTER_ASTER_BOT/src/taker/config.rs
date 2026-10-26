@@ -39,6 +39,11 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Sizes the orders for `market`: its own `desired_notional`, else `[taker.arb]`'s.
+    pub fn size_for(&mut self, market: &MarketCfg) {
+        self.arb.desired_notional = market.desired_notional.unwrap_or(self.arb.desired_notional);
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.markets.is_empty() {
             bail!("config has no [[markets]]");
@@ -125,6 +130,9 @@ impl Config {
             let aster_first = m.first_venue == crate::config::FirstVenue::Aster;
             if aster_first == m.aster_symbol.is_empty() || !(aster_first || m.hedge_venue == crate::config::HedgeVenue::Hyperliquid) {
                 bail!("{}: an Aster first leg needs aster_symbol; a Lighter one has none and trades against hedge_venue = \"hyperliquid\"", m.id());
+            }
+            if m.desired_notional.is_some_and(|n| n <= Decimal::ZERO) {
+                bail!("{}: desired_notional must be positive", m.id());
             }
         }
         Ok(())
@@ -555,10 +563,8 @@ pub struct MarketCfg {
     #[serde(default)]
     pub hedge_venue: crate::config::HedgeVenue,
     pub market_id: Option<String>,
-    pub lighter_market_index: Option<u32>,
-    pub lighter_price_decimals: Option<u32>,
-    pub lighter_size_decimals: Option<u32>,
-    pub lighter_min_notional: Option<Decimal>,
+    /// This market's order size, in place of `[taker.arb] desired_notional`.
+    pub desired_notional: Option<Decimal>,
 }
 
 impl MarketCfg {
@@ -589,12 +595,21 @@ mod tests {
                 lighter_symbol: "HYPE".to_string(),
                 hedge_venue: Default::default(),
                 market_id: Some("HYPE".to_string()),
-                lighter_market_index: Some(24),
-                lighter_price_decimals: Some(4),
-                lighter_size_decimals: Some(2),
-                lighter_min_notional: Some(dec!(10)),
+                desired_notional: None,
             }],
         }
+    }
+
+    #[test]
+    fn a_market_can_size_its_own_orders() {
+        let mut cfg = valid_config();
+        cfg.size_for(&cfg.markets[0].clone());
+        assert_eq!(cfg.arb.desired_notional, dec!(13));
+        cfg.markets[0].desired_notional = Some(dec!(20));
+        cfg.size_for(&cfg.markets[0].clone());
+        assert_eq!(cfg.arb.desired_notional, dec!(20));
+        cfg.markets[0].desired_notional = Some(dec!(0));
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

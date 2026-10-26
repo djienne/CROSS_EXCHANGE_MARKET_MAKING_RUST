@@ -169,7 +169,9 @@ impl StatusPoller {
             lcreds,
             &specs,
         )?;
-        Ok(Self { cfg: cfg.clone(), spec, aster, lighter })
+        let mut cfg = cfg.clone();
+        cfg.size_for(&markets[0]);
+        Ok(Self { cfg, spec, aster, lighter })
     }
 
     pub async fn report(&self) -> Result<StatusReport> {

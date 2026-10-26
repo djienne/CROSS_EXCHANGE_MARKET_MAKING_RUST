@@ -460,7 +460,7 @@ async fn hedge_steps<W: std::future::Future<Output = ()> + Send + 'static>(cfg: 
     position: &impl AsyncFn() -> Result<Decimal>, mid: &impl AsyncFn() -> Result<Decimal>, open_orders: &impl AsyncFn() -> Result<usize>) -> Result<()> {
     let px = mid().await?;
     // Just over the venue minimum, rounded UP so the order builder's floor keeps it.
-    let qty = round_up_size(spec.hl_min_notional * dec!(1.02) / px, size_decimals);
+    let qty = round_up_size(spec.hl_min_notional * dec!(1.02) / px, size_decimals).max(spec.hl_min_qty);
     let open = qty + spec.hl_qty_step * dec!(2);
     if open * px > max_usd {
         bail!("the probe's {venue:?} order ~${:.2} exceeds --max-usd {max_usd}; raise the cap", open * px);
@@ -496,18 +496,19 @@ pub enum CloseVenue {
 }
 
 /// REAL orders, the operator's exit: flattens one coin at market, reduce-only, on Aster, Lighter
-/// and Hyperliquid at once (or the `venues` given): Aster's open orders cancelled, then XEMM's
-/// MARKET close; on the hedge venues, XEMM's hedge worker at the emergency slippage. Holds each
-/// venue's leg lock, so it refuses while a live writer trades there. Ponytail: each venue's spec
-/// read also needs Aster's and a hedge venue's metadata (`build_market_specs`), so one venue's
-/// outage blocks another's close; split the spec read if that ever bites.
+/// and Hyperliquid at once (or the `venues` given; a market with no Aster leg skips Aster): Aster's
+/// open orders cancelled, then XEMM's MARKET close; on the hedge venues, XEMM's hedge worker at the
+/// emergency slippage. Holds each venue's leg lock, so it refuses while a live writer trades there.
+/// Ponytail: each venue's spec read also needs Aster's metadata when the market has an Aster leg
+/// (`build_market_specs`), so an Aster outage blocks a hedge venue's close; split the spec read if
+/// that ever bites.
 pub async fn close(cfg: &Config, target: &str, venues: &[CloseVenue], i_understand_live: bool) -> Result<()> {
     if !i_understand_live {
         bail!("close sends REAL orders: re-run with --i-understand-live");
     }
     let market = cfg.markets.iter().find(|m| m.id().0.eq_ignore_ascii_case(target) || m.hl_coin.eq_ignore_ascii_case(target))
         .with_context(|| format!("no market or coin '{target}' in config [[markets]]"))?;
-    let on = |venue| venues.is_empty() || venues.contains(&venue);
+    let on = |venue| (venues.is_empty() || venues.contains(&venue)) && !(venue == CloseVenue::Aster && market.aster_symbol.is_empty());
     let _locks = [(CloseVenue::Aster, &market.aster_symbol), (CloseVenue::Lighter, &market.hl_coin), (CloseVenue::Hyperliquid, &market.hl_coin)]
         .into_iter().filter(|&(venue, _)| on(venue))
         .map(|(venue, symbol)| crate::controller::lock_leg(venue, symbol))
@@ -568,6 +569,33 @@ pub async fn close(cfg: &Config, target: &str, venues: &[CloseVenue], i_understa
         }
     }
     anyhow::ensure!(failed.is_empty(), "{failed:?} not closed: check by hand");
+    Ok(())
+}
+
+/// `run`'s leverage gate for a route with no Aster leg, which XEMM's own gate (`run.rs`) never
+/// sees: `coin` must be 1x on Lighter (cross) and on Hyperliquid, so a venue refuses an order
+/// beyond the account's equity.
+pub async fn hedge_leverage_gate(cfg: &Config, coin: &str) -> Result<()> {
+    let dry = cfg.live.dry_run;
+    for hedge_venue in [HedgeVenue::Lighter, HedgeVenue::Hyperliquid] {
+        let market = MarketCfg { aster_symbol: String::new(), hl_coin: coin.to_string(), hedge_venue, market_id: None };
+        let specs = rest_specs::build_market_specs(std::slice::from_ref(&market), &cfg.live).await?;
+        let id = &specs[0].market_id;
+        let leverage = match hedge_venue {
+            HedgeVenue::Lighter => {
+                let creds = if dry { LighterCreds::dry_run() } else { LighterCreds::from_env()? };
+                let live = &cfg.live.lighter;
+                LighterExchange::new_lighter(live.base_url.clone(), Path::new(&live.signers_dir), creds, &specs, live.fill_timeout_ms, live.ws_account_max_age_ms)
+                    .await?.get_leverage(id).await?
+            }
+            HedgeVenue::Hyperliquid => {
+                let creds = if dry { HyperliquidCreds::dry_run() } else { HyperliquidCreds::from_env()? };
+                HyperliquidHedge::new(&cfg.live.hyperliquid.base_url, creds, &specs).await?.leverage(id).await?
+            }
+        };
+        anyhow::ensure!(leverage == Decimal::ONE, "{hedge_venue:?} leverage for {coin} is {leverage}x (expected 1x): set it to 1x cross and restart");
+        tracing::info!("leverage gate: {coin} = 1x on {hedge_venue:?}");
+    }
     Ok(())
 }
 

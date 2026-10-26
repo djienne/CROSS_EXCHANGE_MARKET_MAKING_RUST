@@ -67,7 +67,14 @@ cargo build --release --locked        # Rust 1.92; the Lighter signers exist for
 - A `[[taker.markets]]` entry with `first_venue = "lighter"` has no `aster_symbol` and no
   `[[maker.markets]]` entry, and must hedge on Hyperliquid: `HYPE-LH` takes both sides on Lighter
   HYPE and Hyperliquid HYPE. `run` starts the taker alone, with the taker's own account snapshot
-  as the controller's status. Each leg pays its own venue's taker fee.
+  as the controller's status, once both legs read 1x. Each leg pays its own venue's taker fee.
+- A `[[taker.markets]]` entry names its coin only: Lighter's listing gives the market index,
+  decimals and minimums, so an order is at least Lighter's minimum base amount and $10.50 on
+  either venue. `desired_notional` there sizes that market's orders in place of `[taker.arb]`'s.
+  The taker refuses to start on a coin whose legs' mids are over 5% apart (two tokens under one
+  name; a delisted Hyperliquid coin is refused too), or whose common size step is worth more
+  than `max_position_mismatch_usd`, since a partial fill could leave a residual recovery cannot
+  close (ZEC-LH: $12).
 
 ## Run and stop
 
@@ -124,7 +131,8 @@ docker compose --profile live run --rm -T bot close --market HYPE --i-understand
 `close` sends REAL reduce-only orders:
 
 - **Scope.** `--market` takes a market id or its coin: `HYPE` and `HYPE-HL` both close HYPE, on
-  Aster, Lighter and Hyperliquid at once (`--venue aster,lighter` for some). It takes each
+  Aster, Lighter and Hyperliquid at once (`--venue aster,lighter` for some); a taker-only market
+  (`CASHCAT-LH`) closes on Lighter and Hyperliquid. It takes each
   venue's leg lock, so it refuses while a live `run` or `taker run` trades there.
 - **Orders.** It initializes every selected client before sending anything, so a setup failure
   sends nothing. It then cancels the Aster symbol's open orders and closes at market: an Aster
@@ -269,7 +277,8 @@ Before the first start:
    its reports agree with the simulated equity net of funding and open-position marks.
 2. The fee keys in `bot.toml` match both accounts' actual tiers.
 3. On a VPS, ship the sources, the secrets and the live image with `scripts/deploy_vps.sh`
-   ([Deploy](#deploy)); here, `docker compose --profile live build bot`.
+   ([Deploy](#deploy)); on the Tokyo VPS, `python vps.py live creds` then `live start`
+   ([VPS.md](../VPS.md)); here, `docker compose --profile live build bot`.
 4. On the host, the route's read-only probes pass ([Probes](#probes)); both legs are at 1x
    cross, and Aster routes use one-way position mode.
 5. Neither venue has open orders, and positions are flat or paired.

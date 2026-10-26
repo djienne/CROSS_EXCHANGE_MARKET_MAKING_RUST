@@ -20,6 +20,9 @@ pub struct MarketSpec {
     pub aster_min_notional: Decimal,
     pub lighter_qty_step: Decimal,
     pub lighter_min_notional: Decimal,
+    /// The second leg's smallest order: one step, or Lighter's minimum base amount if larger.
+    #[serde(default)]
+    pub lighter_min_qty: Decimal,
     /// The second leg's venue; the `lighter_*` fields describe its market there.
     #[serde(default)]
     pub hedge: crate::config::HedgeVenue,
@@ -41,6 +44,7 @@ impl MarketSpec {
             lighter_price_tick: self.tick,
             lighter_qty_step: self.step,
             lighter_min_notional: self.aster_min_notional,
+            lighter_min_qty: self.aster_min_qty,
             hedge: crate::config::HedgeVenue::Lighter,
             ..self.clone()
         }

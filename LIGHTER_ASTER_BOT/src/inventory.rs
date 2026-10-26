@@ -16,6 +16,8 @@ use crate::types::Side;
 pub struct HedgeabilityRules {
     pub hedge_min_notional: Decimal,
     pub hedge_qty_step: Decimal,
+    /// The smallest order, at least one step.
+    pub hedge_min_qty: Decimal,
 }
 
 #[derive(Debug, Clone)]
@@ -54,14 +56,14 @@ pub struct FillOutcome {
     pub hedge: Option<HedgeOrder>,
 }
 
-/// Minimum opening hedge quantity for a reference price (the configured min
-/// notional, `lighter_min_notional`, rounded up to the size step, but at least one step).
+/// Minimum opening hedge quantity for a reference price (the venue's min notional rounded up
+/// to the size step, but at least the minimum size).
 pub fn hl_min_hedge_qty(rules: &HedgeabilityRules, ref_px: Decimal) -> Decimal {
+    let min_qty = rules.hedge_min_qty.max(rules.hedge_qty_step);
     if ref_px <= Decimal::ZERO {
-        return rules.hedge_qty_step;
+        return min_qty;
     }
-    let by_notional = ceil_to_step(rules.hedge_min_notional / ref_px, rules.hedge_qty_step);
-    by_notional.max(rules.hedge_qty_step)
+    ceil_to_step(rules.hedge_min_notional / ref_px, rules.hedge_qty_step).max(min_qty)
 }
 
 /// Hyperliquid accepts a sub-minimum reduce-only order only for a full close (live 2026-09-28).
@@ -223,6 +225,7 @@ mod tests {
         HedgeabilityRules {
             hedge_min_notional: dec!(10),
             hedge_qty_step: dec!(0.001),
+            hedge_min_qty: dec!(0.001),
         }
     }
 
@@ -230,6 +233,8 @@ mod tests {
     fn min_hedge_qty_from_notional() {
         // ref 100, min $10 => 0.1 base, step 0.001.
         assert_eq!(hl_min_hedge_qty(&rules(), dec!(100)), dec!(0.1));
+        // Lighter's minimum base binds when worth more (QNT: 0.1 coins at ~$203).
+        assert_eq!(hl_min_hedge_qty(&HedgeabilityRules { hedge_min_qty: dec!(0.1), ..rules() }, dec!(202.78)), dec!(0.1));
     }
 
     #[test]
