@@ -1,4 +1,4 @@
-"""Run the HYPE dry runs and the market-data collectors on the Tokyo VPS; bring their data home.
+"""Run the dry runs, the market-data collectors and the live bot on the Tokyo VPS; bring their data home.
 
   python vps.py sync      # upload tracked files (working tree), build, (re)start dry runs + recorder
   python vps.py latency   # TCP-connect and HTTPS round trips to the venues, from the VPS
@@ -10,14 +10,14 @@
   python vps.py live creds|start|stop|logs|status  # the live bot, its own unit apart from the dry runs
 
 Only git-tracked files go up (uncommitted edits included, untracked files and *.env never); the
-live bot's Lighter and Hyperliquid env files go up only by `live creds`, at mode 600. Ponytail: files deleted locally stay on the VPS; if that
-ever matters, wipe ~/xemm/LIGHTER_ASTER_BOT/src before extracting.
+live bot's Lighter and Hyperliquid env files go up only by `live creds`, at mode 600. Ponytail:
+files deleted locally stay on the VPS; if that ever matters, wipe ~/xemm/LIGHTER_ASTER_BOT/src
+before extracting.
 
 Since 2026-10-10 the VPS collects and this PC stores (this PC's route to Tokyo stalls for tens of
-seconds): the three dry runs, the tape recorder (`record --market HYPE`: Aster, Lighter and
+seconds): the dry runs, the tape recorder (`record --market HYPE`: Aster, Lighter and
 Hyperliquid, ~0.19 GB/day) and the screener's collector (full pair list, ~0.24 GB/day) run
-permanently there and nowhere else, and a Windows
-scheduled task runs `pull` daily (VPS.md). Disk stays bounded: journald 200 MB, the build dir
+permanently there and nowhere else, and a Windows scheduled task runs `pull` daily (VPS.md). Disk stays bounded: journald 200 MB, the build dir
 <= 3 GB, a daily timer gzips the dry run's logs past 1 GB and stops the collectors below 4 GB
 free, and `pull` deletes a VPS file only once copied, verified and KEEP_DAYS old.
 """
@@ -132,7 +132,7 @@ CPUWeight=50
 WantedBy=multi-user.target
 """
 
-# The dry runs' append-only logs (~75 MB/day for the three, mostly HYPE's journal). The bot appends to them
+# The dry runs' append-only logs (~75 MB/day for the three HYPE ones, mostly HYPE's journal). The bot appends to them
 # without reopening and reads none back at startup (the risk monitor starts at the session start),
 # so they move only while it is stopped: copy-and-truncate could drop a line written in between,
 # such as a fill. Runs daily; acts only past 1 GB of logs (or the MB given as its argument), about
@@ -366,7 +366,7 @@ def pull_runs(dry_run):
     """Copies the VPS's runs/ (the live bot's files at its top, runs/dry-run/, and each runs/archive/
     batch not here yet) over RUNS_COPY, then writes the copy's time to pulled_at.txt: the reports
     end their window there. Ponytail: the logs come whole each day, gzipped (13x); they reach ~1 GB before
-    the archive moves them (~2 weeks for three markets), so up to ~80 MB, ~1 min at 2 MB/s.
+    the archive moves them (~2 weeks), so up to ~80 MB, ~1 min at 2 MB/s.
     Past that, rsync --append would send only the new bytes."""
     have = [p.name for p in (RUNS_COPY / "archive").glob("*")]
     if dry_run:

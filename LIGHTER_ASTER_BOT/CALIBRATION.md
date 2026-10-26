@@ -118,3 +118,12 @@ flat with no open orders. Net execution cash change was -$0.032819 at stablecoin
 The shared `close` command was also checked from flat; no simultaneous three-venue close
 of open positions or live taker handover was exercised. Detailed logs are local in
 `runs/live-order-check-20260930155334Z/`; the screener and dry runs kept collecting.
+
+## CASHCAT-LH first live trade, 2026-10-26 19:33 UTC
+
+At `5343506`, from Windows, after CASHCAT was set to 1x cross on both venues (Hyperliquid had been
+isolated 2x), `taker run --max-trades 1` with the entry gate off opened one $20 clip: sold 217 on
+Lighter at 0.09206, bought 217 on Hyperliquid at 0.091894. Expected/realized gross 17.42/18.03
+bps, edge kept 1.035, fees 4.49 bps (Lighter 0), net +$0.027; the Hyperliquid leg filled in 572
+ms. `close` then flattened both legs through its taker-only path (Hyperliquid 1.1 s, Lighter
+0.56 s); the whole cycle cost $0.020. One trade checks the mechanics, not profitability.

@@ -21,7 +21,7 @@ pull happens:
 - the tape 0.15-0.23 GB/day;
 - the screener 0.09-0.37 GB/day (median 0.24);
 - the dry runs' four logs in `runs/dry-run` (journals, book sanity, diagnostics, equity) ~75 MB/day
-  for the three markets together (1 GB in 13.7 days to 2026-10-24, mostly HYPE's journal).
+  for the three HYPE markets together (1 GB in 13.7 days to 2026-10-24, mostly HYPE's journal).
 
 `sync` and `pull` set up everything that keeps it bounded:
 
@@ -36,8 +36,8 @@ pull happens:
   - **Retries:** a dropped connection (ssh gives up after ~1 min) restarts it, up to three times,
     5 min apart; every step is idempotent.
 - `pull` then copies the VPS's `runs/` (the live bot's files, `runs/dry-run/` and each
-  `runs/archive/` batch not here yet) whole, gzipped, into `LIGHTER_ASTER_BOT/runs/tokyo/` and writes the time to `pulled_at.txt` there, where
-  the reports end their window.
+  `runs/archive/` batch not here yet) whole, gzipped, into `LIGHTER_ASTER_BOT/runs/tokyo/` and
+  writes the time to `pulled_at.txt` there, where the reports end their window.
 - The daily 03:30 UTC script stops both collectors below 4 GB free, so the dry run keeps its disk;
   the next `pull` starts them again once there is room.
 - The daily timer `xemm-dryrun-archive` (03:30 UTC) acts once those four logs pass 1 GB (about

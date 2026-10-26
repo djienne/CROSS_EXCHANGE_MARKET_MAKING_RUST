@@ -147,7 +147,8 @@ docker compose --profile live run --rm -T bot close --market HYPE --i-understand
 
 `run --mode dry-run` is the whole bot, its engines, the controller and every client and
 signer unchanged, against the market's two venues simulated in process on loopback: Aster and
-Lighter, Aster and Hyperliquid for `HYPE-HL`, Lighter and Hyperliquid for `HYPE-LH`. The
+Lighter, Aster and Hyperliquid for `HYPE-HL`, Lighter and Hyperliquid for `HYPE-LH` and
+`CASHCAT-LH`. The
 simulator follows the live public market data and answers in each venue's own protocol. It
 needs no credentials: the bot signs with a fixed dry-run identity whose keys exist on no
 venue, so a request that escaped to mainnet could not trade. Its files live in
@@ -180,7 +181,7 @@ The venue model targets AWS Tokyo timings, with estimates where measurements are
   rates at Aster and Lighter settlement times; Hyperliquid funding is not simulated.
   A maintenance-margin breach is reported, not liquidated.
 
-The three dry runs run only on the Tokyo VPS (`../VPS.md`); `python vps.py pull` copies their
+The four dry runs run only on the Tokyo VPS (`../VPS.md`); `python vps.py pull` copies their
 files to `runs/tokyo/dry-run/` daily, and the reports read that copy. To run one here by name (the
 services sit behind the `dryrun` profile, so `start_all.bat` starts none), from this directory:
 

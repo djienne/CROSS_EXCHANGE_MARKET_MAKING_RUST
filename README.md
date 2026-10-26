@@ -9,14 +9,15 @@ venues with two engines:
 Its `run` command holds both in one process under one cross-engine loss stop. XEMM quotes; when
 an arbitrage passes the taker's entry gate, XEMM pulls its quotes and hands the execution rights
 to the taker until the trade is done. The markets are `HYPE` (Aster–Lighter), `HYPE-HL`
-(Aster–Hyperliquid) and `HYPE-LH` (Lighter–Hyperliquid: no Aster leg, so the taker runs alone).
+(Aster–Hyperliquid), `HYPE-LH` and `CASHCAT-LH` (Lighter–Hyperliquid: no Aster leg, so the taker
+runs alone).
 `run --mode dry-run` runs the same bot against simulated venues fed by live market data, with no
 credentials and no real orders.
 
 **This is a live trading codebase.** These commands place real orders and can lose money through
 spread, fees, slippage and execution failures:
 
-- `run --mode live`;
+- `run --mode live` (on the Tokyo VPS, `python vps.py live start`);
 - `taker run` without `--observe-only`;
 - `close`;
 - `probe aster-place-cancel`, `probe hl-hedge`, `probe hl-place-cancel`, and the
@@ -64,8 +65,9 @@ The reports need Python 3.
 
 ## Dry run and the Tokyo VPS
 
-The three dry runs (`HYPE`, `HYPE-HL`, `HYPE-LH`), the recorder of HYPE's public feeds for
-backtests and the pair screener's collector run only on the Tokyo VPS ([VPS.md](VPS.md)).
+The four dry runs (`HYPE`, `HYPE-HL`, `HYPE-LH`, `CASHCAT-LH`), the recorder of HYPE's public
+feeds for backtests and the pair screener's collector run only on the Tokyo VPS ([VPS.md](VPS.md)),
+and a live bot can run there in its own unit (`python vps.py live`).
 `python vps.py pull` copies their files home daily, to `LIGHTER_ASTER_BOT/runs/tokyo/dry-run/`,
 `LIGHTER_ASTER_BOT/data-tokyo/HYPE/` and `SCREENER/data-tokyo/`.
 
