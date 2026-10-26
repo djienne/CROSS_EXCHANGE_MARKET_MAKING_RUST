@@ -41,10 +41,10 @@ pull happens:
 - The daily 03:30 UTC script stops both collectors below 4 GB free, so the dry run keeps its disk;
   the next `pull` starts them again once there is room.
 - The daily timer `xemm-dryrun-archive` (03:30 UTC) acts once those four logs pass 1 GB (about
-  every two weeks, e.g. 2026-10-24). It stops the dry runs, moves them to
-  `runs/archive/<UTC time>/`, restarts the dry runs and gzips them (13x smaller, ~6 MB/day: years
-  of the 25 GB disk). Nothing is deleted. The bot
-  appends to these logs and never reads them back, so they move only while it is stopped.
+  every two weeks, e.g. 2026-10-24). It stops the dry runs, moves the logs to
+  `runs/archive/<UTC time>/`, restarts the dry runs and gzips the logs (13x smaller, ~6 MB/day:
+  years of the 25 GB disk). Nothing is deleted. The bot appends to these logs and never reads them
+  back, so they move only while it is stopped.
 - journald is capped at 200 MB, and the cargo build dir at 3 GB (a clean rebuild past that).
 - The apt cache is cleared.
 
@@ -64,8 +64,8 @@ python vps.py live creds|start|stop|status|logs   # the live bot (REAL orders)
 ```
 
 `sync` never restarts the live bot: `live stop`, then `live start`, puts it on the new build.
-`live creds` sends the Lighter and Hyperliquid env files; never let one Lighter API key trade from
-two hosts at once (its nonces are per process).
+`live creds` sends the Lighter and Hyperliquid env files (the live route has no Aster leg); never
+let one Lighter API key trade from two hosts at once (its nonces are per process).
 
 The release build (thin LTO, one job) takes a while on one CPU and leans on swap; the running dry
 run keeps going until the restart, but its timing is noisier while cargo runs.

@@ -18,12 +18,12 @@ One regime at a time, like Hummingbot's XEMM with the taker's arbitrage in betwe
 - **An arbitrage** that passes the taker's entry gate asks XEMM for the rights. XEMM cancels
   both quotes and grants a 3 s lease once nothing rests or is in flight: no live or uncertain
   quote, and every fill (one caught by the cancel included) hedged.
-- **The taker** re-reads its Lighter nonce and an account snapshot that shows no open order on
-  either venue, re-checks the opportunity on current books, trades or skips, and hands the
-  rights back. A request not granted within 5 s is withdrawn; a skip or a withdrawal is followed
-  by `[taker.arb] cooldown_ms`.
-- **XEMM resumes** after re-reading the Lighter nonce and adopting the positions the taker left:
-  only account reads started after the hand-back count, and two in a row must agree.
+- **The taker** re-reads its Lighter nonce and an account snapshot with no open order on either
+  venue, re-checks the opportunity on current books, trades or skips, and hands the rights back.
+  A request not granted within 5 s is withdrawn; a skip or a withdrawal is followed by
+  `[taker.arb] cooldown_ms`.
+- **XEMM resumes** after re-reading the Lighter nonce and adopting the positions the taker left,
+  once two account reads in a row, both started after the hand-back, agree.
 
 On Aster routes, both engines run for the whole session; one that exits halts the bot. XEMM's
 journal records each hand-over (`yield`, `yield_withdrawn`, `rights_returned`, `resumed`), and
@@ -31,8 +31,9 @@ journal records each hand-over (`yield`, `yield_withdrawn`, `rights_returned`, `
 
 The `[controller]` table of `bot.toml` holds the status poll and the cross-engine loss stop. The
 controller reads the venues only at start-up; after that it reads the accounts from XEMM's own
-snapshot, which XEMM refreshes every 6 s with the shipped settings, and every 2 s while a fill,
-hedge, sweep or hand-over settles.
+snapshot, which XEMM refreshes every 6 s with the shipped settings and every 2 s while a fill,
+hedge, sweep or hand-over settles. A taker-only route has no XEMM: the controller reads the
+taker's snapshot, refreshed every 15 s (half `[taker.live] max_account_snapshot_age_ms`).
 
 Lighter's Standard account shares one 60/min cap between REST reads and transactions
 ([rate limits](https://apidocs.lighter.xyz/docs/rate-limits)). The HYPE route's idle reads take
@@ -70,11 +71,11 @@ cargo build --release --locked        # Rust 1.92; the Lighter signers exist for
   as the controller's status, once both legs read 1x. Each leg pays its own venue's taker fee.
 - A `[[taker.markets]]` entry names its coin only: Lighter's listing gives the market index,
   decimals and minimums, so an order is at least Lighter's minimum base amount and $10.50 on
-  either venue. `desired_notional` there sizes that market's orders in place of `[taker.arb]`'s.
-  The taker refuses to start on a coin whose legs' mids are over 5% apart (two tokens under one
-  name; a delisted Hyperliquid coin is refused too), or whose common size step is worth more
-  than `max_position_mismatch_usd`, since a partial fill could leave a residual recovery cannot
-  close (ZEC-LH: $12).
+  either venue. Its `desired_notional` sizes that market's orders in place of `[taker.arb]`'s.
+- The taker refuses to start on a delisted Hyperliquid coin, on a coin whose legs' mids are over
+  5% apart (two tokens under one name), and on one whose common size step is worth more than
+  `max_position_mismatch_usd`: a partial fill could leave a residual that recovery cannot close
+  (ZEC-LH: $12).
 
 ## Run and stop
 
@@ -138,10 +139,10 @@ docker compose --profile live run --rm -T bot close --market HYPE --i-understand
   sends nothing. It then cancels the Aster symbol's open orders and closes at market: an Aster
   MARKET order, and IOCs through XEMM's hedge worker at `emergency_slippage_bps` on Lighter and
   Hyperliquid.
-- **Check.** Each venue gets up to three orders, sized from the fills (from a fresh read after
-  one that filled nothing), and must then read flat, or the command names it and exits nonzero.
-  Later read or order failures can still leave a leg open: check the reported results and
-  positions.
+- **Check.** Each venue gets up to three orders, sized from the fills (or from a fresh read after
+  an order that filled nothing), and must then read flat, or the command names it and exits
+  nonzero. Later read or order failures can still leave a leg open: check the reported results
+  and positions.
 
 ## Dry run
 
@@ -194,14 +195,13 @@ Natively (Linux or macOS): `./target/release/lighter_aster_bot run --market HYPE
 
 **Restarts.** It stops like live (SIGINT, a drain, positions stay open). The simulator saves
 the venues every second and on a clean stop; an unclean stop loses the changes since the last
-save. The next start takes up their accounts, positions and resting orders. The market moved
-meanwhile, so the first book fills any resting order it crosses, an expired Aster deadman
-cancels, and funding that fell due is charged. The start also archives the engines'
-unclean-session markers, whether a kill or an unresolved engine stop left them, as
-`<name>.unclean.<stamp>`: live keeps them until an operator has resolved the session against
-the venues' records, but here the simulated venues' own state is the only record, and the
-engines reconcile to it at start. Docker treats `docker kill` as a deliberate stop and does not
-restart the container; `docker compose up -d dryrun` does.
+save. The next start takes up their accounts, positions and resting orders in a market that has
+moved: the first book fills any resting order it crosses, an expired Aster deadman cancels, and
+funding that fell due is charged. The start also archives the engines' unclean-session markers
+(left by a kill or an unresolved engine stop) as `<name>.unclean.<stamp>`, and the engines
+reconcile to the simulated venues' state, the only record here; live keeps those markers until
+an operator has resolved the session against the venues' records. Docker treats `docker kill` as
+a deliberate stop and does not restart the container; `docker compose up -d dryrun` does.
 
 **Starting afresh.** Stop it and move `runs/dry-run/` away. Moving only `sim-<M>.state.json`
 would leave the drawdown baseline measuring the reset accounts. A fresh directory also restarts
@@ -368,12 +368,12 @@ the foreground).
   - The bot's files are in its `dry-run/`. `bot_stats.py`/`combined_pnl.py --runs <run>/dry-run`
     default to its window, and `combined_pnl`'s `by_day` gives net per UTC day of the market (its
     times less the run's `shift_ms`).
-- **Gate.** The entry gate starts from the samples of the 72 h before `--from` at or above the
-  run's required edge, as its bot would have logged them (Premium's are fewer); below 50 the taker
-  stays in warm-up. They come, read-only, from the dry run that ran beside the tape's recorder:
-  `runs/tokyo/dry-run/opportunities_<M>.jsonl` (the VPS's) for a `data-tokyo` tape, else this PC's
-  `runs/dry-run/`; `--gate <file>` overrides. The live sampler was frozen 2026-10-02 to 10-09, so
-  replay that week as one window, not per day.
+- **Gate.** The entry gate starts from the samples, at or above the run's required edge, that its
+  bot would have logged in the 72 h before `--from` (Premium's are fewer); below 50 the taker
+  stays in warm-up. It reads them, read-only, from the dry run that ran beside the tape's
+  recorder: `runs/tokyo/dry-run/opportunities_<M>.jsonl` (the VPS's) for a `data-tokyo` tape,
+  else this PC's `runs/dry-run/`; `--gate <file>` overrides. The live sampler was frozen
+  2026-10-02 to 10-09, so replay that week as one window, not per day.
 - **Limits.**
   - HYPE Aster-Lighter only: the tape's Hyperliquid lines (2026-10-10 on) are not replayed yet.
   - A recorder restart without `A-`/`L-` lines freezes the feeds (the replay warns about silences
@@ -424,15 +424,15 @@ the simulated venues' `sim-<M>.state.json` and `sim-<M>.diag.jsonl`.
 An engine that fails its drain or does not stop within 200 s makes the exit nonzero
 (`bot_stopped` carries the error).
 
-**Network outage.** Three unreadable statuses in a row (45 s) are treated as a lost network
-(a status is unreadable while XEMM's account snapshot is older than `poll_sec`), not a halt:
-the bot emits `network_pause`, and no engine opens new exposure (no
-taker entry, XEMM quotes pulled). In-flight executions, hedges, corrections and the Aster
-deadman carry on, and the taker asks for no rights. The loss
-stops still run on every readable status. After 4 readable statuses in a row (about 60 s,
-restarting at any failure) it emits `network_resume` and trades on; no restart is needed. An
-order in flight when the network drops can still end the engine with an unresolved
-execution, which halts as `engine_exited`.
+**Network outage.** Three unreadable statuses in a row (45 s) are treated as a lost network, not
+a halt. A status is unreadable while the account snapshot it reads is too old: XEMM's older than
+`poll_sec`, or on a taker-only route the taker's older than `max_account_snapshot_age_ms` plus
+`poll_sec`. The bot then emits `network_pause`, and no engine opens new exposure (no taker entry,
+XEMM quotes pulled). In-flight executions, hedges, corrections and the Aster deadman carry on,
+and the taker asks for no rights. The loss stops still run on every readable status. After 4
+readable statuses in a row (about 60 s, restarting at any failure) it emits `network_resume` and
+trades on; no restart is needed. An order in flight when the network drops can still end the
+engine with an unresolved execution, which halts as `engine_exited`.
 
 Review `bot-<M>.events.jsonl` and the breaker, then restart with `--ack-breaker`, which
 archives it as `.acked.<stamp>`. An equity-drawdown breaker also needs
@@ -492,8 +492,9 @@ reserved, and after 60 s new exposure freezes while late evidence is still accep
 residual is corrected reduce-only, at most twice per incident. Hyperliquid partial closes
 must meet its minimum, so sizing rounds up to the buffered minimum or the whole held position;
 any excess is corrected on the other leg after a fresh position confirmation. Aster and Lighter
-accept sub-minimum reduce-only closes in the measured cases. The margin guard reserves margin for resting makers and hedge obligations above
-the per-venue buffers ($26 shipped); reductions stay possible.
+accept sub-minimum reduce-only closes in the measured cases. The margin guard reserves margin
+for resting makers and hedge obligations above the per-venue buffers ($26 shipped); reductions
+stay possible.
 
 ## Deploy
 

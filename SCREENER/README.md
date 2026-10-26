@@ -27,9 +27,9 @@ runs apart from the bot, with its own crate, image, container and data.
   - Both close their leftover inventory at the last window's mean basis, without fees or spread: a
     standing basis is paid back, not earned.
 
-  Fees, latencies and thresholds apply at report time (`screener.toml` `[report]`). What is recorded
-  follows from `[report]` at its loosest, so the same data answers Standard vs Premium, latency
-  within its recorded pre-roll/tail, or a higher margin, gate percentile or XEMM edge. It refuses
+  Fees, latencies and thresholds apply at report time (`screener.toml` `[report]`). Collection
+  follows `[report]` at its loosest, so one recording answers Standard vs Premium, latency within
+  its recorded pre-roll/tail, or a higher margin, gate percentile or XEMM edge. The report refuses
   settings that would trade on moments the data did not record (a lower percentile, another depth
   or gate window). A test checks that the recording keeps every trade the report would make on the
   full stream.
@@ -57,7 +57,7 @@ stale Hyperliquid book invalidates only its own pairs. No credentials or order c
 ## Run
 
 ```bash
-docker compose up -d --build screener               # collect on this PC (the Tokyo VPS already does)
+docker compose up -d --build screener               # collect on this PC: never while the Tokyo VPS does
 docker compose logs -f                              # traffic and memory every 5 min
 docker compose run --rm screener universe           # today's pairs, with their Aster taker fee
 docker compose run --rm report                      # the ranking, from all the data
@@ -111,11 +111,11 @@ or trading connector is imported.
   less than that at the top are skipped. The bot's `record` command collects full depth (Aster,
   Lighter and Hyperliquid) for a market a bot trades; it runs on the Tokyo VPS for HYPE only.
 - **The gate.** On busy pairs the report trades less often than the bot would: the bot samples
-  only outside its cooldown and when it could size a trade, so it misses the peaks it trades on,
-  and its gate sits lower (2026-09-26: TAO 7.25 vs 9.05 bps, WLD 11.4 vs 14.7). The report's
-  samples are counted in 0.25 bps bins, from the pair's required edge at the cheaper Lighter
-  tier, and it reads whole 5-minute windows: it opens within a bin of the bot's, a window later.
-  At the Premium tier its samples are the Standard ones above Premium's edge.
+  only outside its cooldown and when it could size a trade, so it misses the peaks it trades on
+  and its gate sits lower (2026-09-26: TAO 7.25 vs 9.05 bps, WLD 11.4 vs 14.7). The report counts
+  its samples in 0.25 bps bins from the pair's required edge at the cheaper Lighter tier and reads
+  whole 5-minute windows, so its gate opens within a bin of the bot's, a window later. At the
+  Premium tier its samples are the Standard ones above Premium's edge.
 - **Arrival times.** By default the replay uses arrival times on the recording host (the Tokyo
   VPS for `data-tokyo/`, this PC in Europe for `data/`), not the venues' clocks.
   - Aster sends each trade ~150 ms after the book change it made (Lighter and Hyperliquid send
@@ -135,9 +135,9 @@ or trading connector is imported.
     the stamps: the arrival result, a check. Every report prints this host's feed delays per venue
     (books, prints). Delays are constants: jitter is second order. Exchange clocks may differ by a
     few ms.
-  - A scenario leaves out, and counts, the time around a stall here (a book change over 0.7 s
-    late, plus the 1 s pre-roll either side: 2026-10-10 a single one somewhere in two thirds of
-    the 5-minute pair windows); `days` and the $/day rates leave it out too. It refuses delays
+  - A scenario leaves out, and counts, the time around a stall here: a book change over 0.7 s
+    late, plus the 1 s pre-roll either side (on 2026-10-10, at least one in two thirds of the
+    5-minute pair windows). `days` and the $/day rates leave that time out too. It refuses delays
     more than 0.3 s apart; a quote older than the pre-roll before its print arrived meets an
     unrecorded book, an `unres` fill (the Hyperliquid quote age at `--latency 2`). The gate's
     samples stay those counted at arrival here.
@@ -168,8 +168,8 @@ versions stay readable without migration:
 - **v4** (2026-10-10, current) adds each summary's stall spans; scenarios need it.
 - **v3** (2026-10-10 11:41Z) adds each leg's age against the venue's engine stamp to `B` and `T`
   lines, and `R` marks where an unrecorded change makes a leg unknown, for replay on venue time.
-  It also selects the moments any mix of the two legs' states within the pre-roll could trade,
-  which other feed delays than this host's could produce.
+  It also selects the moments that any mix of the two legs' states within the pre-roll could
+  trade, as feed delays other than this host's could produce.
 - **v2** uses venue-qualified keys and two-second tails. Earlier Aster-Lighter files' one-second
   tails still limit their own replay settings.
 
