@@ -127,3 +127,24 @@ Lighter at 0.09206, bought 217 on Hyperliquid at 0.091894. Expected/realized gro
 bps, edge kept 1.035, fees 4.49 bps (Lighter 0), net +$0.027; the Hyperliquid leg filled in 572
 ms. `close` then flattened both legs through its taker-only path (Hyperliquid 1.1 s, Lighter
 0.56 s); the whole cycle cost $0.020. One trade checks the mechanics, not profitability.
+
+## CASHCAT-LH production path, 2026-10-26 20:45–22:45 UTC
+
+`run --market CASHCAT-LH --mode live` from Windows, gate seeded with the VPS twin's 192 samples
+(threshold 11.5-11.8 bps), $20 clips. The leverage gate passed on the real accounts. All four
+trades sold Lighter's premium (none reversed in 2 h) until the margin buffer stopped the fifth: 888
+a side. Expected/realized gross 13.9/8.0 bps (edge kept 0.58), mostly lost on the Hyperliquid leg
+(4-8 bps slippage on a ~300 ms old book, fills ~590 ms); execution net +$0.028. SIGINT stopped it
+in 1 s. The plan's closing `close` bought Lighter back at a wider premium: the whole cycle, by
+account value, cost $0.165 (fees $0.072, funding ~0).
+
+- **Lighter marks below its book:** at the close the CASHCAT mark was 0.09085, the book mid
+  0.09109 (+26 bps) and Hyperliquid's mid 14.6 bps lower. Venue equity values the short leg at
+  the mark, so it read +$0.145 just before a close that realized -$0.165. On this route, equity
+  is not liquidation value: judge it by closing prices.
+- **Funding:** Lighter's `fundings` `direction` names the side that receives (the 21:00 row
+  matched the $0.012 our short received). Over 7 days the short-Lighter, long-Hyperliquid carry
+  averaged ~0 bps/h, with Lighter's hourly rate swinging by up to ±3-9 bps.
+- A forced close mid-cycle pays the premium back; the screener's profit comes from round trips
+  over days. Two hours of one-way trades test the mechanics, not the economics.
+
