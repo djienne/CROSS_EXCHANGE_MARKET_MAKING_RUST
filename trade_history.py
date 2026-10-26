@@ -16,8 +16,8 @@ from typing import Any, Sequence
 
 from economics import Fill, optional_decimal, taker_economics, xemm_journal, calculate, fill_fee, event_time, venue_name
 
-from combined_pnl import (DEFAULT_SINCE, dec, decimal_str, default_since, default_state_path, fmt_money, fmt_pct, iso,
-    iter_jsonl, json_default, latest_capital_from_state, parse_dt, print_table, projection, report_roots, utc_now)
+from combined_pnl import (DEFAULT_SINCE, dec, decimal_str, default_since, fmt_money, fmt_pct, iso,
+    iter_jsonl, json_default, latest_capital_from_state, parse_dt, print_table, projection, report_runs, utc_now)
 
 
 TAKER_BOT = "LIGHTER_ASTER_TAKER_ARB"
@@ -314,31 +314,6 @@ def taker_trade_from_row(row: dict[str, Any], *, path: Path, line_no: int) -> tu
     return database_records(n,path=path,line_no=line_no,source="taker_local_ledger") if n else None
 
 
-def xemm_trade_from_orchestrator_row(row: dict[str, Any], *, path: Path, line_no: int):
-    if row.get("bot") != XEMM_BOT or row.get("direction") == "XEMM_CORRECTION":
-        return None
-    cloid = row.get("cloid")
-    if cloid is None or not row.get("market"):
-        return None
-    # ASTER_MAKER_HEDGE_BUY / _SELL: the hedge side.
-    if not str(row.get("direction") or "").lower().endswith(("buy", "sell")):
-        return None
-    confirmed = row.get("schema_version",1) >= 2 and row.get("economic_status") == "confirmed"
-    n = {name:optional_decimal(row.get(name)) for name in ("qty","aster_qty","lighter_qty","matched_qty","residual_qty",
-        "aster_px","lighter_px","gross_pnl_usdc","fees_usdc","net_pnl_usdc","aster_fee_usdc","lighter_fee_usdc")}
-    n.update(key=f"xemm:{cloid}",cloid=str(cloid),market=str(row["market"]),direction=row.get("direction"),
-        timestamp=event_time(row),raw=row,economic_status="confirmed" if confirmed else "legacy_unverified",fills=[])
-    if not confirmed:
-        n["net_pnl_usdc"] = None
-    else:
-        gross,fees,net = n["gross_pnl_usdc"],n["fees_usdc"],n["net_pnl_usdc"]
-        if gross is None or fees is None or net is None or abs(gross-fees-net)>Decimal("0.00000001"):
-            n["economic_status"]="incomplete"
-            n["net_pnl_usdc"]=None
-    # Aggregate rows have no native trade identities. Do not fabricate venue fills.
-    return database_records(n,path=path,line_no=line_no,source="orchestrator_normalized_ledger")
-
-
 def upsert_row(conn: sqlite3.Connection, table: str, key_column: str, row: dict[str, Any], preserve: set[str]) -> None:
     columns = list(row.keys())
     placeholders = ", ".join("?" for _ in columns)
@@ -363,8 +338,6 @@ def upsert_trade(conn: sqlite3.Connection, trade: dict[str, Any]) -> bool:
             grew=any(dec(trade.get(k))>dec(previous[k]) for k in ("aster_qty","lighter_qty"))
             if not grew:
                 return False
-        if previous["source"]=="xemm_journal" and previous["schema_version"]>=2 and trade["source"]=="orchestrator_normalized_ledger":
-            return False
     upsert_row(conn,"strategy_trades","trade_key",trade,preserve={"confirmation_status","confirmed_at","created_at"})
     return True
 
@@ -454,63 +427,6 @@ def ingest_taker_trades(conn: sqlite3.Connection, path: Path, *, market: str) ->
     return stats
 
 
-def ingest_orchestrator_xemm(conn: sqlite3.Connection, path: Path, *, market: str) -> IngestStats:
-    stats = IngestStats("orchestrator_normalized_ledger", path)
-    if not path.exists():
-        stats.missing = True
-        update_sync_state(conn, stats, market=market)
-        return stats
-
-    logical_rows = {}
-    errors: list[str] = []
-    for line_no,row in iter_jsonl(path, errors):
-        stats.read += 1
-        if row.get("market") != market or row.get("bot") != XEMM_BOT or row.get("cloid") is None:
-            stats.skipped += 1
-            continue
-        cloid = str(row["cloid"])
-        if row.get("direction") == "XEMM_CORRECTION":
-            base = logical_rows.get(cloid)
-            if base is None:
-                old = conn.execute("SELECT raw_json FROM strategy_trades WHERE trade_key=?",(f"xemm:{cloid}",)).fetchone()
-                if old:
-                    candidate = json.loads(old["raw_json"])
-                    if candidate.get("bot") == XEMM_BOT:
-                        base = (line_no,candidate)
-            if base is None:
-                stats.skipped += 1
-                continue
-            merged = dict(base[1])
-            if isinstance(row.get("corrected_trade"),dict):
-                merged.update(row["corrected_trade"])
-            else:
-                for field in ("gross_pnl_usdc","fees_usdc","net_pnl_usdc"):
-                    absolute = row.get("corrected_"+field)
-                    merged[field] = absolute if absolute is not None else decimal_str(dec(merged.get(field))+dec(row.get(field)))
-            merged.update(key=f"xemm:{cloid}",cloid=cloid)
-            logical_rows[cloid]=(line_no,merged)
-        else:
-            logical_rows[cloid]=(line_no,row)
-    for line_no,row in logical_rows.values():
-        try:
-            parsed=xemm_trade_from_orchestrator_row(row,path=path,line_no=line_no)
-            if parsed is None:
-                stats.skipped += 1
-                continue
-            trade,fills=parsed
-            if replace_trade_records(conn,trade,fills):
-                stats.upserted_trades += 1
-                stats.upserted_fills += len(fills)
-        except (ValueError,TypeError) as exc:
-            stats.skipped += 1
-            stats.error=str(exc)
-    if errors:
-        stats.error = "; ".join(errors[:3])
-        stats.skipped += len(errors)
-    update_sync_state(conn, stats, market=market)
-    return stats
-
-
 def ingest_xemm_journal(conn: sqlite3.Connection, path: Path, *, market: str) -> IngestStats:
     stats = IngestStats("xemm_journal",path)
     if not path.exists():
@@ -535,13 +451,9 @@ def refresh_lan(
     *,
     market: str,
     taker_trades: Path,
-    orchestrator_trades: Path,
     xemm_journals: Sequence[Path] = (),
 ) -> list[IngestStats]:
-    stats = [
-        ingest_taker_trades(conn, taker_trades, market=market),
-        ingest_orchestrator_xemm(conn, orchestrator_trades, market=market),
-    ]
+    stats = [ingest_taker_trades(conn, taker_trades, market=market)]
     for journal in xemm_journals:
         # Last so the journal's real trade times + actual hedge fees win on shared keys.
         stats.append(ingest_xemm_journal(conn, journal, market=market))
@@ -688,8 +600,7 @@ def build_repaired_database(args: argparse.Namespace) -> dict[str, Any]:
                 original_hash=database_fingerprint(conn)
                 before=database_overview(conn)
         init_db(conn)
-        stats=refresh_lan(conn,market=args.market,taker_trades=args.taker_trades,
-            orchestrator_trades=args.orchestrator_trades,xemm_journals=args.xemm_journal)
+        stats=refresh_lan(conn,market=args.market,taker_trades=args.taker_trades,xemm_journals=args.xemm_journal)
         raw=repair_raw_fees(conn,args.raw_fills,args.market) if args.raw_fills else {"repaired_trades":0,"unusable_raw_rows":0}
         conn.commit()
         if conn.execute("PRAGMA integrity_check").fetchone()[0]!="ok" or conn.execute("PRAGMA foreign_key_check").fetchone():
@@ -764,7 +675,7 @@ def empty_bucket(strategy: str) -> dict[str, Any]:
 
 
 def report_from_db(conn: sqlite3.Connection, *, market: str, since: datetime, now: datetime, db_path: Path,
-    capital_usdc: Decimal | None = None, orchestrator_state: Path | None = None) -> dict[str, Any]:
+    capital_usdc: Decimal | None = None, bot_state: Path | None = None) -> dict[str, Any]:
     buckets={"TAKER":empty_bucket("TAKER"),"XEMM":empty_bucket("XEMM")}
     confirmation_counts={}
     rows=conn.execute(
@@ -801,8 +712,8 @@ def report_from_db(conn: sqlite3.Connection, *, market: str, since: datetime, no
             for name in totals: b[name]=None
     capital_source="cli"
     capital=capital_usdc
-    if capital is None and orchestrator_state is not None:
-        capital,capital_source=latest_capital_from_state(orchestrator_state)
+    if capital is None and bot_state is not None:
+        capital,capital_source=latest_capital_from_state(bot_state)
     return {"db":db_path,"market":market,"since":since,"now":now,
         "by_strategy":[buckets[k] for k in sorted(buckets)],"total":total,
         "confirmation_counts":confirmation_counts,"source_errors":source_errors,
@@ -886,9 +797,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--now", default=None, help="Override report end time. Defaults to current UTC time.")
     parser.add_argument("--db", type=Path, default=None, help="Default: runs/trade_history.sqlite in the repository root (with --dry-run, in LIGHTER_ASTER_BOT/runs/tokyo/dry-run/).")
     parser.add_argument("--taker-trades", type=Path, default=None)
-    parser.add_argument("--orchestrator-trades", type=Path, default=None, help="The retired orchestrator's normalized trade ledger (historical XEMM rows).")
-    parser.add_argument("--xemm-journal", type=Path, action="append", default=None, help="XEMM raw journal with logical/attempt execution evidence and economic timestamps; repeatable. Default: the retired orchestrator's journal, then `run`'s.")
-    parser.add_argument("--bot-state", "--orchestrator-state", dest="orchestrator_state", type=Path, default=None, help="Controller state file (capital for projections). Default: `run`'s, else the retired orchestrator's.")
+    parser.add_argument("--xemm-journal", type=Path, action="append", default=None, help="XEMM raw journal with logical/attempt execution evidence and economic timestamps; repeatable. Default: `run`'s.")
+    parser.add_argument("--bot-state", type=Path, default=None, help="Controller state file (capital for projections). Default: `run`'s.")
     parser.add_argument("--capital-usdc", type=Decimal, default=None)
     parser.add_argument("--no-refresh", action="store_true", help="Report existing DB contents without reading local ledgers first.")
     parser.add_argument("--refresh-only", action="store_true", help="Refresh the DB and skip the PnL report.")
@@ -899,22 +809,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebuild-out", type=Path, help="Candidate path (default: <db-stem>.rebuilt.sqlite).")
     parser.add_argument("--raw-fills", type=Path, action="append", default=[], help="Own-account execution_trade JSONL with venue/order identities, notional and fee evidence; repeatable.")
     args = parser.parse_args()
-    roots = report_roots(stack_root, args.dry_run)
-    legacy_runs, bot_runs = roots
+    bot_runs = report_runs(stack_root, args.dry_run)
     args.since = args.since or default_since(bot_runs, args.market, args.dry_run)
     if args.db is None:
-        args.db = legacy_runs / "trade_history.sqlite"
+        args.db = (bot_runs if args.dry_run else stack_root / "runs") / "trade_history.sqlite"
     if args.taker_trades is None:
         args.taker_trades = bot_runs / f"trades_{args.market}.jsonl"
-    if args.orchestrator_trades is None:
-        args.orchestrator_trades = legacy_runs / f"orchestrator_trades_{args.market}.jsonl"
     if args.xemm_journal is None:
-        args.xemm_journal = [
-            legacy_runs / f"orchestrator-xemm-{args.market}-journal.jsonl",
-            bot_runs / f"bot-{args.market}-journal.jsonl",
-        ]
-    if args.orchestrator_state is None:
-        args.orchestrator_state = default_state_path(roots, args.market)
+        args.xemm_journal = [bot_runs / f"bot-{args.market}-journal.jsonl"]
+    if args.bot_state is None:
+        args.bot_state = bot_runs / f"bot-{args.market}.state.json"
     return args
 
 
@@ -935,7 +839,6 @@ def main() -> int:
                 conn,
                 market=args.market,
                 taker_trades=args.taker_trades,
-                orchestrator_trades=args.orchestrator_trades,
                 xemm_journals=args.xemm_journal,
             )
         report = None
@@ -947,7 +850,7 @@ def main() -> int:
                 now=now,
                 db_path=args.db,
                 capital_usdc=args.capital_usdc,
-                orchestrator_state=args.orchestrator_state,
+                bot_state=args.bot_state,
             )
     if args.json:
         print(json.dumps({"refresh": [asdict(s) for s in stats], "report": report}, default=json_default, indent=2))

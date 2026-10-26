@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from combined_pnl import copy_end, default_since, iso, iter_jsonl, parse_dt, replay_json, replay_window, report_roots, utc_now
+from combined_pnl import copy_end, default_since, iso, iter_jsonl, parse_dt, replay_json, replay_window, report_runs, utc_now
 from economics import parse_timestamp, xemm_journal
 
 
@@ -308,7 +308,7 @@ def main() -> int:
     parser.add_argument("--now", default=None)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
-    runs = args.runs.resolve() if args.runs else report_roots(Path(__file__).resolve().parent, args.dry_run)[1]
+    runs = args.runs.resolve() if args.runs else report_runs(Path(__file__).resolve().parent, args.dry_run)
     if args.runs and not runs.is_dir():
         parser.error(f"runs directory does not exist: {runs}")
     window = replay_window(runs) if args.runs else None  # a replay: its own window, on its clock

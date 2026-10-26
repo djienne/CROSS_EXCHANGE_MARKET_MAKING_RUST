@@ -197,14 +197,13 @@ def selected_xemm_journals(paths: list[Path], require_paths: bool = False) -> tu
     return included, skipped
 
 
-def report_roots(stack_root: Path, dry_run: bool = False) -> tuple[Path, Path]:
-    """The `runs/` directories the reports read by default: the retired stacks' and `run`'s.
-    A dry run keeps every file in its `runs/dry-run/`, which live never shares, so both resolve
-    there: the Tokyo VPS's, which `vps.py pull` copies to `LIGHTER_ASTER_BOT/runs/tokyo/` daily
-    (this PC's own, until 2026-10-10, stay in `LIGHTER_ASTER_BOT/runs/dry-run/`: `--runs`)."""
+def report_runs(stack_root: Path, dry_run: bool = False) -> Path:
+    """The `runs/` directory the reports read by default: `run`'s. A dry run keeps every file in
+    its `runs/dry-run/`, which live never shares: the Tokyo VPS's, which `vps.py pull` copies to
+    `LIGHTER_ASTER_BOT/runs/tokyo/` daily (this PC's own, until 2026-10-10, stay in
+    `LIGHTER_ASTER_BOT/runs/dry-run/`: `--runs`)."""
     bot_runs = stack_root / "LIGHTER_ASTER_BOT" / "runs"
-    dry = bot_runs / "tokyo" / "dry-run"
-    return (dry, dry) if dry_run else (stack_root / "runs", bot_runs)
+    return bot_runs / "tokyo" / "dry-run" if dry_run else bot_runs
 
 
 def copy_end(runs: Path) -> str | None:
@@ -224,14 +223,6 @@ def default_since(bot_runs: Path, market: str, dry_run: bool) -> str:
         except (OSError, ValueError, KeyError, TypeError):
             pass
     return DEFAULT_SINCE
-
-
-def default_state_path(roots: tuple[Path, Path], market: str) -> Path:
-    """`run`'s controller state, else the retired orchestrator's (same keys)."""
-    legacy_runs, bot_runs = roots
-    current = bot_runs / f"bot-{market}.state.json"
-    legacy = legacy_runs / f"orchestrator_state_{market}.json"
-    return current if current.exists() or not legacy.exists() else legacy
 
 
 def latest_capital_from_state(path: Path) -> tuple[Decimal | None, str | None]:
@@ -344,14 +335,14 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
     capital = args.capital_usdc
     capital_source = "cli"
     if capital is None:
-        capital, capital_source = latest_capital_from_state(args.orchestrator_state)
+        capital, capital_source = latest_capital_from_state(args.bot_state)
     proj = projection(total["net_pnl_usdc"], capital, since, now)
     notes = [
         "Execution economics include matched spread and explicit recovery closes; portfolio marks and funding are excluded "
         "(the account equity line includes them).",
         "Unknown/legacy fee evidence makes full net totals and return projections unavailable; known subtotals remain visible.",
         "Known net subtotals exclude unresolved rows; estimated recovery losses are shown separately.",
-        "By default XEMM includes only the production run/orchestrator journals. Pass --xemm-journal for exact files.",
+        "By default XEMM reads `run`'s journal. Pass --xemm-journal for exact files.",
     ]
     if xemm["untimestamped_trades"]:
         notes.append(
@@ -531,10 +522,9 @@ def parse_args() -> argparse.Namespace:
         default="exclude",
         help="How to handle legacy XEMM fill/hedge rows without wall-clock timestamps.",
     )
-    parser.add_argument("--bot-state", "--orchestrator-state", dest="orchestrator_state", type=Path, default=None, help="Controller state file. Default: `run`'s, else the retired orchestrator's.")
+    parser.add_argument("--bot-state", type=Path, default=None, help="Controller state file. Default: `run`'s.")
     args = parser.parse_args()
-    roots = (args.runs, args.runs) if args.runs else report_roots(stack_root, args.dry_run)
-    legacy_runs, bot_runs = roots
+    bot_runs = args.runs or report_runs(stack_root, args.dry_run)
     window = replay_window(args.runs) if args.runs else None
     args.shift_ms = window[2] if window else 0
     args.since = args.since or (window[0] if window else default_since(bot_runs, args.market, args.dry_run))
@@ -543,17 +533,14 @@ def parse_args() -> argparse.Namespace:
         args.taker_trades = bot_runs / f"trades_{args.market}.jsonl"
     args.equity = bot_runs / f"bot-{args.market}.equity.jsonl"
     if not args.xemm_journal:
-        args.xemm_journal = [
-            legacy_runs / f"orchestrator-xemm-{args.market}-journal.jsonl",
-            bot_runs / f"bot-{args.market}-journal.jsonl",
-        ]
+        args.xemm_journal = [bot_runs / f"bot-{args.market}-journal.jsonl"]
         args.xemm_journal_selection = "default_production_journals"
         args.require_xemm_journal_paths = False
     else:
         args.xemm_journal_selection = "explicit_journals"
         args.require_xemm_journal_paths = True
-    if args.orchestrator_state is None:
-        args.orchestrator_state = default_state_path(roots, args.market)
+    if args.bot_state is None:
+        args.bot_state = bot_runs / f"bot-{args.market}.state.json"
     args.include_untimestamped_xemm = args.xemm_untimestamped == "include"
     return args
 

@@ -60,21 +60,19 @@ class TradeHistoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             taker_path = root / "taker.jsonl"
-            orch_path = root / "orchestrator.jsonl"
             db_path = root / "history.sqlite"
-            write_jsonl(orch_path, [])
             since = combined_pnl.parse_dt("2026-01-01T00:00:00Z")
             now = combined_pnl.parse_dt("2026-01-03T00:00:00Z")
             with self.open_db(db_path) as conn:
                 write_jsonl(taker_path, [row])
-                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
+                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path)
                 report = trade_history.report_from_db(conn, market="HYPE", since=since, now=now, db_path=db_path)
                 self.assertEqual(report["total"]["trades"], 1)
                 self.assertEqual(report["total"]["gross_pnl_usdc"], Decimal("0.9"))
                 self.assertEqual(report["total"]["policy_fees_usdc"], Decimal("0.04"))
                 self.assertEqual(report["total"]["net_pnl_usdc"], Decimal("0.86"))
                 write_jsonl(taker_path, [row, disagreeing])
-                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
+                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path)
                 report = trade_history.report_from_db(conn, market="HYPE", since=since, now=now, db_path=db_path)
             self.assertEqual((report["total"]["trades"], report["total"]["incomplete_trades"]), (2, 1))
             self.assertEqual(report["total"]["known_net_pnl_usdc"], Decimal("0.86"))
@@ -86,7 +84,6 @@ class TradeHistoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             taker_path = root / "taker.jsonl"
-            orch_path = root / "orchestrator.jsonl"
             db_path = root / "history.sqlite"
             write_jsonl(
                 taker_path,
@@ -106,9 +103,8 @@ class TradeHistoryTests(unittest.TestCase):
                     }
                 ],
             )
-            write_jsonl(orch_path, [])
             with self.open_db(db_path) as conn:
-                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
+                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path)
                 rows = conn.execute(
                     "SELECT direction, net_pnl_usdc FROM strategy_trades"
                 ).fetchall()
@@ -120,7 +116,6 @@ class TradeHistoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             taker_path = root / "taker.jsonl"
-            orch_path = root / "orchestrator.jsonl"
             db_path = root / "history.sqlite"
 
             def recovery(ts: str) -> dict:
@@ -142,9 +137,8 @@ class TradeHistoryTests(unittest.TestCase):
                 taker_path,
                 [recovery("2026-01-02T00:00:00.111111111Z"), recovery("2026-01-02T01:00:00.222222222Z")],
             )
-            write_jsonl(orch_path, [])
             with self.open_db(db_path) as conn:
-                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
+                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path)
                 rows = conn.execute(
                     "SELECT trade_key, net_pnl_usdc FROM strategy_trades ORDER BY trade_key"
                 ).fetchall()
@@ -160,7 +154,6 @@ class TradeHistoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             taker_path = root / "taker.jsonl"
-            orch_path = root / "orchestrator.jsonl"
             db_path = root / "history.sqlite"
             row = {
                 "timestamp": "2026-01-02T00:00:00Z",
@@ -176,13 +169,12 @@ class TradeHistoryTests(unittest.TestCase):
                 "lighter_client_order_index": 9,
             }
             write_jsonl(taker_path, [row])
-            write_jsonl(orch_path, [])
             with self.open_db(db_path) as conn:
                 # Seed the DB with a wrong historical value under the same key.
-                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
+                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path)
                 conn.execute("UPDATE strategy_trades SET net_pnl_usdc = '999' WHERE trade_key = 'taker:9:9'")
                 conn.commit()
-                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
+                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path)
                 net = conn.execute(
                     "SELECT net_pnl_usdc FROM strategy_trades WHERE trade_key = 'taker:9:9'"
                 ).fetchone()[0]
@@ -192,7 +184,6 @@ class TradeHistoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             taker_path = root / "taker.jsonl"
-            orch_path = root / "orchestrator.jsonl"
             db_path = root / "history.sqlite"
             write_jsonl(
                 taker_path,
@@ -209,42 +200,18 @@ class TradeHistoryTests(unittest.TestCase):
                     }
                 ],
             )
-            write_jsonl(orch_path, [])
             with self.open_db(db_path) as conn:
-                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
-                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
+                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path)
+                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path)
                 trade_count = conn.execute("SELECT COUNT(*) FROM strategy_trades").fetchone()[0]
                 fill_count = conn.execute("SELECT COUNT(*) FROM venue_fills").fetchone()[0]
             self.assertEqual(trade_count, 1)
             self.assertEqual(fill_count, 2)
 
-    def test_xemm_orchestrator_preserves_matched_economics_and_folds_corrections(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root=Path(td)
-            row={"timestamp":"2026-01-02T00:00:00Z","key":"xemm:abc","cloid":"abc","bot":"XEMM_LIGHTER_ASTER",
-                "market":"HYPE","direction":"ASTER_MAKER_HEDGE_SELL","qty":"0.20","aster_qty":"0.20","lighter_qty":"0.12",
-                "matched_qty":"0.12","residual_qty":"0.08","aster_px":"100","lighter_px":"101",
-                "gross_pnl_usdc":"0.12","fees_usdc":"0.01","net_pnl_usdc":"0.11","aster_fee_usdc":"0","lighter_fee_usdc":"0.01",
-                "schema_version":2,"economic_status":"confirmed"}
-            final=dict(row,lighter_qty="0.20",matched_qty="0.20",residual_qty="0",lighter_px="100.5",
-                gross_pnl_usdc="0.10",fees_usdc="0.02",net_pnl_usdc="0.08",lighter_fee_usdc="0.02")
-            correction={"timestamp":"2026-01-02T00:00:01Z","key":"xemm:abc#rev1","cloid":"abc","bot":"XEMM_LIGHTER_ASTER",
-                "market":"HYPE","direction":"XEMM_CORRECTION","corrected_trade":final}
-            path=root/"orchestrator.jsonl"
-            write_jsonl(path,[row,correction])
-            with self.open_db(root/"history.sqlite") as conn:
-                trade_history.ingest_orchestrator_xemm(conn,path,market="HYPE")
-                values=conn.execute("SELECT net_pnl_usdc,matched_qty FROM strategy_trades").fetchall()
-                self.assertEqual(len(values),1)
-                self.assertEqual(tuple(values[0]),("0.08","0.2"))
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM venue_fills").fetchone()[0],0,
-                    "aggregate reports must not invent native fill identities")
-
     def test_report_filters_by_time_window(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             taker_path = root / "taker.jsonl"
-            orch_path = root / "orchestrator.jsonl"
             db_path = root / "history.sqlite"
             base = {
                 "market": "HYPE",
@@ -256,9 +223,8 @@ class TradeHistoryTests(unittest.TestCase):
             old = dict(base, timestamp="2026-01-01T00:00:00Z", aster_order_id=1, lighter_client_order_index=1)
             new = dict(base, timestamp="2026-01-02T00:00:00Z", aster_order_id=2, lighter_client_order_index=2)
             write_jsonl(taker_path, [old, new])
-            write_jsonl(orch_path, [])
             with self.open_db(db_path) as conn:
-                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
+                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path)
                 report = trade_history.report_from_db(
                     conn,
                     market="HYPE",
@@ -271,15 +237,14 @@ class TradeHistoryTests(unittest.TestCase):
     def test_untimestamped_rows_keep_every_window_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            taker_path, orch_path, db_path = root / "taker.jsonl", root / "orchestrator.jsonl", root / "history.sqlite"
+            taker_path, db_path = root / "taker.jsonl", root / "history.sqlite"
             row = {"market": "HYPE", "direction": "SELL_ASTER_BUY_LIGHTER", "qty": "1", "timestamp": "2026-01-02T00:00:00Z",
                    "aster_order_id": 1, "lighter_client_order_index": 1,
                    "aster_fill": {"qty": "1", "vwap": "100", "notional": "100", "fee_usd": "0"},
                    "lighter_fill": {"qty": "1", "vwap": "99", "notional": "99", "fee_usd": "0"}}
             write_jsonl(taker_path, [row])
-            write_jsonl(orch_path, [])
             with self.open_db(db_path) as conn:
-                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
+                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path)
                 conn.execute("UPDATE strategy_trades SET timestamp_us=NULL")  # a legacy row without a time
                 report = trade_history.report_from_db(
                     conn, market="HYPE", since=combined_pnl.parse_dt("2026-01-01T00:00:00Z"),
@@ -292,7 +257,6 @@ class TradeHistoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             taker_path = root / "taker.jsonl"
-            orch_path = root / "orchestrator.jsonl"
             db_path = root / "history.sqlite"
             base = {
                 "market": "HYPE",
@@ -303,9 +267,8 @@ class TradeHistoryTests(unittest.TestCase):
             }
             boundary = dict(base, timestamp="2026-06-28T00:00:00.500000Z", aster_order_id=1, lighter_client_order_index=1)
             write_jsonl(taker_path, [boundary])
-            write_jsonl(orch_path, [])
             with self.open_db(db_path) as conn:
-                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
+                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path)
                 report = trade_history.report_from_db(
                     conn,
                     market="HYPE",
@@ -316,8 +279,7 @@ class TradeHistoryTests(unittest.TestCase):
             self.assertEqual(report["total"]["trades"], 1)
 
     def test_xemm_journal_ingest_captures_downtime_trades_with_real_times(self) -> None:
-        # A fill/hedge_fill pair that only exists in the bot journal (orchestrator was
-        # down) must land in the DB with the journal's ts_ms as the trade time and the
+        # A fill/hedge_fill pair from the bot journal must land in the DB with the journal's ts_ms as the trade time and the
         # actual hedge fee from the journal.
         def ms(iso_ts: str) -> int:
             return int(combined_pnl.parse_dt(iso_ts).timestamp() * 1000)
@@ -325,11 +287,9 @@ class TradeHistoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             taker_path = root / "taker.jsonl"
-            orch_path = root / "orchestrator.jsonl"
             journal_path = root / "journal.jsonl"
             db_path = root / "history.sqlite"
             write_jsonl(taker_path, [])
-            write_jsonl(orch_path, [])
             write_jsonl(
                 journal_path,
                 [
@@ -342,7 +302,6 @@ class TradeHistoryTests(unittest.TestCase):
                     conn,
                     market="HYPE",
                     taker_trades=taker_path,
-                    orchestrator_trades=orch_path,
                     xemm_journals=[journal_path],
                 )
                 # Idempotent on re-run.
@@ -350,7 +309,6 @@ class TradeHistoryTests(unittest.TestCase):
                     conn,
                     market="HYPE",
                     taker_trades=taker_path,
-                    orchestrator_trades=orch_path,
                     xemm_journals=[journal_path],
                 )
                 row = conn.execute(
@@ -374,7 +332,7 @@ class TradeHistoryTests(unittest.TestCase):
             for flags in ([], ["--dry-run"]):
                 with mock.patch.object(sys, "argv", [module.__name__, *flags]):
                     args = module.parse_args()
-                keys = ("taker_trades", "orchestrator_state", "db", "orchestrator_trades")
+                keys = ("taker_trades", "bot_state", "db")
                 paths = [getattr(args, key) for key in keys if hasattr(args, key)] + args.xemm_journal
                 self.assertEqual({dry in path.parents for path in paths}, {bool(flags)}, (module.__name__, flags))
 

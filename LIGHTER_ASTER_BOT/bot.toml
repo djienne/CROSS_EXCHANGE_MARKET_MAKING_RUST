@@ -247,14 +247,6 @@ aster_symbol = "HYPEUSDT"
 lighter_symbol = "HYPE"
 hedge_venue  = "hyperliquid"
 
-[[maker.markets]]
-aster_symbol = "BNBUSDT"
-lighter_symbol      = "BNB"
-
-[[maker.markets]]
-aster_symbol = "ETHUSDT"
-lighter_symbol      = "ETH"
-
 # `--mode dry-run`: the same bot, signing with a dry-run identity no venue knows, against its
 # market's two venues simulated on loopback. Live feeds and configured latency assumptions
 # model a Tokyo scenario; files go to runs/dry-run/. Latencies are [p50, p99] ms,

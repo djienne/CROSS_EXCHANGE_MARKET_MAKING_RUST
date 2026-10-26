@@ -7,10 +7,9 @@ script clears the latch so the next run can start. It is a pure host-side file o
 through the Docker bind mount (`./runs:/app/runs`), so there is no need to `docker exec` into the
 container, and it works whether or not the container is running.
 
-Without --runs-dir it searches both latch locations: <crate>/runs (`run`'s) and the
-stack-level runs/ beside the crate (the retired orchestrator's runs).
+Without --runs-dir it looks in <crate>/runs (`run`'s).
 
-Usage (from LIGHTER_ASTER_BOT/, the deploy dir; the default runs dirs do not depend on the cwd):
+Usage (from LIGHTER_ASTER_BOT/, the deploy dir; the default runs dir does not depend on the cwd):
     python scripts/reset_breaker.py                 # clear ALL *.trip.json latches
     python scripts/reset_breaker.py --coin HYPE     # clear only runs/bot-HYPE.trip.json (`run`)
     python scripts/reset_breaker.py --archive       # rename instead of delete (keeps an audit copy)
@@ -27,9 +26,7 @@ from pathlib import Path
 
 
 def _runs_dirs_default() -> list[Path]:
-    # Robust to the cwd: <crate>/runs for `run`, <stack>/runs for the retired orchestrator's runs.
-    crate = Path(__file__).resolve().parent.parent
-    return [d for d in (crate / "runs", crate.parent / "runs") if d.exists()]
+    return [Path(__file__).resolve().parent.parent / "runs"]  # robust to the cwd
 
 
 def _describe(path: Path) -> None:
@@ -59,7 +56,7 @@ def main() -> int:
     runs_dirs = [args.runs_dir] if args.runs_dir else _runs_dirs_default()
     runs_dirs = [d for d in runs_dirs if d.exists()]
     if not runs_dirs:
-        print(f"runs directory not found: {args.runs_dir or 'no <crate>/runs or stack runs/'}")
+        print(f"runs directory not found: {args.runs_dir or 'no <crate>/runs'}")
         return 0
 
     targets = []

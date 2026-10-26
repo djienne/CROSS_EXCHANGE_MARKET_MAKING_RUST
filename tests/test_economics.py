@@ -135,7 +135,7 @@ class EconomicContractTests(unittest.TestCase):
             journal=root/"journal.jsonl"
             write_rows(journal,CASES[0]["rows"])
             args=argparse.Namespace(db=root/"history.sqlite",rebuild_out=None,market="HYPE",raw_fills=[],
-                taker_trades=root/"missing-taker.jsonl",orchestrator_trades=root/"missing-orch.jsonl",xemm_journal=[journal])
+                taker_trades=root/"missing-taker.jsonl",xemm_journal=[journal])
             conn=trade_history.open_db(args.db)
             try:
                 trade_history.init_db(conn)
@@ -175,7 +175,7 @@ class EconomicContractTests(unittest.TestCase):
             journal=root/"journal.jsonl"
             write_rows(journal,CASES[0]["rows"])
             args=argparse.Namespace(db=root/"history.sqlite",rebuild_out=None,market="HYPE",raw_fills=[],
-                taker_trades=root/"missing-taker",orchestrator_trades=root/"missing-orch",xemm_journal=[journal])
+                taker_trades=root/"missing-taker",xemm_journal=[journal])
             conn=trade_history.open_db(args.db)
             try:
                 trade_history.init_db(conn)

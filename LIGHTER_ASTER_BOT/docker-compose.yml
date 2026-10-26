@@ -61,9 +61,6 @@ services:
       # Persistent + WRITABLE outputs; this nested mount overrides the read-only parent
       # for the runs/ subtree only.
       - ./runs:/app/runs
-      # The retired orchestrator's runs/ at the stack root: `run --mode live` refuses to start
-      # while its lock is held or its latches exist (RUNBOOK.md, "Orchestrator leftovers").
-      - ../runs:/runs:ro
       # One counter for every container signing for the Aster wallet: the live bot and the
       # probes beside it. On a Linux host, set ASTER_NONCE_DIR to share it with native signers.
       - ${ASTER_NONCE_DIR:-aster-nonce}:/nonce

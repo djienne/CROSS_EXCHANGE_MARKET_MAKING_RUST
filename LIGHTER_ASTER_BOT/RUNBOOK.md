@@ -517,13 +517,3 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
   real funds: both need `--i-understand-live --max-usd <10.5..20>`, a flat start and no open
   order. Actions spend the address's allowance (initial 10k + ~1 per USDC traded).
   The engines do not implement a Hyperliquid dead-man refresh.
-
-## Orchestrator leftovers
-
-The stack used to run `orchestrator.py` with the engines as child processes. `run --mode live`
-looks in `runs/` and the stack root's `runs/`, and refuses to start while the orchestrator
-still runs (its lock `orchestrator_<M>.lock` is held) or while its latches exist:
-`orchestrator_breaker_<M>.json`, `orchestrator-xemm-<M>.trip.json` and
-`orchestrator-xemm-<M>.active.json`, the last an unresolved session. Review and archive them
-like the latches above. Engines left running by a killed orchestrator hold no lock, so `run`
-cannot see them: stop any before the first `run`. The reports still read its journals and state.

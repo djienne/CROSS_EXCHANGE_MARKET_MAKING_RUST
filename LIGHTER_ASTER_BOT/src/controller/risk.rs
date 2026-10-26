@@ -1,6 +1,5 @@
-//! Cross-engine loss stops, ported from orchestrator.py (`PnlTracker`, `TradeTracker`,
-//! `breaker_reason`). One limit (`max_loss_usdc`), two independent tests, both inclusive and
-//! evaluated every tick:
+//! Cross-engine loss stops. One limit (`max_loss_usdc`), two independent tests, both inclusive
+//! and evaluated every tick:
 //! * **equity drawdown** `last_equity - baseline <= -limit`. The baseline is one sample,
 //!   armed on the first sample and persisted, so a loss keeps counting across restarts; a
 //!   baseline not refreshed for `baseline_max_gap_hours` is discarded.
@@ -442,8 +441,8 @@ pub fn check_breaker(path: &Path, ack: bool, reset_baseline: bool, events: &mut 
     Ok(())
 }
 
-/// `Decimal(str(raw))` when finite, else `None` (economics.optional_decimal): how the retired
-/// orchestrator.py read engine reports, kept for the ledger's JSON numbers.
+/// `Decimal(str(raw))` when finite, else `None` (economics.optional_decimal), for the ledger's
+/// JSON numbers.
 pub fn py_decimal(raw: Option<&Value>) -> Option<Decimal> {
     let text = match raw? {
         Value::String(text) => text.trim().to_owned(),

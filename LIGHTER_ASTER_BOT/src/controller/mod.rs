@@ -1,7 +1,7 @@
 //! The `run` command: one process for one market. On Aster routes, XEMM quotes; when an
 //! arbitrage passes the taker's entry gate, XEMM pulls its quotes and hands the execution
-//! rights to the taker, which trades and hands them back. It replaces the retired
-//! orchestrator.py and its child processes. Lighter/Hyperliquid routes run only the taker.
+//! rights to the taker, which trades and hands them back. Lighter/Hyperliquid routes run only the
+//! taker.
 //!
 //! * [`crate::controller::risk`]: cross-engine loss stops (equity drawdown, realized trade PnL).
 //! * `supervisor`: the loop — engine tasks, loss stops, network pause, halts.
@@ -305,7 +305,6 @@ pub(crate) async fn run_with(
     let _leg_locks = if live { legs(&taker_markets[0]).iter().map(|leg| lock_market(&runs_dir, leg)).collect::<Result<Vec<_>>>()? } else { Vec::new() };
     let sim = if live {
         refuse_insecure_env_files()?;
-        refuse_legacy_stack(&market, &[runs_root, Path::new("../runs")])?;
         None
     } else {
         let dry_run = cfg.dry_run.clone().context("--mode dry-run needs a [dry_run] table in the config")?;
@@ -378,34 +377,6 @@ fn refuse_insecure_env_files() -> Result<()> {
             }
         }
         ensure!(insecure.is_empty(), "credential env file(s) readable by group/other; chmod 600 them: {}", insecure.join(", "));
-    }
-    Ok(())
-}
-
-/// The two-process stack must be stopped, and its latches reviewed, before `run`: a running
-/// orchestrator.py (it holds this flock for life), its breaker, and XEMM's trip latch and
-/// unclean-session marker under the old `orchestrator-xemm-<M>` stem, which the new file names
-/// would silently skip. Looked for in `runs/` and in the stack root's `runs/`, where the
-/// orchestrator kept them. Children orphaned by a killed orchestrator hold no lock, so this
-/// cannot see them. Transitional: delete once no host runs the old layout.
-fn refuse_legacy_stack(market: &str, dirs: &[&Path]) -> Result<()> {
-    for dir in dirs {
-        let lock = dir.join(format!("orchestrator_{market}.lock"));
-        if let Ok(file) = File::open(&lock) {
-            if let Err(std::fs::TryLockError::WouldBlock) = file.try_lock() {
-                bail!("orchestrator.py is still running ({} is locked); stop it and every bot it started", lock.display());
-            }
-        }
-        for name in [
-            format!("orchestrator_breaker_{market}.json"),
-            format!("orchestrator-xemm-{market}.trip.json"),
-            format!("orchestrator-xemm-{market}.active.json"),
-        ] {
-            let path = dir.join(name);
-            if path.exists() {
-                bail!("legacy latch {} (orchestrator era): review it, then archive or delete it before `run`", path.display());
-            }
-        }
     }
     Ok(())
 }
@@ -529,7 +500,6 @@ mod tests {
         let cfg = BotConfig::load(&path).unwrap();
         let (taker, maker) = cfg.select("HYPE").unwrap();
         assert_eq!((taker[0].lighter_market_index, maker[0].aster_symbol.as_str()), (Some(24), "HYPEUSDT"));
-        assert!(cfg.select("BNB").is_err(), "BNB has no taker entry");
         let (taker, maker) = cfg.select("HYPE-HL").unwrap();
         assert!(taker[0].hedge_venue == maker[0].hedge_venue && maker[0].hedge_venue == crate::config::HedgeVenue::Hyperliquid);
         let (lh, maker) = cfg.select("HYPE-LH").unwrap();
@@ -850,21 +820,6 @@ mod tests {
         let qty = |venue: usize, market: &str| state[venue]["account"]["positions"][market]["qty"].as_str().and_then(|q| q.parse::<Decimal>().ok());
         let (lighter, hyperliquid) = (qty(0, "24").unwrap(), qty(1, "HYPE").unwrap());
         assert!(lighter + hyperliquid == Decimal::ZERO && lighter > Decimal::ZERO, "{state}");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_running_orchestrator_or_its_latches_block_run() {
-        let dir = crate::dryrun::tests::temp_dir("bot-legacy");
-        let check = || refuse_legacy_stack("HYPE", &[dir.as_path()]);
-        // A stopped orchestrator leaves its lock file behind, unlocked.
-        let lock = File::create(dir.join("orchestrator_HYPE.lock")).unwrap();
-        check().unwrap();
-        lock.try_lock().unwrap();
-        assert!(format!("{:#}", check().unwrap_err()).contains("orchestrator.py is still running"));
-        drop(lock);
-        std::fs::write(dir.join("orchestrator-xemm-HYPE.trip.json"), "{}").unwrap();
-        assert!(format!("{:#}", check().unwrap_err()).contains("legacy latch"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
