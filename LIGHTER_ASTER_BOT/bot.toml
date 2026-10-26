@@ -266,7 +266,7 @@ hedge_venue  = "hyperliquid"
 # held requests and the HYPE maker spent the morning frozen; 10 s still left 22 % of frames late.
 shift_ms = 90000
 seed     = 0
-# 0: any free port, so dry runs share a host (the VPS runs three side by side).
+# 0: any free port, so dry runs share a host (the VPS runs four side by side).
 aster_port       = 0
 lighter_port     = 0
 hyperliquid_port = 0
