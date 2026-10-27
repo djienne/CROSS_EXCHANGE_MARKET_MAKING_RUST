@@ -52,6 +52,7 @@ class BotStatsTests(unittest.TestCase):
         # Expected edge less both legs' slippage is the realized edge (to the bps basis difference).
         kept = taker["realized_gross_bps"]["mean"]
         self.assertAlmostEqual(10 - 5.0 - 1.998, kept, places=1)
+        self.assertEqual(taker["by_direction"], {"SELL_LIGHTER_BUY_ASTER": {"trades": 1, "net_usd": -0.01, "edge_kept": 0.3}})
         self.assertEqual((taker["aster_fill_ms"]["p50"], taker["lighter_fill_ms"]["p50"]), (90, 300))
         self.assertEqual((sim["host_frozen_windows"], sim["aster"]["late_frames_pct"], sim["aster"]["late_frames_pct_unfrozen"]),
                          (1, 25.5, 1.0))

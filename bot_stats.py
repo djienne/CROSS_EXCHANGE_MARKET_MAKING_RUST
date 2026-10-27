@@ -2,7 +2,7 @@
 """Execution quality and health of `run`: python3 bot_stats.py --market HYPE [--dry-run] [--runs DIR] [--json].
 
 combined_pnl.py says how much was made; this says why. It covers five things:
-- how much of the expected edge each taker trade kept, and which leg lost the rest;
+- how much of the expected edge each taker trade kept, per direction too, and which leg lost the rest;
 - how often the entry gate fired;
 - what XEMM trades earned and how fast they were hedged, and how its quotes were refreshed;
 - what the controller did, and how XEMM handed the rights to the taker;
@@ -66,6 +66,7 @@ def taker(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, 
         final[r["execution_id"]] = r  # append-only; the last row of an execution is its outcome
     executed = sorted((r for r in opps if r.get("decision") == "would_execute"), key=lambda r: ms(r["timestamp"]))
     trades = collections.defaultdict(list)
+    by_direction = collections.defaultdict(list)  # (expected, realized gross bps, net usd) per trade
     for r in final.values():
         econ, a, lf = r.get("actual_economics"), r.get("aster_fill"), r.get("lighter_fill")
         if r.get("outcome") != "success" or not econ:
@@ -81,6 +82,7 @@ def taker(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, 
         trades["fees_bps"].append(float(econ["fees_usd"]) / notional * 1e4)
         trades["net_bps"].append(float(econ["net_bps"]))
         trades["net_usd"].append(float(econ["net_usd"]))
+        by_direction[r["direction"]].append((trades["expected_gross_bps"][-1], trades["realized_gross_bps"][-1], trades["net_usd"][-1]))
         if opp:
             buy_aster = r["direction"].endswith("_BUY_" + str(r.get("first_venue", "aster")).upper())
             aster_px, lighter_px = float(a["vwap"]), float(lf["vwap"])
@@ -104,6 +106,10 @@ def taker(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, 
         "hedge_venues": sorted({r.get("hedge_venue") or "lighter" for r in final.values()}),
         "net_usd": round(sum(trades["net_usd"]), 6),
         "edge_kept": round(realized / expected, 3) if expected else None,
+        # A route's two directions can keep very different shares of their edge: CASHCAT-LH's
+        # trades against Lighter's usual premium lost the hedge race (2026-10-27).
+        "by_direction": {d: {"trades": len(xs), "net_usd": round(sum(x[2] for x in xs), 6),
+                             "edge_kept": round(sum(x[1] for x in xs) / sum(x[0] for x in xs), 3)} for d, xs in sorted(by_direction.items())},
         **{k: dist(v) for k, v in trades.items() if k != "net_usd"},
         "outcomes": dict(collections.Counter(r.get("outcome") for r in final.values())),
         "gate": {"decisions": dict(collections.Counter(r.get("decision") for r in opps)),
