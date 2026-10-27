@@ -3182,9 +3182,12 @@ async fn try_missing_hedge_retry(
             report.error = Some("hedge retry did not fill".to_string());
             return report;
         }
+        // The deadline bounds the unhedged leg; a filled retry gets a window of its own to show in
+        // the positions. Hyperliquid can list a fill ~6.5 s late, and its read-back used the
+        // deadline up: recovery then ran on balanced legs (CASHCAT-LH live, 2026-10-27 09:00).
+        let deadline = tokio::time::Instant::now() + timeout;
         let verified = tokio::time::timeout_at(deadline, async { tokio::join!(
-            wait_post_trade_reconciled_for(cfg, spec, aster, lighter, opp,
-                deadline.saturating_duration_since(tokio::time::Instant::now())),
+            wait_post_trade_reconciled_for(cfg, spec, aster, lighter, opp, timeout),
             aster.open_orders_count(&spec.market_id),
             lighter.rest_open_orders_count(&spec.market_id),
         ) }).await;
