@@ -777,14 +777,25 @@ mod tests {
         let mut cfg = crate::dryrun::tests::shipped_config(&market, &dir);
         let arb = &mut cfg.taker.arb;
         (arb.startup_warmup_ms, arb.entry_gate.enabled) = (0, false);
+        let confirm = Duration::from_millis(2000);
+        cfg.taker.markets.iter_mut().filter(|m| m.id().0 == "HYPE-LH").for_each(|m| m.confirm_ms = 2000);
         let fresh = market.keep_fresh();
         let stop = CancellationToken::new();
         let bot = tokio::spawn({
             let (stop, runs) = (stop.clone(), dir.clone());
             async move { run_with(cfg, &runs, "HYPE-LH", LiveMode::DryRun, false, false, stop).await }
         });
-        // Hyperliquid bids 102 while Lighter asks 101.
+        let state = dir.join("dry-run").join("bot-HYPE-LH.state.json");
+        let from_taker = || std::fs::read_to_string(&state).ok().and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .is_some_and(|state| state["rights"] == "taker" && state["accounts"]["taker"]["total_equity_usd"].is_string());
+        for _ in 0..600 {
+            if from_taker() { break; }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(from_taker(), "the controller reads the taker's status: {:?}", std::fs::read_to_string(&state));
+        // Hyperliquid bids 102 while Lighter asks 101, a gap the taker sees within ~1 s.
         market.set_hyperliquid(dec!(102), dec!(103));
+        let opened = std::time::Instant::now();
         let ledger = dir.join("dry-run").join("trades_HYPE-LH.jsonl");
         let row = tokio::time::timeout(Duration::from_secs(60), async {
             loop {
@@ -796,6 +807,7 @@ mod tests {
         })
         .await
         .expect("no hedged trade within 60 s");
+        assert!(opened.elapsed() >= confirm, "the orders went out before the gap held {confirm:?}");
         let confirmed = crate::taker::pnl::EconomicStatus::Confirmed;
         assert_eq!((row.economic_status, row.direction.as_str(), row.first_venue, row.hedge_venue),
             (confirmed, "SELL_HYPERLIQUID_BUY_LIGHTER", FirstVenue::Lighter, HedgeVenue::Hyperliquid), "{row:?}");
@@ -806,14 +818,6 @@ mod tests {
         assert!(lighter.fee_usd.is_zero() && hyperliquid.fee_provenance == crate::taker::types::FeeProvenance::Venue
             && (hyperliquid.fee_usd - fee).abs() < dec!(0.000001), "{row:?}");
         assert!(row.final_net_position.is_zero() && (row.expected_net_usd - row.actual_net_usd).abs() < dec!(0.001), "{row:?}");
-        let state = dir.join("dry-run").join("bot-HYPE-LH.state.json");
-        let from_taker = || std::fs::read_to_string(&state).ok().and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .is_some_and(|state| state["rights"] == "taker" && state["accounts"]["taker"]["total_equity_usd"].is_string());
-        for _ in 0..600 {
-            if from_taker() { break; }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert!(from_taker(), "the controller reads the taker's status: {:?}", std::fs::read_to_string(&state));
         stop.cancel();
         tokio::time::timeout(Duration::from_secs(60), bot).await.expect("the drain hung").unwrap().expect("a clean stop");
         fresh.abort();

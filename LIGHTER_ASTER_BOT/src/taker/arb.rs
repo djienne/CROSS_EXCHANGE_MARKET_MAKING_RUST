@@ -1066,6 +1066,9 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
         .map(|s| tokio::time::Instant::now() + Duration::from_secs(s));
     let mut cooldown_until =
         tokio::time::Instant::now() + Duration::from_millis(cfg.arb.startup_warmup_ms);
+    // Orders go out only for a gap seen `confirm_ms` in a row; `held` is its direction and since when.
+    let confirm = Duration::from_millis(markets[0].confirm_ms);
+    let mut held: Option<(Direction, tokio::time::Instant)> = None;
     let mut trades_executed = 0u64;
     let mut want: Option<Want> = None;
     let mut next_want_id = 0u64;
@@ -1100,7 +1103,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
     let mut woke_for_account_update = false;
 
     info!(
-        "taker arb running: market={} required_gross_edge={}bps desired_notional=${} min_size={} max_trades={:?} observe_only={} exposure_filter={:?} lease_standby={} startup_warmup_ms={} cooldown_ms={} reduce_cooldown_ms={} fees_bps=aster:{} lighter:{} margin_bps={} slippage_bps=aster:{} lighter:{} depth_guard_enabled={} liquidity_multiple={} depth_max_levels={} rescue_breaker=count_per_hour:{} loss_per_hour:${} risk_max_abs_notional=${} risk_mismatch=${} margin_buffer=${}",
+        "taker arb running: market={} required_gross_edge={}bps desired_notional=${} min_size={} max_trades={:?} observe_only={} exposure_filter={:?} lease_standby={} startup_warmup_ms={} cooldown_ms={} reduce_cooldown_ms={} fees_bps=aster:{} lighter:{} margin_bps={} slippage_bps=aster:{} lighter:{} depth_guard_enabled={} liquidity_multiple={} depth_max_levels={} rescue_breaker=count_per_hour:{} loss_per_hour:${} risk_max_abs_notional=${} risk_mismatch=${} margin_buffer=${} confirm_ms={}",
         spec.market_id,
         cfg.arb.required_gross_edge_bps(),
         cfg.arb.desired_notional,
@@ -1124,7 +1127,8 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
         cfg.arb.max_recovered_loss_usdc_per_hour,
         cfg.risk.max_abs_position_notional_usd,
         cfg.risk.max_position_mismatch_usd,
-        cfg.risk.margin_buffer_usd
+        cfg.risk.margin_buffer_usd,
+        confirm.as_millis()
     );
     if cfg.arb.startup_warmup_ms > 0 {
         info!(
@@ -1139,6 +1143,8 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
     // observed live 2026-07-02.)
     let run_result: Result<()> = async {
     loop {
+        // A gap stays held through full evaluations that see it again and skips on unchanged inputs.
+        let seen = held.take();
         if let (Some(tx), Some(w)) = (&options.want, &want) {
             // After one pass under the lease (an execution, or a skip when the edge is gone), or
             // without a grant in time.
@@ -1265,6 +1271,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
         ) {
             // Nothing an evaluation depends on has changed since the last full pass —
             // skip the sizing body this iteration (the staleness gates above already ran).
+            held = seen;
             wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
             continue;
         }
@@ -1468,6 +1475,12 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
             wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
             continue;
         };
+        // Live CASHCAT-LH, 2026-10-27: a gap opened by Lighter moving first is mostly gone from
+        // Hyperliquid's book when the IOC lands ~0.5 s later. Lighter buys on gaps first seen at the
+        // decision lost 16 bps on average (11), on gaps seen up to 1.7 s earlier 3 bps (6).
+        let since = match seen { Some((direction, at)) if direction == opp.direction => at, _ => tokio::time::Instant::now() };
+        held = Some((opp.direction, since));
+        let held_for = since.elapsed();
         if let Some(sanity) = book_sanity.entry_block() {
             if exposure_effect_f64(
                 pos_f.aster_qty,
@@ -1557,7 +1570,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
                 buy_best_qty: opp.buy_best_qty,
                 aster_book_age_ms: aster_book.age_ms(now),
                 lighter_book_age_ms: lighter_book.age_ms(now),
-                force_record: execution_enabled,
+                force_record: execution_enabled && held_for >= confirm,
             },
             cfg.arb.required_gross_edge_bps(),
         );
@@ -1587,7 +1600,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
                 last_gate_log = Some((gate.decision, tokio::time::Instant::now()));
             }
         }
-        if !gate.allow_execution {
+        if !gate.allow_execution || held_for < confirm {
             wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
             continue;
         }
@@ -1702,8 +1715,9 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
                 finish_execution(&execution_epoch);
                 trades_executed += 1;
                 info!(
-                    "trade report count={} expected_net=${} actual_gross=${} actual_fees=${} actual_net=${} actual_net_bps={} fill_qty_mismatch={} aster_fill_qty={} aster_vwap={} aster_notional=${} aster_fee=${} lighter_fill_qty={} lighter_vwap={} lighter_notional=${} lighter_fee=${} available_margin_delta=${} available_before=${} available_after=${} aster_available_before=${} aster_available_after=${} lighter_available_before=${} lighter_available_after=${} final_aster_pos={} final_lighter_pos={} final_net_pos={}",
+                    "trade report count={} held_ms={} expected_net=${} actual_gross=${} actual_fees=${} actual_net=${} actual_net_bps={} fill_qty_mismatch={} aster_fill_qty={} aster_vwap={} aster_notional=${} aster_fee=${} lighter_fill_qty={} lighter_vwap={} lighter_notional=${} lighter_fee=${} available_margin_delta=${} available_before=${} available_after=${} aster_available_before=${} aster_available_after=${} lighter_available_before=${} lighter_available_after=${} final_aster_pos={} final_lighter_pos={} final_net_pos={}",
                     trades_executed,
+                    held_for.as_millis(),
                     opp.expected_net_usd,
                     report.economics.gross_usd,
                     report.economics.fees_usd,
