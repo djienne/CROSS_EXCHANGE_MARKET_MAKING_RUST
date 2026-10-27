@@ -287,10 +287,13 @@ lighter_feed_ms      = [5, 30]
 aster_user_stream_ms = [10, 50]
 lighter_account_ms   = [5, 30]
 # Hyperliquid (its account starts with lighter_balance_usdc and follows lighter_account_ms).
-# Hyperliquid's co-located order latency is 200 ms median / 900 ms p99 (HyperCore overview).
-# Windows IOCs measured 942-973 ms on 2026-09-30, including network and API-to-node forwarding;
-# an info ping removes only the client-to-API trip, so those calls do not set the Tokyo median.
-hyperliquid_rtt_ms  = [200, 900]
+# Its co-located order latency is 200 ms median / 900 ms p99 (HyperCore overview); through the
+# public API it is slower and steadier. The live CASHCAT-LH IOCs from the Tokyo VPS, 2026-10-27,
+# filled (block `time`) 439-606 ms after their send, p10 473 / p50 518 / p90 568 (20), while a
+# kept-alive /info call takes 15-25 ms; at [200, 900] the twin filled them 50-637, p50 238.
+# Effect at 0.9 x RTT: this fits p10/p50/p90 464/517/576. Check bot_stats `lighter_fill_ms`
+# (the hedge's) of the twin against the live bot's.
+hyperliquid_rtt_ms  = [575, 700]
 # Hyperliquid's `time` is the block time and its API publishes ~250 ms later even in Tokyo:
 # l2Book (fast) arrival - time on a Tokyo VPS, 2026-10-10, p50 246 / p90 285 / p99 314 ms (Europe
 # 380 ms). Aster and Lighter stamp near their send time (Tokyo p50 6.5 and 0.8 ms), so their
