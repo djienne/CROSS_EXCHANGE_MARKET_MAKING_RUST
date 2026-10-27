@@ -161,16 +161,21 @@ The `xemm-live` unit, $20 clips, no forced closes. To 2026-10-27 03:11 UTC: 21 t
   - Lighter's filled 309-325 ms after the decision.
   - A kept-alive `/info` call takes 15-25 ms, so the rest of the 518 ms is Hyperliquid's own.
   - The twin had filled the same orders at p50 238 ms; hence `525820a` (Model changes, above).
+    From 03:19 to 08:50 the twin then filled its hedges at p50 533 ms (live 527 ms). Its trades
+    against Lighter's premium also lost: -$0.125 over 3, against live's -$0.084 over 3.
 - **The two directions differ** (`bot_stats.py` `by_direction`):
   - Trades selling Lighter's usual premium kept 77% of their edge: 12 trades, +$0.133.
   - Those buying Lighter under Hyperliquid kept 13%: 8 trades, -$0.042. Their Hyperliquid leg
     filled 9-26 bps worse than decided.
   - Those gaps open when Lighter moves first, and they close before the hedge lands.
   - The trades still free the margin the next premium sale needs.
-- **Two taker bugs:**
+- **Three taker bugs:**
   - `6b3cae6`: the missing-hedge retry reused the missed IOC's decision-price bound, so it
     repeated the miss. It is now priced off fresh REST mids.
   - `3d0f28e`: a Hyperliquid IOC that replied "filled 214" read back as unfilled, because the
     info API still said `unknownOid` 6 s later. Recovery then ran on a balanced position. The
     reply's size now stands.
+  - `117ff28`, at 09:00: a retry filled in 1.1 s, but its fill listed ~6.5 s late. Waiting for
+    it used up the retry's 5 s deadline, and recovery again ran on balanced legs. A filled retry
+    now gets its own window to show in the positions.
 
