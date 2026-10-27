@@ -816,8 +816,9 @@ impl RecoveredFailureTracker {
 enum ExecutionError {
     #[error("{details}")]
     Skipped { details: String },
+    /// `flow`: what the execution's fills did, when all are known (prices the recovery's loss).
     #[error("{details}")]
-    Unreconciled { details: String },
+    Unreconciled { details: String, flow: Option<Flow> },
     #[error("{details}")]
     AccountingUnavailable { details: String },
     #[error("{details}")]
@@ -1338,7 +1339,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
                 begin_execution(&execution_epoch);
                 if let Some(want) = want.as_mut() { want.attempted = true; }
                 let recovery_result =
-                    recover_if_needed(&cfg, &spec, &aster, &lighter, &http, account.margins, &session, &execution_journal).await;
+                    recover_if_needed(&cfg, &spec, &aster, &lighter, &http, account.margins, None, &session, &execution_journal).await;
                 finish_execution(&execution_epoch);
                 match recovery_result {
                     Ok(recovery) => {
@@ -1781,8 +1782,9 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
                     continue;
                 }
                 begin_execution(&execution_epoch);
+                let flow = match &e { ExecutionError::Unreconciled { flow, .. } => *flow, _ => None };
                 let recovery_result =
-                    recover_if_needed(&cfg, &spec, &aster, &lighter, &http, margins, &session, &execution_journal).await;
+                    recover_if_needed(&cfg, &spec, &aster, &lighter, &http, margins, flow, &session, &execution_journal).await;
                 let recovery = recovery_result?;
                 info!(
                     "rescue check complete action_taken={} estimated_loss=${} final_aster_pos={} final_lighter_pos={} lighter_ws={:?} aster_open_orders={} lighter_open_orders={} available_after=${}",
@@ -2697,13 +2699,15 @@ async fn execute_opportunity(
         aster_qty: pre_position.aster_qty + a_sign * a.qty.unwrap_or(Decimal::ZERO),
         lighter_qty: pre_position.lighter_qty - a_sign * l.qty.unwrap_or(Decimal::ZERO),
     };
+    let (first_bps, hedge_bps) = (cfg.arb.aster_taker_fee_bps, cfg.arb.lighter_taker_fee_bps);
+    let mut flows = vec![Flow::of(aster_side, a.fill, first_bps), Flow::of(lighter_side, l.fill, hedge_bps)];
     let mut position = match wait_position_evidence(cfg, spec, aster, lighter, expected, opp.ref_px).await {
         Ok(position) => position,
         Err(error) => {
             row["outcome"] = serde_json::json!("unreconciled");
             row["error"] = serde_json::json!(format!("{error:#}"));
             append_execution_record(journal,row).await?;
-            return Err(ExecutionError::Unreconciled { details: format!("{error:#}") });
+            return Err(ExecutionError::Unreconciled { details: format!("{error:#}"), flow: Flow::sum(flows) });
         }
     };
     let mut hedge_retry_action_taken = false;
@@ -2727,6 +2731,8 @@ async fn execute_opportunity(
                 append_execution_record(journal,row).await?;
                 return Err(ExecutionError::OutcomeUnresolved { details: "hedge retry remains unresolved".to_string() });
             }
+            let bps = if attempt.venue == HedgeRetryVenue::Aster { first_bps } else { hedge_bps };
+            flows.push(Flow::of(attempt.side, attempt.fill, bps));
             match attempt.venue {
                 HedgeRetryVenue::Aster => {
                     aster_retry_fills.push(attempt.fill);
@@ -2746,7 +2752,8 @@ async fn execute_opportunity(
             row["outcome"] = serde_json::json!("unreconciled");
             row["orders"] = serde_json::json!(orders);
             append_execution_record(journal,row).await?;
-            return Err(ExecutionError::Unreconciled { details: retry.error.unwrap_or_else(|| "missing hedge could not be completed".to_string()) });
+            return Err(ExecutionError::Unreconciled { details: retry.error.unwrap_or_else(|| "missing hedge could not be completed".to_string()),
+                flow: Flow::sum(flows) });
         }
     }
     let (a_open, l_open, margin_after, priced) = tokio::join!(aster.open_orders_count(&spec.market_id),
@@ -3310,6 +3317,7 @@ async fn wait_post_trade_reconciled_for(
                         details: format!(
                             "post-trade position query kept failing (positions unverified): {e:#}"
                         ),
+                        flow: None,
                     });
                 }
                 warn!("post-trade position query failed; retrying: {e:#}");
@@ -3326,6 +3334,7 @@ async fn wait_post_trade_reconciled_for(
                     "post-trade residual too large after wait: aster={} lighter={} net_notional=${}",
                     pos.aster_qty, pos.lighter_qty, net_notional
                 ),
+                flow: None,
             });
         }
     }
@@ -3333,7 +3342,7 @@ async fn wait_post_trade_reconciled_for(
 
 async fn recover_if_needed(
     cfg: &Config, spec: &MarketSpec, aster: &FirstLeg, lighter: &OtherLeg,
-    http: &reqwest::Client, margin_before: MarginSnapshot, session: &ActiveSession,
+    http: &reqwest::Client, margin_before: MarginSnapshot, mut flow: Option<Flow>, session: &ActiveSession,
     journal: &ExecutionJournal,
 ) -> Result<RecoveryReport> {
     let execution_id = next_execution_id();
@@ -3362,9 +3371,10 @@ async fn recover_if_needed(
                     lighter.rest_open_orders_count(&spec.market_id), reconcile_margins(aster, lighter));
                 anyhow::ensure!(a_open? == 0 && l_open? == 0, "recovery has unverified/live open orders");
                 let margins = margins?;
+                let loss = realized_recovery_loss([flow], mark).unwrap_or_else(|| estimated_recovery_loss(margin_before, margins));
                 return Ok::<_, anyhow::Error>(RecoveryReport { execution_id: execution_id.clone(), action_taken,
                     position, lighter_ws_qty: lighter_ws_divergence(aster, lighter, &spec.market_id, position).0,
-                    margin_after: margins, estimated_loss_usdc: estimated_recovery_loss(margin_before, margins),
+                    margin_after: margins, estimated_loss_usdc: loss,
                     aster_open_orders: 0, lighter_open_orders: 0 });
             }
             anyhow::ensure!(attempt < 3, "recovery residual remains after three close attempts");
@@ -3403,6 +3413,8 @@ async fn recover_if_needed(
             if !a_evidence.terminal || !l_evidence.terminal {
                 bail!("recovery close terminal evidence unavailable; no further close may be submitted");
             }
+            flow = Flow::sum([flow, Flow::of(side, a_evidence.fill, cfg.arb.aster_taker_fee_bps),
+                Flow::of(side, l_evidence.fill, cfg.arb.lighter_taker_fee_bps)]);
             // The next attempt sizes from REST positions: wait until they show these closes, or
             // a lagging read would close the same residual twice.
             let sign = if side == Side::Buy { Decimal::ONE } else { -Decimal::ONE };
@@ -3444,6 +3456,40 @@ async fn recover_if_needed(
 fn session_marked_loss(baseline: Decimal, current: Decimal, limit: Decimal) -> Option<Decimal> {
     let loss = baseline-current;
     (loss >= limit).then_some(loss)
+}
+
+/// What fills did to the account: cash in (sales less purchases and fees) and base bought.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Flow {
+    cash: Decimal,
+    qty: Decimal,
+}
+
+impl Flow {
+    /// `None` for a fill not known; a fee not known from the venue counts at `fee_bps`.
+    fn of(side: Side, fill: Option<FillSummary>, fee_bps: Decimal) -> Option<Self> {
+        let fill = fill?;
+        let fee = match fill.fee_provenance {
+            FeeProvenance::Venue => fill.fee_usd,
+            _ => fill.fee_usd.max(fill.notional * fee_bps / Decimal::from(10_000)),
+        };
+        let sign = if side == Side::Buy { -Decimal::ONE } else { Decimal::ONE };
+        Some(Self { cash: sign * fill.notional - fee, qty: -sign * fill.qty })
+    }
+
+    fn sum(flows: impl IntoIterator<Item = Option<Self>>) -> Option<Self> {
+        flows.into_iter().try_fold(Self::default(), |sum, flow| flow.map(|flow| Self { cash: sum.cash + flow.cash, qty: sum.qty + flow.qty }))
+    }
+}
+
+/// A failed execution's loss from its own and recovery's fills, once the legs are balanced
+/// again: pairs at their fill prices, as every trade is booked, and a residual left within the
+/// mismatch tolerance at `mark`. The equity delta ([`estimated_recovery_loss`]) also carries the
+/// hedged inventory's marks: it booked $0.33 for fills that lost $0.078 with 860 CASHCAT held a
+/// side (CASHCAT-LH live, 2026-10-27 10:48). `None` while a fill is not known.
+fn realized_recovery_loss(flows: impl IntoIterator<Item = Option<Flow>>, mark: Decimal) -> Option<Decimal> {
+    let flow = Flow::sum(flows)?;
+    Some((-(flow.cash + flow.qty * mark)).max(Decimal::ZERO))
 }
 
 /// Estimated realized loss across a recovery window. Prefers the total-equity delta:
@@ -4470,6 +4516,22 @@ mod tests {
         let before = margin_snapshot(dec!(100), dec!(100), Some(dec!(180)), Some(dec!(120)));
         let after = margin_snapshot(dec!(140), dec!(100), Some(dec!(175)), Some(dec!(115)));
         assert_eq!(estimated_recovery_loss(before, after), dec!(10));
+    }
+
+    #[test]
+    fn a_recovery_loss_is_priced_by_its_fills_not_the_inventory_marks() {
+        let fill = |qty, notional, fee, fee_provenance| Some(FillSummary { qty, vwap: notional / qty, notional, fee_usd: fee, fee_provenance });
+        // CASHCAT-LH 2026-10-27 10:48: bought 199 on Lighter, both Hyperliquid sells missed, and
+        // recovery sold 199 there (fee unknown: 4.5 bps). Equity had booked $0.33.
+        let bought = Flow::of(Side::Buy, fill(dec!(199), dec!(19.86418), dec!(0), FeeProvenance::Venue), dec!(0));
+        let missed = Flow::of(Side::Sell, Some(FillSummary::zero()), dec!(4.5));
+        let closed = Flow::of(Side::Sell, fill(dec!(199), dec!(19.795376), dec!(0), FeeProvenance::Unknown), dec!(4.5));
+        let loss = realized_recovery_loss([bought, missed, closed], dec!(0.0995)).unwrap();
+        assert!((loss - dec!(0.0777)).abs() < dec!(0.0001), "{loss}");
+        // A residual left within tolerance counts at the mark; an unknown fill prices nothing.
+        let part = Flow::of(Side::Sell, fill(dec!(190), dec!(18.9), dec!(0), FeeProvenance::Venue), dec!(0));
+        assert_eq!(realized_recovery_loss([bought, part], dec!(0.1)).unwrap(), dec!(0.06418));
+        assert_eq!(realized_recovery_loss([bought, None], dec!(0.1)), None);
     }
 
     #[test]

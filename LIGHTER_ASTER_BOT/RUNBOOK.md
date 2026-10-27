@@ -486,7 +486,9 @@ position does not prove no fill. A known missing hedge gets one retry within
 (the missed order's decision-price bound would miss again); one that ends unfilled hands over at
 once, and a filled one has another `hedge_retry_timeout_ms` to show in the positions. Recovery then closes only the same-sign net residual, and an unresolved retry or close
 stops further submissions. The ledger's `actual_net_usd` is
-matched spread capture minus fees, and recovery rows are conservative equity-delta estimates.
+matched spread capture minus fees, and a recovery row prices the failed execution's and its
+closes' fills the same way. It falls back to a conservative equity-delta estimate when a fill is
+unknown, and that estimate also moves with the held inventory's marks.
 
 **XEMM.** Stale books block new exposure. A timeout, a balanced position snapshot or an empty
 open-order list never proves that an order did not execute: an unresolved attempt stays
