@@ -565,7 +565,8 @@ pub struct MarketCfg {
     pub market_id: Option<String>,
     /// This market's order size, in place of `[taker.arb] desired_notional`.
     pub desired_notional: Option<Decimal>,
-    /// How long a gap must stay in view, in ms, before its orders go out (0: at once).
+    /// The gap must still show in a hedge book the venue stamped this many ms after the gap
+    /// appeared before its orders go out (0: at once).
     #[serde(default)]
     pub confirm_ms: u64,
 }

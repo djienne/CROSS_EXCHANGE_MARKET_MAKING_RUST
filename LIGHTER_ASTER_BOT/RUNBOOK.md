@@ -72,8 +72,9 @@ cargo build --release --locked        # Rust 1.92; the Lighter signers exist for
 - A `[[taker.markets]]` entry names its coin only: Lighter's listing gives the market index,
   decimals and minimums, so an order is at least Lighter's minimum base amount and $10.50 on
   either venue. Its `desired_notional` sizes that market's orders in place of `[taker.arb]`'s,
-  and its `confirm_ms` (default 0) sends them only once a gap has stayed in view that long, in
-  the same direction. Each trade report logs the gap's `held_ms`.
+  and its `confirm_ms` (default 0) sends them only once a hedge book the venue stamped that long
+  after the gap appeared still shows it, in the same direction. Each trade report logs that
+  stamp's distance from the gap's first sight as `held_ms`.
 - The taker refuses to start on a delisted Hyperliquid coin, on a coin whose legs' mids are over
   5% apart (two tokens under one name), and on one whose common size step is worth more than
   `max_position_mismatch_usd`: a partial fill could leave a residual that recovery cannot close

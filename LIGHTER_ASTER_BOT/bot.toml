@@ -119,8 +119,9 @@ first_venue = "lighter"
 lighter_symbol = "CASHCAT"
 hedge_venue = "hyperliquid"
 desired_notional = "20"
-# Orders go out once a gap has held 500 ms. The Hyperliquid IOC lands ~0.5 s after the decision,
-# and the gaps that closed faster (Lighter moving first) lost 16 bps a trade live (2026-10-27).
+# Orders go out once a Hyperliquid book stamped 500 ms after the gap appeared still shows it. The
+# IOC lands ~0.5 s after the decision, and the gaps that closed faster (Lighter moving first) lost
+# 16 bps a trade live (2026-10-27).
 confirm_ms = 500
 
 [maker.edge]
