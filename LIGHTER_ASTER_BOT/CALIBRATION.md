@@ -14,6 +14,9 @@ code change.
   state per quantity; ~15% of simulated Hyperliquid hedges had failed as no-match (2026-10-12).
   `175d7e5`: a resubscribe snapshot no longer runs before its break, which had left the Lighter
   book unknown until the next snapshot.
+- 2026-10-27 (`525820a`): `[dry_run] hyperliquid_rtt_ms` went from `[200, 900]` to
+  `[575, 700]`, the live bot's Tokyo IOCs (CASHCAT-LH on the VPS, below). The VPS dry runs
+  adopted it at 03:18:39 UTC; reports across that restart mix models.
 - A live-vs-twin comparison should run the twin with the live host's measured latencies (from
   Windows: Aster ~350 ms per order call, Hyperliquid ~950 ms per action), not the Tokyo profile;
   otherwise fill-rate differences mix location with simulator fidelity. With a handful of fills
@@ -147,4 +150,27 @@ account value, cost $0.165 (fees $0.072, funding ~0).
   averaged ~0 bps/h, with Lighter's hourly rate swinging by up to ±3-9 bps.
 - A forced close mid-cycle pays the premium back; the screener's profit comes from round trips
   over days. Two hours of one-way trades test the mechanics, not the economics.
+
+## CASHCAT-LH on the Tokyo VPS, from 2026-10-26 22:53 UTC
+
+The `xemm-live` unit, $20 clips, no forced closes. To 2026-10-27 03:11 UTC: 21 trades, net
++$0.11, and the paired position held at the margin cap (862 a side).
+
+- **Hyperliquid is the slow leg:**
+  - Its IOCs filled (block `time`) 439-606 ms after their send: p50 518 ms over 20 orders.
+  - Lighter's filled 309-325 ms after the decision.
+  - A kept-alive `/info` call takes 15-25 ms, so the rest of the 518 ms is Hyperliquid's own.
+  - The twin had filled the same orders at p50 238 ms; hence `525820a` (Model changes, above).
+- **The two directions differ** (`bot_stats.py` `by_direction`):
+  - Trades selling Lighter's usual premium kept 77% of their edge: 12 trades, +$0.133.
+  - Those buying Lighter under Hyperliquid kept 13%: 8 trades, -$0.042. Their Hyperliquid leg
+    filled 9-26 bps worse than decided.
+  - Those gaps open when Lighter moves first, and they close before the hedge lands.
+  - The trades still free the margin the next premium sale needs.
+- **Two taker bugs:**
+  - `6b3cae6`: the missing-hedge retry reused the missed IOC's decision-price bound, so it
+    repeated the miss. It is now priced off fresh REST mids.
+  - `3d0f28e`: a Hyperliquid IOC that replied "filled 214" read back as unfilled, because the
+    info API still said `unknownOid` 6 s later. Recovery then ran on a balanced position. The
+    reply's size now stands.
 
