@@ -104,7 +104,7 @@ Wants=network-online.target
 
 [Service]
 WorkingDirectory=/root/xemm/LIGHTER_ASTER_BOT
-ExecStart=/root/xemm/LIGHTER_ASTER_BOT/target/release/lighter_aster_bot run --market {market} --mode live
+ExecStart=/root/xemm/LIGHTER_ASTER_BOT/target/release/lighter_aster_bot run --market {market} --mode live{ack}
 Restart=no
 KillSignal=SIGINT
 TimeoutStopSec=460
@@ -257,9 +257,10 @@ def unit_files():
     return "".join(f"cat > /etc/systemd/system/{u}.service <<'EOF'\n{UNIT.format(market=m)}EOF\n" for u, m in DRY_RUNS.items())
 
 
-def live(action):
+def live(action, ack=False):
     """`creds` uploads lighter.env and hyperliquid.env at mode 600 (never printed); `start` (re)writes
-    the unit and starts it unless it runs; `stop` drains it (SIGINT, up to 460 s)."""
+    the unit and starts it unless it runs (`start --ack-breaker`: this once, after a breaker halt
+    was reviewed); `stop` drains it (SIGINT, up to 460 s)."""
     if action == "creds":
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tar:
@@ -271,7 +272,8 @@ def live(action):
                     tar.addfile(info, f)
         ssh(f"umask 077 && tar -x --no-same-owner -C {REMOTE} && chmod 600 {REMOTE}/*.env && ls -l {REMOTE}/*.env", stdin=buf.getvalue())
     elif action == "start":
-        ssh(f"cat > /etc/systemd/system/{LIVE}.service <<'EOF'\n{LIVE_UNIT.format(market=LIVE_MARKET)}EOF\n"
+        unit = LIVE_UNIT.format(market=LIVE_MARKET, ack=" --ack-breaker" if ack else "")
+        ssh(f"cat > /etc/systemd/system/{LIVE}.service <<'EOF'\n{unit}EOF\n"
             f"systemctl daemon-reload && if systemctl is-active -q {LIVE}; then echo already running; else systemctl start {LIVE}; fi"
             f" && sleep 5 && systemctl --no-pager status {LIVE} | head -5")
     elif action == "stop":
@@ -402,7 +404,7 @@ def main():
     elif cmd == "screener":
         screener()
     elif cmd == "live":
-        live(sys.argv[2] if len(sys.argv) > 2 else "status")
+        live(sys.argv[2] if len(sys.argv) > 2 else "status", "--ack-breaker" in sys.argv[3:])
     elif cmd == "pull":
         # It starts over after a dropped connection: every step is idempotent.
         for attempt in range(3):
