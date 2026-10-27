@@ -17,6 +17,8 @@ code change.
 - 2026-10-27 (`525820a`): `[dry_run] hyperliquid_rtt_ms` went from `[200, 900]` to
   `[575, 700]`, the live bot's Tokyo IOCs (CASHCAT-LH on the VPS, below). The VPS dry runs
   adopted it at 03:18:39 UTC; reports across that restart mix models.
+- 2026-10-27 (`ad3be0c`): CASHCAT-LH's orders wait for a gap held 500 ms (`confirm_ms`), live
+  from 22:29:43 UTC and in the twin from 22:30:55; reports across those restarts mix policies.
 - A live-vs-twin comparison should run the twin with the live host's measured latencies (from
   Windows: Aster ~350 ms per order call, Hyperliquid ~950 ms per action), not the Tokyo profile;
   otherwise fill-rate differences mix location with simulator fidelity. With a handful of fills
@@ -169,7 +171,15 @@ The `xemm-live` unit, $20 clips, no forced closes. To 2026-10-27 03:11 UTC: 21 t
     filled 9-26 bps worse than decided.
   - Those gaps open when Lighter moves first, and they close before the hedge lands.
   - The trades still free the margin the next premium sale needs.
-- **Three taker bugs:**
+  - To the 11:31 halt (43 trades, priced by their fills): premium sales +$0.250 over 23,
+    Lighter buys -$0.500 over 20. The live opportunity samples (<= 1/s) show which: Lighter buys
+    on gaps first seen at the decision lost 15.7 bps on average (11, 2 won), those on gaps in
+    view up to 1.7 s earlier 3.4 bps (6). Hence `confirm_ms = 500` (`ad3be0c`), about the
+    Hyperliquid IOC's own latency; each trade report logs its gap's `held_ms`.
+- **Breaker halts:** each successful hedge retry counts toward the 3-an-hour limit, so a fast
+  market halted live at 11:31 (4 retries, all rebalanced within 2.7 s) and the twin at 11:28.
+  A halted dry run parks until restarted: the twin then sat out 11 h.
+- **Four taker bugs:**
   - `6b3cae6`: the missing-hedge retry reused the missed IOC's decision-price bound, so it
     repeated the miss. It is now priced off fresh REST mids.
   - `3d0f28e`: a Hyperliquid IOC that replied "filled 214" read back as unfilled, because the
@@ -178,4 +188,8 @@ The `xemm-live` unit, $20 clips, no forced closes. To 2026-10-27 03:11 UTC: 21 t
   - `117ff28`, at 09:00: a retry filled in 1.1 s, but its fill listed ~6.5 s late. Waiting for
     it used up the retry's 5 s deadline, and recovery again ran on balanced legs. A filled retry
     now gets its own window to show in the positions.
+  - `5be2efc`, at 10:48: both Hyperliquid sells missed a 50 bps drop, and recovery sold the 199
+    for a real loss of $0.078. The loss estimate from the equity delta carried the marks of the
+    860-a-side inventory, said $0.33, and tripped the $0.25/h breaker. A recovery is now priced
+    by its fills.
 
