@@ -96,24 +96,32 @@ impl HyperliquidVenue {
         (outcome, None)
     }
 
-    /// The order's end and its fills with their fees, by cloid. Waits at least until an unknown
-    /// order is final ([`resolution_timeout`]), whatever `timeout` says.
-    pub async fn resolve_order_terminal(&self, market: &MarketId, client_order_index: i64, timeout: Duration) -> Result<LighterFillConfirmation> {
+    /// The order's end and its fills with their fees, by cloid. `reply` is the fill the venue
+    /// answered: the size its listed fills must reach, standing with its fee unknown if they never
+    /// are. The info API can lag the exchange: 6 s after a "filled 214" reply it still said
+    /// "unknown order", which read back as no fill (CASHCAT-LH live, 2026-10-27). Waits at least
+    /// until an unknown order is final ([`resolution_timeout`]), whatever `timeout` says.
+    pub async fn resolve_order_terminal(&self, market: &MarketId, client_order_index: i64, reply: Option<FillSummary>, timeout: Duration) -> Result<LighterFillConfirmation> {
         self.check(market)?;
         let (cloid, sent_ms) = (cloid(client_order_index), client_order_index / 1000);
         let timeout = resolution_timeout(timeout, client_order_index, Utc::now().timestamp_millis());
+        let reply = reply.filter(|fill| fill.qty > Decimal::ZERO);
         let fills = tokio::time::timeout(timeout, async {
             loop {
                 let unknown_is_final = Utc::now().timestamp_millis() > sent_ms + ORDER_TTL_MS as i64 + 1_000;
-                if let Some(fills) = self.client.ioc_fills(&cloid, sent_ms - FILLS_LOOKBACK_MS, None, unknown_is_final).await {
+                if let Some(fills) = self.client.ioc_fills(&cloid, sent_ms - FILLS_LOOKBACK_MS, reply.map(|fill| fill.qty), unknown_is_final).await {
                     break fills;
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         })
-        .await
-        .with_context(|| format!("Hyperliquid order {cloid} unresolved within {timeout:?}"))?;
-        Ok(confirmation(client_order_index, &fills))
+        .await;
+        match (fills, reply) {
+            (Ok(fills), _) => Ok(confirmation(client_order_index, &fills)),
+            (Err(_), Some(fill)) => Ok(LighterFillConfirmation { fee_evidence: Vec::new(), fill: Some(fill), filled_qty: fill.qty,
+                terminal_order: Some(RemoteOrder { client_order_index: Some(client_order_index), status: Some("filled".into()), ..Default::default() }) }),
+            (Err(_), None) => bail!("Hyperliquid order {cloid} unresolved within {timeout:?}"),
+        }
     }
 
     async fn state(&self) -> Result<Value> {
@@ -308,6 +316,39 @@ mod tests {
         let unpriced = confirmation(1, &[json!({"sz": "0.5", "px": "40", "tid": 7, "oid": 9})]).fill.unwrap();
         assert_eq!(unpriced.fee_provenance, FeeProvenance::Unknown, "a fill without its fee is not a venue fee of 0");
         assert!(confirmation(1, &[]).fill.is_some_and(|f| f.qty.is_zero()), "no fill is a terminal zero");
+    }
+
+    /// An info API that has not caught up: no order behind the cloid, no fills listed.
+    struct Lagging;
+    impl crate::dryrun::server::Handler for Lagging {
+        async fn rest(&self, _lane: u64, request: crate::dryrun::server::Request) -> crate::dryrun::server::Response {
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+            crate::dryrun::server::Response::json(200, if body["type"] == "orderStatus" { r#"{"status":"unknownOid"}"# } else { "[]" })
+        }
+        async fn websocket(&self, _lane: u64, _request: crate::dryrun::server::Request,
+            _ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {}
+    }
+
+    /// A filled reply is never read back as no fill: past the order's expiry the lagging API makes
+    /// a lost reply a terminal zero, but a reply that said "filled" stands, fee unknown.
+    #[tokio::test]
+    async fn a_filled_reply_outlasts_a_lagging_read_back() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(crate::dryrun::server::serve(listener, Arc::new(Lagging)));
+        let client = Client::new(&base, HyperliquidCreds::dry_run()).unwrap();
+        let asset = asset_in(&json!({"universe": [{"name": "HYPE", "szDecimals": 2}]}), "HYPE").unwrap();
+        let market = MarketId("HYPE-LH".into());
+        let venue = HyperliquidVenue { client, asset, market: market.clone(), book: Arc::new(Book::default()) };
+        // Sent a minute ago: an unknown order is final, and the budget is not stretched.
+        let index = (Utc::now().timestamp_millis() - 60_000) * 1000;
+        let budget = Duration::from_millis(600);
+        let lost = venue.resolve_order_terminal(&market, index, None, budget).await.unwrap();
+        assert!(lost.filled_qty.is_zero() && lost.terminal_order.is_some_and(|o| o.is_terminal()));
+        let reply = FillSummary::from_qty_notional(dec!(214), dec!(19.92), Decimal::ZERO).map(|f| f.with_fee_provenance(FeeProvenance::Unknown));
+        let kept = venue.resolve_order_terminal(&market, index, reply, budget).await.unwrap();
+        assert_eq!((kept.filled_qty, kept.fill.unwrap().fee_provenance), (dec!(214), FeeProvenance::Unknown));
+        assert!(kept.terminal_order.is_some_and(|o| o.is_terminal()));
     }
 
     /// A lost reply resolves only past the order's `expiresAfter`, so a shorter budget (the hedge

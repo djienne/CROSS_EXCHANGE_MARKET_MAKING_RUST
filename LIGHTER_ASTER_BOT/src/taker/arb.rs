@@ -2569,9 +2569,9 @@ pub(crate) async fn resolve_lighter_evidence(
     spec: &MarketSpec, lighter: &impl TerminalOrders, outcome: &LighterOutcome,
     mut pending: Option<PendingFill>, side: Side, qty: Decimal, timeout: Duration,
 ) -> LegEvidence {
-    let client = match outcome {
-        LighterOutcome::Accepted { client_order_index, .. }
-        | LighterOutcome::Unknown { client_order_index, .. } => *client_order_index,
+    let (client, reply) = match outcome {
+        LighterOutcome::Accepted { client_order_index, fill, .. } => (*client_order_index, *fill),
+        LighterOutcome::Unknown { client_order_index, .. } => (*client_order_index, None),
         _ => return LegEvidence::not_submitted(),
     };
     let start = tokio::time::Instant::now();
@@ -2586,7 +2586,7 @@ pub(crate) async fn resolve_lighter_evidence(
         || value.fill.as_ref().is_none_or(|fill| fill.fee_provenance != FeeProvenance::Venue));
     if needs_history {
         let remaining = timeout.saturating_sub(start.elapsed());
-        let history = lighter.resolve_order_terminal(&spec.market_id, client, side, remaining);
+        let history = lighter.resolve_order_terminal(&spec.market_id, client, side, reply, remaining);
         tokio::pin!(history);
         if let Some(pending) = pending.as_mut() {
             let stream = pending.observe_confirmed(remaining);

@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 use crate::taker::aster::rest::AsterRest;
 use crate::taker::aster::ws::AsterBookFeed;
 use crate::taker::book::OrderBook;
-use crate::taker::types::{MarketId, Side};
+use crate::taker::types::{FillSummary, MarketId, Side};
 use hyperliquid::HyperliquidVenue;
 use lighter::{LighterAccountSnapshot, LighterFillConfirmation, LighterMarginSnapshot, LighterVenue, PendingFill, SubmitOutcome};
 
@@ -114,24 +114,25 @@ impl OtherLeg {
 }
 
 /// An order's end by its client index: what the evidence resolver reads, from the arbitrage's
-/// leg or from the Lighter-only diagnostics' venue.
+/// leg or from the Lighter-only diagnostics' venue. `reply` is the fill the submission's answer
+/// carried (Hyperliquid's IOCs; Lighter's read-back does without).
 pub trait TerminalOrders: Sync {
-    fn resolve_order_terminal(&self, market: &MarketId, client_order_index: i64, side: Side, timeout: Duration)
+    fn resolve_order_terminal(&self, market: &MarketId, client_order_index: i64, side: Side, reply: Option<FillSummary>, timeout: Duration)
         -> impl Future<Output = Result<LighterFillConfirmation>> + Send;
 }
 
 impl TerminalOrders for LighterVenue {
-    fn resolve_order_terminal(&self, market: &MarketId, client_order_index: i64, side: Side, timeout: Duration)
+    fn resolve_order_terminal(&self, market: &MarketId, client_order_index: i64, side: Side, _reply: Option<FillSummary>, timeout: Duration)
         -> impl Future<Output = Result<LighterFillConfirmation>> + Send {
         LighterVenue::resolve_order_terminal(self, market, client_order_index, side, timeout)
     }
 }
 
 impl TerminalOrders for OtherLeg {
-    async fn resolve_order_terminal(&self, market: &MarketId, client_order_index: i64, side: Side, timeout: Duration) -> Result<LighterFillConfirmation> {
+    async fn resolve_order_terminal(&self, market: &MarketId, client_order_index: i64, side: Side, reply: Option<FillSummary>, timeout: Duration) -> Result<LighterFillConfirmation> {
         match self {
             Self::Lighter(l) => l.resolve_order_terminal(market, client_order_index, side, timeout).await,
-            Self::Hyperliquid(h) => h.resolve_order_terminal(market, client_order_index, timeout).await,
+            Self::Hyperliquid(h) => h.resolve_order_terminal(market, client_order_index, reply, timeout).await,
         }
     }
 }
