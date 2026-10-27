@@ -19,6 +19,9 @@ code change.
   adopted it at 03:18:39 UTC; reports across that restart mix models.
 - 2026-10-27 (`ad3be0c`): CASHCAT-LH's orders wait for a gap held 500 ms (`confirm_ms`), live
   from 22:29:43 UTC and in the twin from 22:30:55; reports across those restarts mix policies.
+  From `58ca5b0` (live 23:16:45, the twin ~23:18) the 500 ms count in the hedge venue's own book
+  stamps: the local hold had still lost both Lighter buys after it, on Hyperliquid books
+  464-642 ms old.
 - A live-vs-twin comparison should run the twin with the live host's measured latencies (from
   Windows: Aster ~350 ms per order call, Hyperliquid ~950 ms per action), not the Tokyo profile;
   otherwise fill-rate differences mix location with simulator fidelity. With a handful of fills
