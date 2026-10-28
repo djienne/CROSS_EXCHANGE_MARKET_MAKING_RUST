@@ -67,9 +67,10 @@ The reports need Python 3.
 
 The four dry runs (`HYPE`, `HYPE-HL`, `HYPE-LH`, `CASHCAT-LH`), the recorder of HYPE's public
 feeds for backtests and the pair screener's collector run only on the Tokyo VPS ([VPS.md](VPS.md)),
-and a live bot can run there in its own unit (`python vps.py live`).
-`python vps.py pull` copies their files home daily, to `LIGHTER_ASTER_BOT/runs/tokyo/dry-run/`,
-`LIGHTER_ASTER_BOT/data-tokyo/HYPE/` and `SCREENER/data-tokyo/`.
+and the live bot (`CASHCAT-LH`) runs there in its own unit, `xemm-live` (`python vps.py live`).
+`python vps.py pull` copies their files home daily, to `LIGHTER_ASTER_BOT/runs/tokyo/` (the live
+bot's; the dry runs' in `dry-run/` there), `LIGHTER_ASTER_BOT/data-tokyo/HYPE/` and
+`SCREENER/data-tokyo/`.
 
 The runbook covers the [dry run](LIGHTER_ASTER_BOT/RUNBOOK.md#dry-run) (model, halts,
 diagnostics), [going live](LIGHTER_ASTER_BOT/RUNBOOK.md#going-live) and the
@@ -79,8 +80,9 @@ diagnostics), [going live](LIGHTER_ASTER_BOT/RUNBOOK.md#going-live) and the
 
 Run them from the repository root.
 
-- By default they read the live bot's records in `LIGHTER_ASTER_BOT/runs/`; `trade_history.py`
-  keeps its database in the root `runs/`.
+- By default they read this PC's live records in `LIGHTER_ASTER_BOT/runs/`; `trade_history.py`
+  keeps its database in the root `runs/`. The VPS live bot's copy is `LIGHTER_ASTER_BOT/runs/tokyo/`
+  (`combined_pnl.py`/`bot_stats.py --market CASHCAT-LH --runs LIGHTER_ASTER_BOT/runs/tokyo`).
 - With `--dry-run` they read only the Tokyo copy, `LIGHTER_ASTER_BOT/runs/tokyo/dry-run/`
   (`--runs LIGHTER_ASTER_BOT/runs/dry-run` for this PC's). Without `--since` they count from the
   dry run's first start, and their window ends at the copy's time (`pulled_at.txt`).
@@ -97,8 +99,8 @@ python3 bot_stats.py --market HYPE --dry-run      # execution quality and health
 
 `bot_stats.py` explains the totals:
 
-- **Taker:** expected vs realized edge, how much each leg filled worse than the decision price,
-  book ages, fill delays and the entry gate's decisions.
+- **Taker:** expected vs realized edge (per direction too), how much each leg filled worse than
+  the decision price, book ages, fill delays and the entry gate's decisions.
 - **XEMM and controller:** XEMM edge and hedge delay, XEMM's hand-overs to the taker, controller
   halts and network pauses.
 - **Dry run:** the simulator's late frames (host freezes separated), latencies against the

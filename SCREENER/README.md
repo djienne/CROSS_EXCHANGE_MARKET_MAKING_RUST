@@ -6,9 +6,9 @@ runs apart from the bot, with its own crate, image, container and data.
 
 <!-- ft-facts: container=aster-lighter-screener image=aster_lighter_screener:latest -->
 
-- **`collect`** (the container) follows best bid/offer and trades, subscribing once per venue
-  instrument and sharing updates between pairs. It records only the moments the report could
-  trade on, plus 5-minute summaries per pair:
+- **`collect`** (`xemm-screener` on the Tokyo VPS) follows best bid/offer and trades, subscribing
+  once per venue instrument and sharing updates between pairs. It records only the moments the
+  report could trade on, plus 5-minute summaries per pair:
   - **taker:** an edge reaching the bot's entry gate (the 90th percentile of its samples over 72 h),
     whose samples the summaries count;
   - **XEMM:** a trade that could have filled a quote at the lowest edge scored (5 bps), with the
@@ -16,9 +16,10 @@ runs apart from the bot, with its own crate, image, container and data.
   - each moment keeps two seconds after it (where latency-delayed orders fill).
 - **`report`** applies a simplified model of the bot's rules and ranks the pairs.
   - **Taker-taker:** the entry gate (also at least the required edge plus 0.5 bps, the bot's
-    `min_extra_bps`), cooldown, inventory cap and each leg's latency. `confirm_ms` holds a gap as
-    the bot's per-market setting does, on the hedge venue's stamps (arrival replay of v3+ data); the
-    recording shows a gap first at the start of its moment, so the hold may end later than the bot's.
+    `min_extra_bps`), cooldown, inventory cap and each leg's latency. `confirm_ms` (`[report.taker]`,
+    0 by default) holds a gap as the bot's per-market setting does, on the hedge venue's stamps
+    (arrival replay of v3+ data, so not with `--scenario`); the recording shows a gap first at the
+    start of its moment, so the hold may end later than the bot's.
   - **XEMM:** the quote price, a fill only when trades print through the quote (those of one ms
     add up), the hedge latency and the distance gate (skipped behind a maker top thinner than the
     bot's depth). Both sides quote a clip, as the bot (`reduce_position_only = false`); the side that
@@ -46,8 +47,9 @@ runs apart from the bot, with its own crate, image, container and data.
   is capped at 5 s, with connection/subscription time added: an outage records a gap, except its
   first 30 s, which keep the last prices (a 60 s cut, 2026-09-26: 33 s down, every pair back
   within seconds).
-- **Restarts.** After a reboot or a crash, Docker restarts the container (`unless-stopped`). The
-  writer flushes every 30 s; an unclean stop can lose queued or unflushed data.
+- **Restarts.** After a reboot or a crash, systemd restarts it on the VPS (Docker's
+  `unless-stopped` here). The writer flushes every 30 s; an unclean stop can lose queued or
+  unflushed data.
 
 Hyperliquid uses public `bbo`, `l2Book` and `trades`. BBO gives the faster touch; L2 confirms an
 unchanged book. `l2Book` is subscribed `fast` (5 levels, every ~0.54 s instead of 20 every
@@ -62,10 +64,10 @@ stale Hyperliquid book invalidates only its own pairs. No credentials or order c
 docker compose up -d --build screener               # collect on this PC: never while the Tokyo VPS does
 docker compose logs -f                              # traffic and memory every 5 min
 docker compose run --rm screener universe           # today's pairs, with their Aster taker fee
-docker compose run --rm report                      # the ranking, from all the data
+docker compose run --rm report                      # the ranking of data/ (this PC's, to 2026-10-10)
 docker compose run --rm report --since 2026-09-27 --lighter premium --json
 docker compose run --rm report --latency 2          # sensitivity: every latency doubled
-docker compose run --rm report --since 2026-10-11 --scenario tokyo   # on the venues' clocks (v4 days)
+docker compose run --rm report --data data-tokyo --since 2026-10-27 --scenario tokyo   # venue clocks
 ```
 
 `report` is its own service (profile `report`, never started by `up`): it holds every recorded
@@ -81,7 +83,8 @@ less memory (10-17 at N=3: 0.67 GB instead of 1.36). `screener_summary.py` picks
   `0` is the left venue, `1` the right. `xf0` means maker on 0, hedge on 1; `xf1` reverses them.
 - **Units / coverage.** $/day at one $13 clip, divided by the time both books were known.
   `days` and `down%` show coverage; `unres` counts fixed-strategy fills with an unknown delayed
-  book or one not recorded, whose PnL cannot be estimated. JSON includes each leg's fees/delays and daily results.
+  book or one not recorded, whose PnL cannot be estimated. JSON includes each leg's fees/delays,
+  daily results and the taker's split by direction (with the gaps `confirm_ms` skipped).
 - **`tk`.** The existing gated taker, requiring 50 opportunity samples before leaving warmup.
   `kept` is realized/expected gross edge after latency.
 - **Fixed ranking.** `xf0` / `xf1` use the 18.5 bps required edge and 18–50 bps distance gate.
@@ -95,10 +98,11 @@ less memory (10-17 at N=3: 0.67 GB instead of 1.36). `screener_summary.py` picks
   portfolio profits. Day-to-day rank correlation needs at least two days.
 
 Hyperliquid defaults to **1.5 bps maker / 4.5 bps taker**, the undiscounted native-perp base tier.
-The **500 ms execution / 250 ms fill notice / 500 ms quote age** are provisional assumptions,
-not order-latency measurements. All are configurable in `[report.hyperliquid]`. Lowering fees
-below a recording's taker floor can expose unrecorded opportunities: the report rejects that
-rather than silently overstate coverage.
+The **500 ms execution** is close to the live bot's Tokyo IOCs (filled p50 518 ms after their send,
+2026-10-27: `LIGHTER_ASTER_BOT/CALIBRATION.md`); the **250 ms fill notice / 500 ms quote age** are
+provisional assumptions, not measurements. All are configurable in `[report.hyperliquid]`.
+Lowering fees below a recording's taker floor can expose unrecorded opportunities: the report
+rejects that rather than silently overstate coverage.
 
 Current references checked 2026-09-26: [full documentation index](https://hyperliquid.gitbook.io/hyperliquid-docs/llms.txt),
 [public feeds](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions),

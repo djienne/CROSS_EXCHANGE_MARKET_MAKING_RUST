@@ -22,8 +22,9 @@ code change.
   From `58ca5b0` (live 23:16:45, the twin ~23:18) the 500 ms count in the hedge venue's own book
   stamps: the local hold had still lost both Lighter buys after it, on Hyperliquid books
   464-642 ms old.
-- A live-vs-twin comparison should run the twin with the live host's measured latencies (from
-  Windows: Aster ~350 ms per order call, Hyperliquid ~950 ms per action), not the Tokyo profile;
+- A live-vs-twin comparison should run the twin with the live host's measured latencies: the
+  Tokyo profile for the VPS live bot (its Hyperliquid latency fitted to it, `525820a`), but for a
+  live bot on Windows its own (Aster ~350 ms per order call, Hyperliquid ~950 ms per action);
   otherwise fill-rate differences mix location with simulator fidelity. With a handful of fills
   per cell, differences in counts are not yet significant.
 

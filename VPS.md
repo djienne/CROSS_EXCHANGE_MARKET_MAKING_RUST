@@ -9,7 +9,7 @@
 | Code | `/root/xemm/LIGHTER_ASTER_BOT` (git-tracked files only), plus `lighter.env` and `hyperliquid.env` at mode 600 once `vps.py live creds` sent them |
 | Services | `xemm-dryrun`, `xemm-dryrun-hl`, `xemm-dryrun-lh`, `xemm-dryrun-cashcat-lh` (systemd): `run --market HYPE` / `HYPE-HL` / `HYPE-LH` / `CASHCAT-LH` `--mode dry-run --ack-breaker` (Aster-Lighter, Aster-Hyperliquid, Lighter-Hyperliquid twice), 512 MB cap each, SIGINT stop; their simulated venues take free ports (`[dry_run]` ports 0) |
 | Live | `xemm-live`: `run --market CASHCAT-LH --mode live`, REAL orders. Only `vps.py live start` starts it, never `sync` or a boot; a halt leaves it stopped. 512 MB cap, SIGINT stop (460 s), niced above the rest |
-| Output | `/root/xemm/LIGHTER_ASTER_BOT/runs/dry-run/` and the live bot's `runs/`, copied daily to `LIGHTER_ASTER_BOT/runs/tokyo/` (`dry-run/` there is the reports' default) |
+| Output | `/root/xemm/LIGHTER_ASTER_BOT/runs/dry-run/` and the live bot's `runs/`, copied daily to `LIGHTER_ASTER_BOT/runs/tokyo/` (`dry-run/` there is the reports' `--dry-run` default) |
 | Collectors | `xemm-recorder` (`record --market HYPE`, 256 MB cap) → `LIGHTER_ASTER_BOT/data/HYPE/`; `xemm-screener` (`screener collect`, 400 MB cap) → `SCREENER/data/`; both enabled at boot, niced below the dry run |
 
 Since 2026-10-10 the VPS collects and the Windows PC stores: this PC's route to Tokyo stalls for
@@ -20,7 +20,7 @@ pull happens:
 
 - the tape 0.15-0.23 GB/day;
 - the screener 0.09-0.37 GB/day (median 0.24);
-- the dry runs' four logs in `runs/dry-run` (journals, book sanity, diagnostics, equity) ~75 MB/day
+- the dry runs' logs in `runs/dry-run` (journals, book sanity, diagnostics, equity) ~75 MB/day
   for the three HYPE markets together (1 GB in 13.7 days to 2026-10-24, mostly HYPE's journal).
 
 `sync` and `pull` set up everything that keeps it bounded:
@@ -33,18 +33,17 @@ pull happens:
   - **Schedule:** the Windows scheduled task "XEMM Tokyo pull" runs it daily at 04:00 UTC all year
     (06:00 CEST in summer, 05:00 CET in winter): after the 00:00 UTC rotations and outside the
     06-09 UTC stall window. Its output is appended to `LIGHTER_ASTER_BOT/data-tokyo/pull.log`.
-  - **Retries:** a dropped connection (ssh gives up after ~1 min) restarts it, up to three times,
-    5 min apart; every step is idempotent.
+  - **Retries:** a dropped connection (ssh gives up after ~1 min) starts it over, up to three
+    attempts in all, 5 min apart; every step is idempotent.
 - `pull` then copies the VPS's `runs/` (the live bot's files, `runs/dry-run/` and each
   `runs/archive/` batch not here yet) whole, gzipped, into `LIGHTER_ASTER_BOT/runs/tokyo/` and
   writes the time to `pulled_at.txt` there, where the reports end their window.
-- The daily 03:30 UTC script stops both collectors below 4 GB free, so the dry run keeps its disk;
-  the next `pull` starts them again once there is room.
-- The daily timer `xemm-dryrun-archive` (03:30 UTC) acts once those four logs pass 1 GB (about
-  every two weeks, e.g. 2026-10-24). It stops the dry runs, moves the logs to
-  `runs/archive/<UTC time>/`, restarts the dry runs and gzips the logs (13x smaller, ~6 MB/day:
-  years of the 25 GB disk). Nothing is deleted. The bot appends to these logs and never reads them
-  back, so they move only while it is stopped.
+- The daily timer `xemm-dryrun-archive` (03:30 UTC) stops both collectors below 4 GB free, so the
+  dry runs keep their disk; the next `pull` starts them again once there is room.
+- The same timer acts once those logs pass 1 GB (about every two weeks, e.g. 2026-10-24). It
+  stops the dry runs, moves the logs to `runs/archive/<UTC time>/`, restarts the dry runs and
+  gzips the logs (13x smaller, ~6 MB/day: years of the 25 GB disk). Nothing is deleted. The bot
+  appends to these logs and never reads them back, so they move only while it is stopped.
 - journald is capped at 200 MB, and the cargo build dir at 3 GB (a clean rebuild past that).
 - The apt cache is cleared.
 
@@ -58,7 +57,7 @@ From the repository root on Windows:
 python vps.py sync      # upload tracked files (uncommitted edits too), build, restart the dry runs and recorder
 python vps.py status    # services, memory, disk, runs/ and data sizes
 python vps.py pull      # bring the collectors' closed files home (also daily, scheduled)
-python vps.py logs 100  # journal tail
+python vps.py logs 100 HYPE-LH   # a dry run's journal tail (default 50 lines, HYPE)
 python vps.py latency   # TCP and HTTPS round trips to Aster, Lighter, Hyperliquid
 python vps.py live creds|start|stop|status|logs   # the live bot (REAL orders)
 ```
@@ -78,8 +77,7 @@ run keeps going until the restart, but its timing is noisier while cargo runs.
 screener's collector as `xemm-screener`, with the full pair list: 400 MB cap, niced below the dry
 run, enabled at boot. `pull`
 copies its files to `SCREENER/data-tokyo/` (git-ignored), which `python screener_summary.py`
-scores by default (`--local` for this PC's own recording). Its first hours gave
-`[report.scenario.tokyo]` its delays; rank on this recording (SCREENER/README.md, "Venue clocks").
+scores by default (SCREENER/README.md, "Files").
 
 ## Latency from the VPS (2026-10-10)
 

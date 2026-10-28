@@ -96,6 +96,9 @@ docker compose --profile live run -d --name bot-hype bot run --market HYPE --mod
 docker logs -f bot-hype
 ```
 
+On the Tokyo VPS, the `xemm-live` systemd unit runs it natively (`python vps.py live start|stop`,
+[VPS.md](../VPS.md)).
+
 The bot logs to stdout only; `runs/` holds its journals, ledgers, latches and state. The
 stopped container keeps its log for review; `docker rm bot-hype` before the next start.
 
@@ -214,21 +217,22 @@ recorded `min_history_samples` (50) opportunities above its required edge
 
 **Halts.** A halted dry run parks: the process, the simulated venues and the diagnostics keep
 running until it is stopped, so the restart policy cannot loop on a halt. Every start passes
-`--ack-breaker`, so any restart resumes it: `docker compose restart dryrun` after a review, but
-also a host reboot, or `start_all.bat` recreating it on a new image. The halt stays in
+`--ack-breaker`, so any restart resumes it: on the VPS `systemctl restart xemm-dryrun` after a
+review, but also a reboot or `python vps.py sync`, which restarts all four. The halt stays in
 `bot-<M>.events.jsonl` and the archived breaker, so check them after an unplanned restart. An
-equity-drawdown halt parks again, asking for `--reset-breaker-baseline`:
+equity-drawdown halt parks again, asking for `--reset-breaker-baseline` (on the VPS, in
+`/root/xemm/LIGHTER_ASTER_BOT`):
 
 ```bash
-docker compose stop dryrun
-docker compose run --rm dryrun run --market HYPE --mode dry-run --ack-breaker --reset-breaker-baseline
-# Ctrl-C once it has started, then resume in the background:
-docker compose up -d dryrun
+systemctl stop xemm-dryrun
+./target/release/lighter_aster_bot run --market HYPE --mode dry-run --ack-breaker --reset-breaker-baseline
+# Ctrl-C once it has started, then resume under systemd:
+systemctl start xemm-dryrun
 ```
 
 The engines' own loss latches ([Halts and recovery](#halts-and-recovery)) have dry-run
 resets: `python scripts/reset_breaker.py --runs-dir runs/dry-run --coin HYPE` for XEMM, and
-`docker compose run --rm dryrun taker reset-circuit-breaker --market HYPE --dry-run` for the
+`./target/release/lighter_aster_bot taker reset-circuit-breaker --market HYPE --dry-run` for the
 taker. Without `--dry-run` that command resets live's breaker.
 
 **Diagnostics.** Every minute the simulator logs a one-line gist and appends a row to
@@ -249,8 +253,7 @@ taker. Without `--dry-run` that command resets live's breaker.
 
 Simulator warnings start with `dry-run`. `no route`, `no websocket` or `not simulated` means
 the bot used something the simulator does not serve, so the dry run no longer matches live:
-treat it as a bug. The reports take `--dry-run` (`python3 ../combined_pnl.py --dry-run`;
-`python3 ../trade_history.py --dry-run` keeps its own database in `runs/dry-run/`).
+treat it as a bug. The reports read the dry run with `--dry-run` ([README](../README.md#reports));
 `python3 ../bot_stats.py --dry-run` summarizes these diagnostics together with the trades'
 edge kept and slippage per leg.
 
@@ -269,20 +272,22 @@ Live timings and the calibration trials are in [CALIBRATION.md](CALIBRATION.md).
 
 ## Going live
 
-Live runs in the `bot` container, on this Windows host or a Linux host ([Deploy](#deploy)). Live
-refuses credential files that group or other can read: the `bot` container's entrypoint checks
-the host's env files, then copies them at 0600 into a memory-only tmpfs of the bot user and
-points `*_ENV_PATH` there. Docker Desktop shows every Windows bind mount as mode 777, so on this
-host put `XEMM_ENV_MODE_CHECK=off` in the `.env` beside `docker-compose.yml`.
+Live runs natively on the Tokyo VPS (`xemm-live`, [VPS.md](../VPS.md)), or in the `bot` container
+on this Windows host or another Linux host ([Deploy](#deploy)). Live refuses credential files that
+group or other can read: the `bot` container's entrypoint checks the host's env files, then copies
+them at 0600 into a memory-only tmpfs of the bot user and points `*_ENV_PATH` there. Docker Desktop
+shows every Windows bind mount as mode 777, so on this host put `XEMM_ENV_MODE_CHECK=off` in the
+`.env` beside `docker-compose.yml`.
 
 Before the first start:
 
 1. The dry run has run for days with no unexplained reject, halt or `no route` warning, and
    its reports agree with the simulated equity net of funding and open-position marks.
 2. The fee keys in `bot.toml` match both accounts' actual tiers.
-3. On a VPS, ship the sources, the secrets and the live image with `scripts/deploy_vps.sh`
-   ([Deploy](#deploy)); on the Tokyo VPS, `python vps.py live creds` then `live start`
-   ([VPS.md](../VPS.md)); here, `docker compose --profile live build bot`.
+3. On the Tokyo VPS, `python vps.py sync` builds the binary and `python vps.py live creds` sends
+   the env files ([VPS.md](../VPS.md)); on another VPS, ship the sources, the secrets and the
+   live image with `scripts/deploy_vps.sh` ([Deploy](#deploy)); here,
+   `docker compose --profile live build bot`.
 4. On the host, the route's read-only probes pass ([Probes](#probes)); both legs are at 1x
    cross, and Aster routes use one-way position mode.
 5. Neither venue has open orders, and positions are flat or paired.
@@ -305,7 +310,8 @@ route to Tokyo is a hole in the tape, and `python vps.py pull` copies its files 
 - **Hyperliquid** (from 2026-10-10): `l2Book` fast (5 levels, ~0.54 s), `bbo`, `trades` and
   `activeAssetCtx` on one connection; `l2Book` slow (20 levels, ~5.4 s) on another, since its
   frames do not say which mode they are.
-- **REST:** Aster `premiumIndex` every minute; `exchangeInfo` and `orderBooks` hourly.
+- **REST:** Aster `premiumIndex`, Aster `depth` (500 levels) and Lighter `orderBookOrders` (250
+  orders) every minute; `exchangeInfo` and `orderBooks` hourly.
 
 Every line carries its arrival time on the recording host (the VPS, NTP-synced) beside the venues'
 own stamps, so the tape holds that host's feed latency too. The recorder is its own process, so
@@ -334,7 +340,7 @@ service has no network at all and no credentials.
 ```bash
 docker compose run -d --rm --name replay-0928 replay replay --market HYPE --from 2026-09-28T00:00:00Z --until 2026-09-29T00:00:00Z
 docker logs -f replay-0928
-python ../dryrun_summary.py --runs LIGHTER_ASTER_BOT/runs/replay/HYPE-20260928T000000Z-20260929T000000Z-k1-standard-s0
+python ../dryrun_summary.py --runs runs/replay/HYPE-20260928T000000Z-20260929T000000Z-k1-standard-s0
 ```
 
 Always `--rm`: the container goes when the replay ends, and its log is copied into the run
@@ -438,9 +444,9 @@ trades on; no restart is needed. An order in flight when the network drops can s
 engine with an unresolved execution, which halts as `engine_exited`.
 
 Review `bot-<M>.events.jsonl` and the breaker, then restart with `--ack-breaker`, which
-archives it as `.acked.<stamp>`. An equity-drawdown breaker also needs
-`--reset-breaker-baseline`, which re-arms the drawdown stop on the next sample. The
-engines' own latches below are separate and each blocks its engine on its own.
+archives it as `.acked.<stamp>` (on the Tokyo VPS, `python vps.py live start --ack-breaker`). An
+equity-drawdown breaker also needs `--reset-breaker-baseline`, which re-arms the drawdown stop on
+the next sample. The engines' own latches below are separate and each blocks its engine on its own.
 
 **XEMM.**
 
@@ -471,6 +477,10 @@ marker holds complete scoped order identities:
   `[taker.pnl] since` reaches −`max_loss_usdc` (10), on the same terms. `reset-circuit-breaker`
   archives it only: it neither resolves a session nor rewrites the ledger, so the breaker returns
   at the next start while that PnL is still at or below the limit.
+- More than `max_recovered_failures_per_hour` (3) recoveries in an hour, each successful hedge
+  retry counting as one, or more than `max_recovered_loss_usdc_per_hour` ($0.25) of their losses,
+  stop the taker and so halt the bot (`engine_exited`). The count lives in memory: a restart
+  clears it.
 
 ## Engines
 
@@ -505,8 +515,8 @@ stay possible.
 
 ## Deploy
 
-A live VPS does not compile (unlike the Tokyo dry-run VPS, which builds natively: `../VPS.md`).
-Build the image locally and ship it:
+A Docker VPS does not compile (unlike the Tokyo VPS, which builds natively and runs `xemm-live`:
+`../VPS.md`). Build the image locally and ship it:
 
 ```bash
 export VPS_HOST='ubuntu@<host>' KEY="$HOME/.ssh/<deploy-key>.pem"
