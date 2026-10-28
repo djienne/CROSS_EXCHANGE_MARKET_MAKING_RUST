@@ -145,14 +145,16 @@ class BotStatsTests(unittest.TestCase):
         self.assertEqual(x["net_bps"], {"n": 3, "mean": 32, "p50": 0, "p90": 100})
 
     def test_the_tokyo_copy_ends_its_window_when_it_was_pulled(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            runs = Path(tmp) / "tokyo" / "dry-run"
-            runs.mkdir(parents=True)
-            (runs.parent / "pulled_at.txt").write_text("2026-10-11T04:00:00Z\n", encoding="utf-8")
-            proc = subprocess.run([sys.executable, bot_stats.__file__, "--market", "HYPE", "--runs", str(runs),
-                "--since", "2026-10-11T00:00:00Z", "--json"], check=True, capture_output=True, text=True)
-            result = json.loads(proc.stdout)
-        self.assertEqual((result["now"][:19], result["hours"]), ("2026-10-11T04:00:00", 4))
+        # The dry runs' copy (tokyo/dry-run) and the live bot's (tokyo itself).
+        for sub in ("dry-run", ""):
+            with tempfile.TemporaryDirectory() as tmp:
+                runs = Path(tmp) / "tokyo" / sub
+                runs.mkdir(parents=True, exist_ok=True)
+                (Path(tmp) / "tokyo" / "pulled_at.txt").write_text("2026-10-11T04:00:00Z\n", encoding="utf-8")
+                proc = subprocess.run([sys.executable, bot_stats.__file__, "--market", "HYPE", "--runs", str(runs),
+                    "--since", "2026-10-11T00:00:00Z", "--json"], check=True, capture_output=True, text=True)
+                result = json.loads(proc.stdout)
+            self.assertEqual((result["now"][:19], result["hours"]), ("2026-10-11T04:00:00", 4), sub)
 
     def test_a_replay_stopped_early_ends_at_its_last_minute_and_reports_the_taped_lag(self) -> None:
         day, lead = 10 * 86_400_000, 120_000

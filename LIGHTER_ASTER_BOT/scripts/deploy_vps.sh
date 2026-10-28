@@ -42,7 +42,7 @@ EOF
 
 build_image() {
   log "build image locally ($IMAGE)"
-  docker compose build bot    # the live service; a bare `build` makes only the dry run
+  docker compose build bot    # the live service, behind the `live` profile
 }
 
 ship_image() {

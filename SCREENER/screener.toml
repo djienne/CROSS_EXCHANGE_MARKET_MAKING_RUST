@@ -81,7 +81,8 @@ sweep_bps = [5.0, 8.0, 10.0, 12.0, 15.0, 18.5, 22.0, 26.0, 30.0, 40.0, 50.0, 60.
 
 # Native perps, base tier without discounts. Fees checked 2026-09-26:
 # https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees
-# Delays are provisional scenarios, NOT measured order latency. Compare --latency 0.5 / 1 / 2.
+# The 500 ms execution is close to the live bot's Tokyo IOCs (p50 518 ms, 2026-10-27); the other
+# delays are provisional. Compare --latency 0.5 / 1 / 2.
 [report.hyperliquid]
 maker_bps = 1.5
 taker_bps = 4.5

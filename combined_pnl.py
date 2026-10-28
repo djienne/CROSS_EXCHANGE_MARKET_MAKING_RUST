@@ -207,10 +207,11 @@ def report_runs(stack_root: Path, dry_run: bool = False) -> Path:
 
 
 def copy_end(runs: Path) -> str | None:
-    """When `runs` is the daily copy of the VPS's dry runs (`runs/tokyo/dry-run/`), when it was
-    taken: its records end there, so a report's window does too."""
-    path = runs.parent / "pulled_at.txt"
-    return path.read_text(encoding="utf-8").strip() if path.exists() else None
+    """When `runs` is the daily copy of the VPS's runs (`runs/tokyo/` for the live bot, its
+    `dry-run/` for the dry runs), when it was taken: its records end there, so a report's window
+    does too."""
+    path = next((p for p in (runs / "pulled_at.txt", runs.parent / "pulled_at.txt") if p.exists()), None)
+    return path.read_text(encoding="utf-8").strip() if path else None
 
 
 def default_since(bot_runs: Path, market: str, dry_run: bool) -> str:
