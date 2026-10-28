@@ -324,6 +324,10 @@ pub struct TakerResult {
     pub realized_bps: f64,
     pub pnl_usd: f64,
     pub inventory_clips: f64,
+    /// Buying the left leg (selling the right), then the reverse: trades, their cash (after fees,
+    /// before the inventory closes), their realized gross bps summed, and the gaps that cleared the
+    /// gate but ended before `confirm_ms` confirmed them.
+    pub by_direction: [(usize, f64, f64, usize); 2],
     #[serde(skip)]
     pub by_day: BTreeMap<i64, f64>,
 }
@@ -339,6 +343,8 @@ pub struct TakerSim<'a> {
     pub lag_l: i64,
     /// Where the leftover inventory is closed: right mid vs left mid, bps.
     pub close_basis_bps: Option<f64>,
+    /// `R` marks, on the clock of `states`: an unrecorded change there ends a held gap.
+    pub marks: &'a [(i64, Leg, i32)],
 }
 
 /// The bot's gated taker deciding on `states` (its view) and filling on `fills` (the venues' books;
@@ -353,11 +359,26 @@ pub fn simulate_taker(states: &[State], fills: &[State], windows: &[(i64, Sample
     let mut last_trade = i64::MIN / 2;
     // Left base position (long: bought left, sold right) and cash.
     let (mut position, mut cash, mut expected, mut realized) = (0.0f64, 0.0f64, 0.0, 0.0);
+    // As the bot's `confirm_ms`: a gap (the edge at `required` one way, outside the cooldown) is first
+    // seen at its books' latest venue stamp and trades once a right-leg (hedge venue) book stamped
+    // `confirm_ms` later still shows it. An unrecorded change ends it: the recording shows a gap
+    // first at the start of its moment, maybe later than the bot saw it. (way, since, waited?)
+    let (mut held, mut mark, mut last) = (None::<(bool, i64, bool)>, 0, i64::MIN);
     for s in states {
-        let Some((buy_left, edge)) = best_edge(&s.a, &s.l, sim.depth_usd) else { continue };
-        if edge < sim.required_bps {
-            continue;
-        }
+        let next = mark + sim.marks[mark..].partition_point(|m| m.0 < s.t);
+        let unrecorded = sim.marks[mark..next].iter().any(|m| m.0 > last);
+        (mark, last) = (next, s.t);
+        let gap = best_edge(&s.a, &s.l, sim.depth_usd).filter(|&(_, edge)| edge >= sim.required_bps && s.t - last_trade >= rules.cooldown_ms);
+        held = match (held, gap) {
+            (Some(h), Some((buy_left, _))) if h.0 == buy_left && !unrecorded => Some(h),
+            (old, gap) => {
+                if let Some((way, _, true)) = old {
+                    r.by_direction[!way as usize].3 += 1;
+                }
+                gap.map(|(buy_left, _)| (buy_left, s.t - s.age[0].min(s.age[1]) as i64, false))
+            }
+        };
+        let Some((buy_left, edge)) = gap else { continue };
         let w = s.t - s.t.rem_euclid(WINDOW_MS);
         if w != window {
             while pushed < windows.len() && windows[pushed].0 < w {
@@ -369,7 +390,7 @@ pub fn simulate_taker(states: &[State], fills: &[State], windows: &[(i64, Sample
             window = w;
         }
         let Some(threshold) = threshold else { continue };
-        if edge < threshold || s.t - last_trade < rules.cooldown_ms {
+        if edge < threshold {
             continue;
         }
         let mid = s.a.mid();
@@ -378,6 +399,12 @@ pub fn simulate_taker(states: &[State], fills: &[State], windows: &[(i64, Sample
         let after = ((position + signed) * mid).abs();
         if after > rules.max_position_usd + 1e-9 && after > (position * mid).abs() {
             continue;
+        }
+        if let Some((_, since, waited)) = held.as_mut().filter(|_| rules.confirm_ms > 0) {
+            *waited = s.t - s.age[1] as i64 - *since < rules.confirm_ms;
+            if *waited {
+                continue;
+            }
         }
         let fill_a = state_at(fills, s.t + sim.lag_a).map(|f| f.a).filter(Bbo::known);
         let fill_l = state_at(fills, s.t + sim.lag_l).map(|f| f.l).filter(Bbo::known);
@@ -393,8 +420,13 @@ pub fn simulate_taker(states: &[State], fills: &[State], windows: &[(i64, Sample
         expected += edge;
         realized += gross / mid * 1e4;
         r.trades += 1;
+        let d = &mut r.by_direction[!buy_left as usize];
+        (d.0, d.1, d.2) = (d.0 + 1, d.1 + net, d.2 + gross / mid * 1e4);
         *r.by_day.entry(day(s.t)).or_default() += net;
         last_trade = s.t;
+    }
+    if let Some((way, _, true)) = held {
+        r.by_direction[!way as usize].3 += 1;
     }
     if r.trades > 0 {
         (r.expected_bps, r.realized_bps) = (expected / r.trades as f64, realized / r.trades as f64);
@@ -635,6 +667,7 @@ fn score(cfg: &Report, latency: f64, pair: &Pair, series: &Series, timing: Timin
             lag_a: ms(left.taker_ms),
             lag_l: ms(right.taker_ms),
             close_basis_bps,
+            marks: &series.marks,
         },
     );
     let xemm = |maker: Leg, required_bps: f64, distance: Option<(f64, f64)>| {
@@ -747,11 +780,13 @@ pub fn run(cfg: &Report, args: &Args) -> Result<()> {
             Timing::Delays(s)
         }
     };
+    // A scenario's view keeps no venue stamps (`timeline`).
+    ensure!(cfg.taker.confirm_ms <= 0 || matches!(timing, Timing::Arrival), "confirm_ms counts in the venue stamps of the arrival replay: score it without --scenario");
     let (scores, stability, delays) = rank(&cfg, lighter, args, timing)?;
     let scenario = match timing { Timing::Delays(s) => serde_json::to_value(s)?, _ => Value::String(args.scenario.clone().unwrap_or("arrival".into())) };
 
     if args.json {
-        let out = serde_json::json!({ "lighter_tier": cfg.lighter_tier, "latency": args.latency, "scenario": scenario, "feed_delays_here": delays, "clip_usd": cfg.clip_usd, "hyperliquid_assumptions": cfg.hyperliquid, "ranking": "fixed strategies; sweeps exploratory", "funding_included": false, "stablecoin_parity_assumed": true, "day_to_day_rank_correlation": stability, "pairs": scores });
+        let out = serde_json::json!({ "lighter_tier": cfg.lighter_tier, "latency": args.latency, "confirm_ms": cfg.taker.confirm_ms, "scenario": scenario, "feed_delays_here": delays, "clip_usd": cfg.clip_usd, "hyperliquid_assumptions": cfg.hyperliquid, "ranking": "fixed strategies; sweeps exploratory", "funding_included": false, "stablecoin_parity_assumed": true, "day_to_day_rank_correlation": stability, "pairs": scores });
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
@@ -788,6 +823,10 @@ pub fn run(cfg: &Report, args: &Args) -> Result<()> {
     if unresolved > 0 {
         println!("{unresolved} fills met an unknown book (a connection gap) or an unrecorded one (with a scenario, also a quote older than the pre-roll before its print's arrival): their PnL is left out.");
     }
+    let unconfirmed: usize = scores.iter().flat_map(|s| s.taker_gated.by_direction).map(|d| d.3).sum();
+    if unconfirmed > 0 {
+        println!("{unconfirmed} taker gaps cleared the gate but ended before a hedge book stamped {} ms after they were first seen (confirm_ms): not traded.", cfg.taker.confirm_ms);
+    }
     let uncovered: f64 = scores.iter().map(|s| s.uncovered_days).sum();
     if uncovered > 0.0 {
         let share = uncovered / scores.iter().map(|s| s.days + s.down_days + s.uncovered_days).sum::<f64>();
@@ -809,6 +848,7 @@ fn rank(cfg: &Report, lighter: &crate::config::LighterTier, args: &Args, timing:
         for (file, rec, history, version) in data.recordings.iter().filter(|_| g == 0) {
             rec.check(cfg, lighter, &data.pairs).with_context(|| format!("{file}: these settings would trade on moments it did not record"))?;
             ensure!(*history || *version >= 4 || !matches!(timing, Timing::Delays(_)), "{file}: format v{version} has no venue stamps or stall spans for a scenario; score newer days (--since)");
+            ensure!(*history || *version >= 3 || cfg.taker.confirm_ms <= 0, "{file}: format v{version} has no venue stamps for confirm_ms; score newer days (--since)");
             if !history {
                 for name in rec.floors.keys() {
                     if let Some(pair) = data.pairs.get(name) { rec.check_latency(cfg, pair, args.latency).with_context(|| file.clone())?; }
@@ -912,11 +952,12 @@ mod tests {
             sample_interval_ms: 1000,
             cooldown_ms: 60_000,
             max_position_usd: 200.0,
+            confirm_ms: 0,
         }
     }
 
     fn sim(rules: &crate::config::Taker) -> TakerSim<'_> {
-        TakerSim { rules, required_bps: 6.0, clip_usd: 100.0, depth_usd: 1_000.0, fee_a: 4e-4, fee_l: 0.0, lag_a: 100, lag_l: 300, close_basis_bps: None }
+        TakerSim { rules, required_bps: 6.0, clip_usd: 100.0, depth_usd: 1_000.0, fee_a: 4e-4, fee_l: 0.0, lag_a: 100, lag_l: 300, close_basis_bps: None, marks: &[] }
     }
 
     #[test]
@@ -941,6 +982,9 @@ mod tests {
         let fees = qty * (100.02 + 100.00) * 4e-4;
         assert!((r.pnl_usd - (qty * (0.08 + 0.10) - fees)).abs() < 1e-9);
         assert!(r.inventory_clips.abs() < 1e-12);
+        // One each way: buying Aster first, then selling it.
+        assert_eq!(r.by_direction.map(|d| (d.0, d.3)), [(1, 0), (1, 0)]);
+        assert!((r.by_direction[0].1 - (qty * 0.08 - qty * 100.02 * 4e-4)).abs() < 1e-9 && (r.by_direction[1].2 - 0.10 / 100.01 * 1e4).abs() < 1e-9);
         assert!((r.expected_bps - (0.10 / 100.01 * 1e4 + 0.10 / 100.01 * 1e4) / 2.0).abs() < 1e-9);
         assert!((r.realized_bps - (0.08 / 100.01 * 1e4 + 0.10 / 100.01 * 1e4) / 2.0).abs() < 1e-9);
     }
@@ -959,6 +1003,31 @@ mod tests {
         assert!((r.expected_bps - 15.2).abs() < 1e-9);
         let never = simulate_taker(&states, &states, &windows, &sim(&rules(50)));
         assert_eq!((never.trades, never.warmup), (0, true));
+    }
+
+    #[test]
+    fn confirm_ms_trades_a_gap_once_a_hedge_book_stamped_that_much_later_still_shows_it() {
+        // The gate is 6.5 bps, as above; Lighter's bid 100.12 over Aster's ask 100.02 is 10 bps.
+        let windows = vec![(-WINDOW_MS, Samples::from([(24, 50)]))];
+        let (a, gap, none) = (bbo(100.0, 100.02), bbo(100.12, 100.14), bbo(100.0, 100.02));
+        // Aster stamped -10 ms throughout; the right (hedge) leg at t minus its age.
+        let at = |t: i64, l: Bbo, right_age: i32| State { t, a, l, age: [t as i32 + 10, right_age] };
+        // First seen at 0 ms, at the later stamp (-10); hedge books stamped -50, 250 and 450 ms.
+        let held = [at(0, gap, 300), at(200, gap, 250), at(500, gap, 250), at(700, gap, 250)];
+        let run = |states: &[State], confirm_ms: i64, marks: &[(i64, Leg, i32)]| {
+            let rules = crate::config::Taker { confirm_ms, ..rules(50) };
+            let r = simulate_taker(states, states, &windows, &TakerSim { marks, ..sim(&rules) });
+            (r.trades, r.by_direction[0].3)
+        };
+        // At once without the hold; at 700 ms with 460 ms of it (450 - -10), not with 461.
+        assert_eq!((run(&held, 0, &[]), run(&held, 460, &[]), run(&held, 461, &[])), ((1, 0), (1, 0), (0, 1)));
+        // Gone at 500 ms: one gap unconfirmed, though traded at once without the hold.
+        let gone = [held[0], held[1], at(500, none, 250)];
+        assert_eq!((run(&gone, 0, &[]), run(&gone, 400, &[])), ((1, 0), (0, 1)));
+        // A 200 ms hold trades at 500 ms; after an unrecorded change at 300 ms (the gap ended,
+        // unconfirmed), it is first seen again at 500 ms (stamp 250) and holds 200 ms by 700.
+        let mark = [(300, Leg::Right, 250)];
+        assert_eq!((run(&held, 200, &[]), run(&held, 200, &mark), run(&held, 201, &mark)), ((1, 0), (1, 1), (0, 2)));
     }
 
     #[test]

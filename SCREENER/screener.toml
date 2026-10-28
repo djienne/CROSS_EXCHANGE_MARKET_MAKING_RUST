@@ -58,6 +58,9 @@ gate_extra_bps     = 0.5     # min_extra_bps
 sample_interval_ms = 1000    # sample_interval_ms
 cooldown_ms        = 60000   # [taker.arb] cooldown_ms
 max_position_usd   = 200.0   # [taker.risk] max_abs_position_notional_usd
+# [[taker.markets]] confirm_ms (CASHCAT-LH: 500; 0 = at once): orders wait for a hedge book stamped
+# that long after the gap was first seen. Arrival replay of v3+ data only (README.md).
+confirm_ms         = 0
 
 [report.xemm]
 # [maker.edge] min_net_profit 14 + slippage 1.5 + latency 2 + basis 1 + funding 0.

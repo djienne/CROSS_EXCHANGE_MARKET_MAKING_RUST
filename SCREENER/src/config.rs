@@ -123,6 +123,7 @@ pub struct Taker {
     pub sample_interval_ms: i64,
     pub cooldown_ms: i64,
     pub max_position_usd: f64,
+    pub confirm_ms: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

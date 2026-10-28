@@ -16,7 +16,9 @@ runs apart from the bot, with its own crate, image, container and data.
   - each moment keeps two seconds after it (where latency-delayed orders fill).
 - **`report`** applies a simplified model of the bot's rules and ranks the pairs.
   - **Taker-taker:** the entry gate (also at least the required edge plus 0.5 bps, the bot's
-    `min_extra_bps`), cooldown, inventory cap and each leg's latency.
+    `min_extra_bps`), cooldown, inventory cap and each leg's latency. `confirm_ms` holds a gap as
+    the bot's per-market setting does, on the hedge venue's stamps (arrival replay of v3+ data); the
+    recording shows a gap first at the start of its moment, so the hold may end later than the bot's.
   - **XEMM:** the quote price, a fill only when trades print through the quote (those of one ms
     add up), the hedge latency and the distance gate (skipped behind a maker top thinner than the
     bot's depth). Both sides quote a clip, as the bot (`reduce_position_only = false`); the side that

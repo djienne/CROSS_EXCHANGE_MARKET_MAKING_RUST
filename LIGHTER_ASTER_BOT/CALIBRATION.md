@@ -179,6 +179,11 @@ The `xemm-live` unit, $20 clips, no forced closes. To 2026-10-27 03:11 UTC: 21 t
     on gaps first seen at the decision lost 15.7 bps on average (11, 2 won), those on gaps in
     view up to 1.7 s earlier 3.4 bps (6). Hence `confirm_ms = 500` (`ad3be0c`), about the
     Hyperliquid IOC's own latency; each trade report logs its gap's `held_ms`.
+  - The screener report with `confirm_ms` (Tokyo recording, 2026-10-26 to 27, $13 clips): at any
+    hold of 250 ms or more no Lighter buy survives (53 gaps cleared the gate, none held), while
+    Lighter sales keep 13-15 bps net instead of 6.5. The route then runs one way: sales fill the
+    inventory cap and nothing frees it, so the cap, not the hold, sets the day's profit. The
+    report prices the Lighter buys near break-even where live lost 16 bps.
 - **Breaker halts:** each successful hedge retry counts toward the 3-an-hour limit, so a fast
   market halted live at 11:31 (4 retries, all rebalanced within 2.7 s) and the twin at 11:28.
   A halted dry run parks until restarted: the twin then sat out 11 h.
