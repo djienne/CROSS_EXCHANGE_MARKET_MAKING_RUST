@@ -185,10 +185,15 @@ The `xemm-live` unit, $20 clips, no forced closes. To 2026-10-27 03:11 UTC: 21 t
     Lighter sales keep 13-15 bps net instead of 6.5. The route then runs one way: sales fill the
     inventory cap and nothing frees it, so the cap, not the hold, sets the day's profit. The
     report prices the Lighter buys near break-even where live lost 16 bps.
+  - Live did not stay one-way. From `58ca5b0` (10-27 23:16) to the 11-02 04:02 pull: 33 trades,
+    +$0.32. Premium sales: 18, +$0.248, 79% of their edge kept. Lighter buys: 15, +$0.076, 49%
+    kept, against 13% before. On 10-29 the premium flipped for hours, and the buys took the
+    position from the cap (869 a side) to 2 a side before the sales rebuilt it (909 by 10-31).
+    The screener day it was scored on (10-26 to 27) had no such flip.
 - **Breaker halts:** each successful hedge retry counts toward the 3-an-hour limit, so a fast
   market halted live at 11:31 (4 retries, all rebalanced within 2.7 s) and the twin at 11:28.
   A halted dry run parks until restarted: the twin then sat out 11 h.
-- **Four taker bugs:**
+- **Five taker bugs:**
   - `6b3cae6`: the missing-hedge retry reused the missed IOC's decision-price bound, so it
     repeated the miss. It is now priced off fresh REST mids.
   - `3d0f28e`: a Hyperliquid IOC that replied "filled 214" read back as unfilled, because the
@@ -201,4 +206,8 @@ The `xemm-live` unit, $20 clips, no forced closes. To 2026-10-27 03:11 UTC: 21 t
     for a real loss of $0.078. The loss estimate from the equity delta carried the marks of the
     860-a-side inventory, said $0.33, and tripped the $0.25/h breaker. A recovery is now priced
     by its fills.
+  - `5a51680`, 10-29 22:02: a hedge replied "filled 213", stamped 531 ms after its send, but its
+    fills were not listed within the main path's 10 s. Its fee unknown, the paired trade (about
+    +$0.006) was booked as a $0 recovery and counted toward the breaker. A filled reply now waits
+    30 s for the listing.
 
