@@ -21,7 +21,9 @@ pull happens:
 - the tape 0.15-0.23 GB/day;
 - the screener 0.09-0.37 GB/day (median 0.24);
 - the dry runs' logs in `runs/dry-run` (journals, book sanity, diagnostics, equity) ~75 MB/day
-  for the three HYPE markets together (1 GB in 13.7 days to 2026-10-24, mostly HYPE's journal).
+  for the three HYPE markets together (1 GB in 13.7 days to 2026-10-24, mostly HYPE's journal);
+- the live bot's `runs/` ~2 MB/day (11 MB of equity log in 6.7 days to 2026-11-02), never
+  archived: years of the disk.
 
 `sync` and `pull` set up everything that keeps it bounded:
 
@@ -64,7 +66,7 @@ python vps.py live creds|start|stop|status|logs   # the live bot (REAL orders)
 
 `sync` never restarts the live bot: `live stop`, then `live start`, puts it on the new build.
 After a breaker halt, review `runs/bot-CASHCAT-LH.breaker.json`, then `live start --ack-breaker`
-starts it once with `--ack-breaker`.
+starts it once with `--ack-breaker` (add `--reset-breaker-baseline` after an equity-drawdown halt).
 `live creds` sends the Lighter and Hyperliquid env files (the live route has no Aster leg); never
 let one Lighter API key trade from two hosts at once (its nonces are per process).
 

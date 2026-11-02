@@ -82,7 +82,8 @@ Run them from the repository root.
 
 - By default they read this PC's live records in `LIGHTER_ASTER_BOT/runs/`; `trade_history.py`
   keeps its database in the root `runs/`. The VPS live bot's copy is `LIGHTER_ASTER_BOT/runs/tokyo/`
-  (`combined_pnl.py`/`bot_stats.py --market CASHCAT-LH --runs LIGHTER_ASTER_BOT/runs/tokyo`).
+  (`--market CASHCAT-LH --runs LIGHTER_ASTER_BOT/runs/tokyo`; `trade_history.py` keeps that
+  database there), its window ending at the copy's time like the dry runs'.
 - With `--dry-run` they read only the Tokyo copy, `LIGHTER_ASTER_BOT/runs/tokyo/dry-run/`
   (`--runs LIGHTER_ASTER_BOT/runs/dry-run` for this PC's). Without `--since` they count from the
   dry run's first start, and their window ends at the copy's time (`pulled_at.txt`).

@@ -17,7 +17,7 @@ from typing import Any, Sequence
 from economics import Fill, optional_decimal, taker_economics, xemm_journal, calculate, fill_fee, event_time, venue_name
 
 from combined_pnl import (DEFAULT_SINCE, dec, decimal_str, default_since, fmt_money, fmt_pct, iso,
-    iter_jsonl, json_default, latest_capital_from_state, parse_dt, print_table, projection, report_runs, utc_now)
+    copy_end, iter_jsonl, json_default, latest_capital_from_state, parse_dt, print_table, projection, report_runs, utc_now)
 
 
 TAKER_BOT = "LIGHTER_ASTER_TAKER_ARB"
@@ -794,8 +794,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="The dry run's files and its own DB (the VPS's, copied to LIGHTER_ASTER_BOT/runs/tokyo/dry-run/) instead of live.")
     parser.add_argument("--market", default="HYPE")
     parser.add_argument("--since", default=None, help=f"UTC/RFC3339 start time. Default: {DEFAULT_SINCE}; with --dry-run, the dry run's first start.")
-    parser.add_argument("--now", default=None, help="Override report end time. Defaults to current UTC time.")
-    parser.add_argument("--db", type=Path, default=None, help="Default: runs/trade_history.sqlite in the repository root (with --dry-run, in LIGHTER_ASTER_BOT/runs/tokyo/dry-run/).")
+    parser.add_argument("--now", default=None, help="Override report end time. Defaults to current UTC time, or a Tokyo copy's pull time.")
+    parser.add_argument("--runs", type=Path, default=None, help="Read this runs directory (the VPS live bot's copy: LIGHTER_ASTER_BOT/runs/tokyo) and keep the DB there.")
+    parser.add_argument("--db", type=Path, default=None, help="Default: runs/trade_history.sqlite in the repository root (with --dry-run or --runs, in the runs directory read).")
     parser.add_argument("--taker-trades", type=Path, default=None)
     parser.add_argument("--xemm-journal", type=Path, action="append", default=None, help="XEMM raw journal with logical/attempt execution evidence and economic timestamps; repeatable. Default: `run`'s.")
     parser.add_argument("--bot-state", type=Path, default=None, help="Controller state file (capital for projections). Default: `run`'s.")
@@ -809,10 +810,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebuild-out", type=Path, help="Candidate path (default: <db-stem>.rebuilt.sqlite).")
     parser.add_argument("--raw-fills", type=Path, action="append", default=[], help="Own-account execution_trade JSONL with venue/order identities, notional and fee evidence; repeatable.")
     args = parser.parse_args()
-    bot_runs = report_runs(stack_root, args.dry_run)
+    bot_runs = args.runs or report_runs(stack_root, args.dry_run)
+    args.now = args.now or copy_end(bot_runs)  # a copy ends when it was taken
     args.since = args.since or default_since(bot_runs, args.market, args.dry_run)
     if args.db is None:
-        args.db = (bot_runs if args.dry_run else stack_root / "runs") / "trade_history.sqlite"
+        args.db = (bot_runs if args.dry_run or args.runs else stack_root / "runs") / "trade_history.sqlite"
     if args.taker_trades is None:
         args.taker_trades = bot_runs / f"trades_{args.market}.jsonl"
     if args.xemm_journal is None:

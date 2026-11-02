@@ -445,8 +445,9 @@ engine with an unresolved execution, which halts as `engine_exited`.
 
 Review `bot-<M>.events.jsonl` and the breaker, then restart with `--ack-breaker`, which
 archives it as `.acked.<stamp>` (on the Tokyo VPS, `python vps.py live start --ack-breaker`). An
-equity-drawdown breaker also needs `--reset-breaker-baseline`, which re-arms the drawdown stop on
-the next sample. The engines' own latches below are separate and each blocks its engine on its own.
+equity-drawdown breaker also needs `--reset-breaker-baseline` (`live start --ack-breaker
+--reset-breaker-baseline` there), which re-arms the drawdown stop on the next sample. The
+engines' own latches below are separate and each blocks its engine on its own.
 
 **XEMM.**
 
