@@ -100,19 +100,21 @@ impl HyperliquidVenue {
     /// answered: the size its listed fills must reach, standing with its fee unknown if they never
     /// are. The info API can lag the exchange: 6 s after a "filled 214" reply it still said
     /// "unknown order", which read back as no fill (CASHCAT-LH live, 2026-10-27). Waits at least
-    /// until an unknown order is final ([`resolution_timeout`]), whatever `timeout` says.
+    /// until an unknown order is final, or a filled reply's fills are listed
+    /// ([`resolution_timeout`]), whatever `timeout` says.
     pub async fn resolve_order_terminal(&self, market: &MarketId, client_order_index: i64, reply: Option<FillSummary>, timeout: Duration) -> Result<LighterFillConfirmation> {
         self.check(market)?;
         let (cloid, sent_ms) = (cloid(client_order_index), client_order_index / 1000);
-        let timeout = resolution_timeout(timeout, client_order_index, Utc::now().timestamp_millis());
         let reply = reply.filter(|fill| fill.qty > Decimal::ZERO);
+        let timeout = resolution_timeout(timeout, client_order_index, Utc::now().timestamp_millis(), reply.is_some());
         let fills = tokio::time::timeout(timeout, async {
             loop {
                 let unknown_is_final = Utc::now().timestamp_millis() > sent_ms + ORDER_TTL_MS as i64 + 1_000;
                 if let Some(fills) = self.client.ioc_fills(&cloid, sent_ms - FILLS_LOOKBACK_MS, reply.map(|fill| fill.qty), unknown_is_final).await {
                     break fills;
                 }
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                // Then a late listing every 2 s: `userFillsByTime` weighs 20 of the IP's 1200 a minute.
+                tokio::time::sleep(Duration::from_millis(if unknown_is_final { 2_000 } else { 250 })).await;
             }
         })
         .await;
@@ -166,11 +168,15 @@ fn account_of(state: &Value, coin: &str) -> Result<LighterAccountSnapshot> {
 /// than until an unknown order is final (1 s past its `expiresAfter`) plus 2 s for the reads that
 /// show it. A shorter wait can never resolve a lost reply: the hedge retry's and recovery's 5 s
 /// end before the 6 s an unknown IOC needs, so a 503 on the retry halted the taker with its
-/// position one-legged (HYPE-LH dry run, 2026-10-02).
-fn resolution_timeout(timeout: Duration, client_order_index: i64, now_ms: i64) -> Duration {
-    let resolvable_ms = client_order_index / 1000 + ORDER_TTL_MS as i64 + 1_000 + 2_000;
+/// position one-legged (HYPE-LH dry run, 2026-10-02). A `filled` reply waits for its fills to be
+/// listed until [`LATE_FILLS_MS`] after the send: under 10 s, a fill stamped 531 ms after its send
+/// went unlisted and its trade was booked as a failure (CASHCAT-LH live, 2026-10-29).
+fn resolution_timeout(timeout: Duration, client_order_index: i64, now_ms: i64, filled: bool) -> Duration {
+    let resolvable_ms = client_order_index / 1000 + if filled { LATE_FILLS_MS } else { ORDER_TTL_MS as i64 + 1_000 + 2_000 };
     timeout.max(Duration::from_millis((resolvable_ms - now_ms).max(0) as u64))
 }
+
+const LATE_FILLS_MS: i64 = 30_000;
 
 /// The cloid of client index `index`: 16 bytes, the index in the low ones.
 fn cloid(index: i64) -> String {
@@ -357,9 +363,12 @@ mod tests {
     fn a_resolution_outlasts_an_unknown_order() {
         let sent_ms = 1_790_967_077_057;
         let index = sent_ms * 1000 + 40;
-        let wait = resolution_timeout(Duration::from_secs(5), index, sent_ms + 20);
+        let wait = resolution_timeout(Duration::from_secs(5), index, sent_ms + 20, false);
         assert!(wait > Duration::from_millis(ORDER_TTL_MS + 1_000), "{wait:?} ends before an unknown order is final");
-        assert_eq!(resolution_timeout(Duration::from_secs(30), index, sent_ms), Duration::from_secs(30));
-        assert_eq!(resolution_timeout(Duration::from_secs(1), index, sent_ms + 60_000), Duration::from_secs(1));
+        assert_eq!(resolution_timeout(Duration::from_secs(30), index, sent_ms, false), Duration::from_secs(30));
+        assert_eq!(resolution_timeout(Duration::from_secs(1), index, sent_ms + 60_000, false), Duration::from_secs(1));
+        // The main path's 10 s ended before the 2026-10-29 fill was listed.
+        let filled = resolution_timeout(Duration::from_secs(10), index, sent_ms + 531, true);
+        assert!(filled >= Duration::from_millis((LATE_FILLS_MS - 531) as u64), "{filled:?} ends before a late listing");
     }
 }
