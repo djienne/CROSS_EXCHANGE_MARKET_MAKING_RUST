@@ -67,6 +67,7 @@ def taker(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, 
     executed = sorted((r for r in opps if r.get("decision") == "would_execute"), key=lambda r: ms(r["timestamp"]))
     trades = collections.defaultdict(list)
     by_direction = collections.defaultdict(list)  # (expected, realized gross bps, net usd) per trade
+    slippage = collections.defaultdict(list)  # (first, hedge leg slippage bps) per trade with its decision
     for r in final.values():
         econ, a, lf = r.get("actual_economics"), r.get("aster_fill"), r.get("lighter_fill")
         if r.get("outcome") != "success" or not econ:
@@ -90,6 +91,7 @@ def taker(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, 
             # Positive = filled worse than the decision price; the two legs sum to the edge lost.
             trades["aster_slippage_bps"].append((aster_px - buy) / buy * 1e4 if buy_aster else (sell - aster_px) / sell * 1e4)
             trades["lighter_slippage_bps"].append((sell - lighter_px) / sell * 1e4 if buy_aster else (lighter_px - buy) / buy * 1e4)
+            slippage[r["direction"]].append((trades["aster_slippage_bps"][-1], trades["lighter_slippage_bps"][-1]))
             trades["aster_book_age_ms"].append(float(opp["aster_book_age_ms"]))
             trades["lighter_book_age_ms"].append(float(opp["lighter_book_age_ms"]))
         if (m := re.search(r'\\"updateTime\\":(\d+)', r.get("aster_submit", ""))):
@@ -107,9 +109,13 @@ def taker(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, 
         "net_usd": round(sum(trades["net_usd"]), 6),
         "edge_kept": round(realized / expected, 3) if expected else None,
         # A route's two directions can keep very different shares of their edge: CASHCAT-LH's
-        # trades against Lighter's usual premium lost the hedge race (2026-10-27).
+        # trades against Lighter's usual premium lost the hedge race (2026-10-27), and in a fast
+        # market their first leg too (2026-11-03): each leg's mean slippage says which.
         "by_direction": {d: {"trades": len(xs), "net_usd": round(sum(x[2] for x in xs), 6),
-                             "edge_kept": round(sum(x[1] for x in xs) / sum(x[0] for x in xs), 3)} for d, xs in sorted(by_direction.items())},
+                             "edge_kept": round(sum(x[1] for x in xs) / sum(x[0] for x in xs), 3),
+                             **({"first_slippage_bps": round(sum(x[0] for x in slippage[d]) / len(slippage[d]), 3),
+                                 "hedge_slippage_bps": round(sum(x[1] for x in slippage[d]) / len(slippage[d]), 3)} if slippage[d] else {})}
+                         for d, xs in sorted(by_direction.items())},
         **{k: dist(v) for k, v in trades.items() if k != "net_usd"},
         "outcomes": dict(collections.Counter(r.get("outcome") for r in final.values())),
         "gate": {"decisions": dict(collections.Counter(r.get("decision") for r in opps)),
