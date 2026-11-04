@@ -190,6 +190,13 @@ The `xemm-live` unit, $20 clips, no forced closes. To 2026-10-27 03:11 UTC: 21 t
     kept, against 13% before. On 10-29 the premium flipped for hours, and the buys took the
     position from the cap (869 a side) to 2 a side before the sales rebuilt it (909 by 10-31).
     The screener day it was scored on (10-26 to 27) had no such flip.
+  - What the hold leaves is Hyperliquid's own move while its IOC is in flight (both legs go out
+    together). Of the 43 trades from `58ca5b0` to the 11-04 04:04 pull, the screener's
+    `L-H:CASHCAT` recording holds 27. Its Hyperliquid touch 500 ms after the decision matched
+    the hedge's slippage within 3 bps in 22. The 1.5 s before the decision does not predict
+    it. By which venue moved toward the gap, gaps opened by Lighter kept +4.0 bps net (18),
+    by Hyperliquid +7.4 (3) and by neither +4.5 (6). The largest prior moves both won (Lighter
+    93 bps, Hyperliquid 59), so a spike filter would cut winners too (11-04).
 - **Breaker halts:** each successful hedge retry counts toward the 3-an-hour limit, so a fast
   market halted live at 11:31 (4 retries, all rebalanced within 2.7 s) and the twin at 11:28.
   A halted dry run parks until restarted: the twin then sat out 11 h.
