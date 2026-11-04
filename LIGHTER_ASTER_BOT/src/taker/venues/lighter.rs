@@ -34,6 +34,8 @@ static CLIENT_ORDER_COUNTER: AtomicI64 = AtomicI64::new(0);
 /// `random_client_order_index`).
 static LAST_COUNTER_WRAP_MS: AtomicI64 = AtomicI64::new(-1);
 
+// `reason` is read only through `Debug`, which writes it into the execution records.
+#[expect(dead_code)]
 #[derive(Debug, Clone)]
 pub enum SubmitOutcome {
     Accepted {

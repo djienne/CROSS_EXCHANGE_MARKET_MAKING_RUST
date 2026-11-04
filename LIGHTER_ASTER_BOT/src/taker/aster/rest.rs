@@ -44,6 +44,8 @@ struct MarketWire {
     tick: Decimal,
 }
 
+// `reason` is read only through `Debug`, which writes it into the execution records.
+#[expect(dead_code)]
 #[derive(Debug, Clone)]
 pub enum SubmitOutcome {
     Accepted {

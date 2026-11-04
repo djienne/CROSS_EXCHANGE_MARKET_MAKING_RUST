@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
-import sqlite3
 import sys
 import tempfile
 import unittest

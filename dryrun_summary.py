@@ -39,7 +39,7 @@ def dist(d: dict | None, key: str = "p50") -> str:
 
 def summary(runs: Path, market: str, since: str | None, now: str | None) -> None:
     pnl, stats = report("combined_pnl.py", runs, market, since, now), report("bot_stats.py", runs, market, since, now)
-    t, x, c, sim = stats["taker"], stats["xemm"], stats["controller"], stats["simulator"] or {}
+    t, c, sim = stats["taker"], stats["controller"], stats["simulator"] or {}
     usd = lambda v: f"{float(v):+.4f}" if v is not None else "?"
     print(f"== {market}: {stats['since'][:16]}Z -> {stats['now'][:16]}Z ({stats['hours']} h)")
     print(f"  net $: taker {usd(pnl['taker']['net_pnl_usdc'])} ({pnl['taker']['trades']} trades), "
