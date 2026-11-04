@@ -499,15 +499,19 @@ impl VenueState {
         self.account.view(&|market: &str| self.marks.get(market).copied(), working, leverage)
     }
 
-    /// Whether the margin covers the open orders plus `qty` more working on `side`.
+    /// Whether the margin covers the open orders plus `qty` more working on `side`, or the order
+    /// adds no margin: below initial margin a venue still takes an order that reduces the position
+    /// (Lighter's pre-liquidation mode, docs.lighter.xyz/trading/liquidations-and-llp-insurance-fund).
     fn affords(&self, market: &str, side: Side, qty: Decimal, leverage: Decimal) -> bool {
-        let mut working = self.working();
+        let before = self.working();
+        let mut working = before.clone();
         let w = working.entry(market.to_string()).or_default();
         match side {
             Side::Buy => w.buys += qty,
             Side::Sell => w.sells += qty,
         }
-        self.view(&working, leverage).available >= Decimal::ZERO
+        let view = self.view(&working, leverage);
+        view.available >= Decimal::ZERO || view.margin <= self.view(&before, leverage).margin
     }
 }
 
@@ -1934,6 +1938,21 @@ mod tests {
         sim.at(1_100);
         assert_eq!(sim.reply(ticket), Some(&Reply::Ok));
         assert_eq!(sim.last_status(Venue::Lighter, 1), Some(Status::Done(End::Rejected(Reject::Margin))));
+    }
+
+    #[test]
+    fn below_initial_margin_only_orders_that_reduce_the_position_pass() {
+        let mut sim = Sim::new();
+        // Short 9 at 100, then the mark rises to 120: 1080 of margin against 820 of equity
+        // (CASHCAT's twin, 2026-11-04, refused its own buy-back here).
+        sim.ex.venues[0].account.fill(HYPE, Side::Sell, dec!(9), dec!(100), dec!(0));
+        sim.book(Venue::Aster, 10, &[(dec!(119), dec!(5))], &[(dec!(121), dec!(5))]);
+        sim.at(10);
+        let add = sim.send(Venue::Aster, limit(Side::Sell, dec!(1), dec!(121), Tif::PostOnly));
+        let reduce = sim.send(Venue::Aster, limit(Side::Buy, dec!(1), dec!(119), Tif::PostOnly));
+        sim.at(1_000);
+        assert_eq!(sim.reply(add), Some(&Reply::Reject(Reject::Margin)));
+        assert!(matches!(sim.reply(reduce), Some(Reply::Order(_))), "{:?}", sim.reply(reduce));
     }
 
     #[test]
