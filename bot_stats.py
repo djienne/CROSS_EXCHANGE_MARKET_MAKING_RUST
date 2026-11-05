@@ -70,7 +70,8 @@ def taker(runs: Path, market: str, since: datetime, now: datetime) -> dict[str, 
     slippage = collections.defaultdict(list)  # (first, hedge leg slippage bps) per trade with its decision
     for r in final.values():
         econ, a, lf = r.get("actual_economics"), r.get("aster_fill"), r.get("lighter_fill")
-        if r.get("outcome") != "success" or not econ:
+        # Before 11-05 a both-legs-unfilled execution was journaled as a zero "success".
+        if r.get("outcome") != "success" or not econ or not float(a["notional"]):
             continue
         # The gate records every executed opportunity just before its orders go out, with the
         # depth-weighted prices the expected edge was computed from.

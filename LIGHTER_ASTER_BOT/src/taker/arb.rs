@@ -2792,7 +2792,10 @@ async fn execute_opportunity(
     row["final_positions"] = serde_json::json!({"aster_qty": position.aster_qty,
         "lighter_rest_qty": position.lighter_qty, "net_qty": position.net_qty()});
     let clean_orders = a_open.as_ref().is_ok_and(|count| *count == 0) && l_open.as_ref().is_ok_and(|count| *count == 0);
-    row["outcome"] = serde_json::json!(if economics.is_ok() && clean_orders && margin_after.is_ok() { "success" } else { "accounting_unavailable" });
+    // Both legs terminal without a fill: nothing traded, so the journal says so too (`Skipped` below).
+    let unfilled = a.qty == Some(Decimal::ZERO) && l.qty == Some(Decimal::ZERO) && !hedge_retry_action_taken;
+    let outcome = if !(economics.is_ok() && clean_orders && margin_after.is_ok()) { "accounting_unavailable" } else if unfilled { "skipped" } else { "success" };
+    row["outcome"] = serde_json::json!(outcome);
     if let Ok(economics) = &economics {
         row["economic_status"] = serde_json::json!("confirmed");
         row["actual_economics"] = serde_json::json!({"gross_usd": economics.gross_usd,
@@ -2804,7 +2807,7 @@ async fn execute_opportunity(
     if !clean_orders { return Err(ExecutionError::AccountingUnavailable { details: "open-order evidence unavailable or nonempty".to_string() }); }
     let margin_after = margin_after.map_err(|error| ExecutionError::AccountingUnavailable { details: format!("{error:#}") })?;
     let economics = economics?;
-    if a.qty == Some(Decimal::ZERO) && l.qty == Some(Decimal::ZERO) && !hedge_retry_action_taken {
+    if unfilled {
         session.resolve_execution().await?;
         return Err(ExecutionError::Skipped { details: "both legs confirmed terminal without fills".to_string() });
     }

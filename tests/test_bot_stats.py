@@ -39,14 +39,17 @@ class BotStatsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             runs = Path(tmp)
             write_jsonl(runs / "opportunities_HYPE.jsonl", [opp])
-            write_jsonl(runs / "executions_HYPE.jsonl", [{**done, "outcome": "submitting", "actual_economics": None}, done])
+            unfilled = {**done, "execution_id": "e0", "aster_fill": {"vwap": "0", "notional": "0"}, "lighter_fill": {"vwap": "0"},
+                        "actual_economics": {"gross_usd": "0", "fees_usd": "0", "net_usd": "0", "net_bps": "0"}}
+            write_jsonl(runs / "executions_HYPE.jsonl", [{**done, "outcome": "submitting", "actual_economics": None}, done, unfilled])
             write_jsonl(runs / "sim-HYPE.diag.jsonl", [window(start_ms, 2000, 50), window(start_ms + 60_000, 2, 1)])
             write_jsonl(runs / "sim-HYPE-HL.diag.jsonl", [window(start_ms, 2, 1, ("aster", "hyperliquid"))])
             since, until = (datetime.fromtimestamp(start_ms / 1000 + h * 3600, timezone.utc) for h in (-1, 1))
             result = bot_stats.report(runs, "HYPE", since, until)
             hl = bot_stats.simulator(runs, "HYPE-HL", since, until)
         taker, sim = result["taker"], result["simulator"]
-        self.assertEqual((taker["trades"], taker["outcomes"]), (1, {"success": 1}))
+        # The legacy zero-fill "success" (e0) is no trade.
+        self.assertEqual((taker["trades"], taker["outcomes"]), (1, {"success": 2}))
         self.assertAlmostEqual(taker["aster_slippage_bps"]["mean"], 5.0, places=2)
         self.assertAlmostEqual(taker["lighter_slippage_bps"]["mean"], 1.998, places=2)
         # Expected edge less both legs' slippage is the realized edge (to the bps basis difference).
