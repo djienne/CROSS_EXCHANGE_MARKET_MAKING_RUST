@@ -196,7 +196,10 @@ The `xemm-live` unit, $20 clips, no forced closes. To 2026-10-27 03:11 UTC: 21 t
     the hedge's slippage within 3 bps in 22. The 1.5 s before the decision does not predict
     it. By which venue moved toward the gap, gaps opened by Lighter kept +4.0 bps net (18),
     by Hyperliquid +7.4 (3) and by neither +4.5 (6). The largest prior moves both won (Lighter
-    93 bps, Hyperliquid 59), so a spike filter would cut winners too (11-04).
+    93 bps, Hyperliquid 59), so a spike filter would cut winners too (11-04). 11-04's own
+    trades (8 of 12 recorded) turned that: of all 35, the 6 after a move of more than 40 bps
+    in the 1.5 s before netted -8.5 bps on average (4 lost), the other 29 +4.8. That threshold
+    was chosen after looking, and 6 trades are too few to set a filter on.
 - **Breaker halts:** each successful hedge retry counts toward the 3-an-hour limit, so a fast
   market halted live at 11:31 (4 retries, all rebalanced within 2.7 s) and the twin at 11:28.
   A halted dry run parks until restarted: the twin then sat out 11 h.
