@@ -219,5 +219,9 @@ The `xemm-live` unit, $20 clips, no forced closes. To 2026-10-27 03:11 UTC: 21 t
   - `5a51680`, 10-29 22:02: a hedge replied "filled 213", stamped 531 ms after its send, but its
     fills were not listed within the main path's 10 s. Its fee unknown, the paired trade (about
     +$0.006) was booked as a $0 recovery and counted toward the breaker. A filled reply now waits
-    30 s for the listing.
+    30 s for the listing. 11-05 07:57 went past that too: a fill stamped 567 ms after its send
+    was in `clearinghouseState` at 30 s but not yet in `userFillsByTime`, which lists it now (fee
+    4.5 bps). It was booked the same way, but its recovery took no action, so it did not count
+    toward the breaker. A longer wait would only block the taker, so the 30 s stays (2 of 144
+    hedges since 10-27).
 
