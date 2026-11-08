@@ -59,8 +59,10 @@ pub struct AccountStatus {
     /// Extra marked Lighter uPnL; zero on Hyperliquid (see `AccountSnapshot::hl_unrealized_usd`).
     pub lighter_unrealized_usd: Decimal,
     pub total_available_usd: Decimal,
-    /// Fully marked cross-venue equity (both legs' uPnL included).
-    pub total_equity_usd: Decimal,
+    /// Fully marked cross-venue equity (both legs' uPnL included); none while the Lighter leg's
+    /// uPnL is unmarked, which left it out and tripped the HYPE dry run's drawdown stop during a
+    /// Lighter book outage (2026-11-08).
+    pub total_equity_usd: Option<Decimal>,
     pub aster_open_orders: usize,
     pub lighter_open_orders: usize,
 }
@@ -274,7 +276,7 @@ fn account_status(snapshot: &AccountSnapshot, market: &MarketId) -> AccountStatu
         lighter_equity_usd: snapshot.hl_equity_usd,
         lighter_unrealized_usd: snapshot.hl_unrealized_usd,
         total_available_usd: snapshot.aster_available_usd + snapshot.hl_withdrawable_usd,
-        total_equity_usd: snapshot.total_equity_usd(),
+        total_equity_usd: snapshot.hl_upnl_marked.then(|| snapshot.total_equity_usd()),
         aster_open_orders,
         lighter_open_orders,
     }
@@ -411,5 +413,14 @@ mod tests {
         };
         assert_eq!(exposure_effect(pos, Side::Buy, dec!(0.2)), "reduce");
         assert_eq!(exposure_effect(pos, Side::Sell, dec!(0.2)), "increase");
+    }
+
+    #[test]
+    fn unmarked_lighter_upnl_reports_no_equity() {
+        let (mut snap, market) = (AccountSnapshot::empty(), MarketId::from("HYPE"));
+        (snap.aster_equity_usd, snap.hl_equity_usd, snap.hl_unrealized_usd) = (dec!(177), dec!(205), dec!(17));
+        assert_eq!(account_status(&snap, &market).total_equity_usd, Some(dec!(399)));
+        snap.hl_upnl_marked = false;
+        assert_eq!(account_status(&snap, &market).total_equity_usd, None);
     }
 }
