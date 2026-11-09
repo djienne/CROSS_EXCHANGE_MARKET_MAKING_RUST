@@ -199,7 +199,9 @@ The `xemm-live` unit, $20 clips, no forced closes. To 2026-10-27 03:11 UTC: 21 t
     93 bps, Hyperliquid 59), so a spike filter would cut winners too (11-04). 11-04's own
     trades (8 of 12 recorded) turned that: of all 35, the 6 after a move of more than 40 bps
     in the 1.5 s before netted -8.5 bps on average (4 lost), the other 29 +4.8. That threshold
-    was chosen after looking, and 6 trades are too few to set a filter on.
+    was chosen after looking, and 6 trades are too few to set a filter on. Out of sample, 11-05
+    to 11-08 (37 of 55 recorded): one trade followed such a move (Lighter 92 bps) and lost 21
+    bps, the other 36 averaged +7.1.
 - **Breaker halts:** each successful hedge retry counts toward the 3-an-hour limit, so a fast
   market halted live at 11:31 (4 retries, all rebalanced within 2.7 s) and the twin at 11:28.
   A halted dry run parks until restarted: the twin then sat out 11 h.
