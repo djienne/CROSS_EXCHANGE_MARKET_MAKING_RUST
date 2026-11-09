@@ -1070,6 +1070,12 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
     // appeared; `held` is the gap's direction and the books' latest venue stamp at first sight.
     let confirm = chrono::Duration::milliseconds(markets[0].confirm_ms as i64);
     let mut held: Option<(Direction, DateTime<Utc>)> = None;
+    // Live CASHCAT-LH, 10-27 to 11-08: of 72 trades in the screener's recording, the 7 within 1.5 s
+    // of a move toward the gap of over 40 bps on either venue netted -10.4 bps on average (5 lost),
+    // the other 65 +6.0: Hyperliquid was still moving when its IOC landed (CALIBRATION.md).
+    let max_prior_move = markets[0].max_prior_move_bps;
+    let mut tops = Tops::new();
+    let mut last_spike_log_at: Option<tokio::time::Instant> = None;
     let mut trades_executed = 0u64;
     let mut want: Option<Want> = None;
     let mut next_want_id = 0u64;
@@ -1223,6 +1229,7 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
             wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
             continue;
         }
+        record_tops(&mut tops, now, &aster_book, &lighter_book);
 
         // "Fresh" = a NEW snapshot (a new REST read) arrived since the last iteration —
         // either still pending on the watch, or already consumed by the cooldown select's
@@ -1486,6 +1493,8 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
         held = Some((opp.direction, since));
         let held_for = lighter_book.exch_ts - since;
         let confirmed = confirm.is_zero() || held_for >= confirm;
+        let prior_move = prior_move_bps(&tops, now, opp.direction);
+        let spiked = max_prior_move.zip(prior_move).is_some_and(|(max, moved)| moved > max);
         if let Some(sanity) = book_sanity.entry_block() {
             if exposure_effect_f64(
                 pos_f.aster_qty,
@@ -1575,7 +1584,8 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
                 buy_best_qty: opp.buy_best_qty,
                 aster_book_age_ms: aster_book.age_ms(now),
                 lighter_book_age_ms: lighter_book.age_ms(now),
-                force_record: execution_enabled && confirmed,
+                prior_move_bps: prior_move,
+                force_record: execution_enabled && confirmed && !spiked,
             },
             cfg.arb.required_gross_edge_bps(),
         );
@@ -1605,7 +1615,14 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
                 last_gate_log = Some((gate.decision, tokio::time::Instant::now()));
             }
         }
-        if !gate.allow_execution || !confirmed {
+        if spiked && gate.allow_execution && confirmed
+            && last_spike_log_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(5)) {
+            info!("spike guard holding the gap market={} direction={} gross={}bps prior_move={}bps max={}bps",
+                spec.market_id, opp.direction.as_str(spec.first, spec.hedge), opp.gross_edge_bps,
+                prior_move.unwrap_or_default(), max_prior_move.unwrap_or_default());
+            last_spike_log_at = Some(tokio::time::Instant::now());
+        }
+        if !gate.allow_execution || !confirmed || spiked {
             wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
             continue;
         }
@@ -1917,6 +1934,37 @@ fn scan_inputs_unchanged(
     }
 }
 
+/// How far back `prior_move_bps` looks, by the local clock (the screener's, which found the losses).
+const PRIOR_MOVE_WINDOW_MS: i64 = 1500;
+
+/// Touches seen at the local clock: the first leg's bid and ask, then the hedge's.
+type Tops = VecDeque<(DateTime<Utc>, [Decimal; 4])>;
+
+/// Appends the touches when they changed, keeping the newest top at or before the window's start:
+/// the price there.
+fn record_tops(tops: &mut Tops, now: DateTime<Utc>, first: &OrderBook, hedge: &OrderBook) {
+    let (Some(fb), Some(fa), Some(hb), Some(ha)) = (first.best_bid(), first.best_ask(), hedge.best_bid(), hedge.best_ask())
+    else { return };
+    let top = [fb.px, fa.px, hb.px, ha.px];
+    if top.iter().any(|px| *px <= Decimal::ZERO) || tops.back().is_some_and(|(_, last)| *last == top) { return; }
+    tops.push_back((now, top));
+    let start = now - chrono::Duration::milliseconds(PRIOR_MOVE_WINDOW_MS);
+    while tops.get(1).is_some_and(|(at, _)| *at <= start) { tops.pop_front(); }
+}
+
+/// The larger move toward `direction`'s gap, in bps, of the two venues' touches since the window's
+/// start: the first leg's bid up or the hedge's ask down when selling the first leg, the first
+/// leg's ask down or the hedge's bid up when buying it. Negative when both moved away.
+fn prior_move_bps(tops: &Tops, now: DateTime<Utc>, direction: Direction) -> Option<Decimal> {
+    let (_, new) = tops.back()?;
+    let start = now - chrono::Duration::milliseconds(PRIOR_MOVE_WINDOW_MS);
+    let (_, old) = tops.iter().rev().find(|(at, _)| *at <= start).or(tops.front())?;
+    let bps = |i: usize| (new[i] - old[i]) / old[i] * Decimal::from(10_000);
+    Some(match direction {
+        Direction::SellAsterBuyLighter => bps(0).max(-bps(3)),
+        Direction::SellLighterBuyAster => (-bps(1)).max(bps(2)),
+    }.round_dp(1))
+}
 
 fn book_ok(book: &OrderBook, now: chrono::DateTime<Utc>, max_age_ms: i64) -> bool {
     book.best_bid().is_some() && book.best_ask().is_some() && !book.is_crossed()
@@ -3992,6 +4040,33 @@ mod tests {
     fn book(bid: Decimal, ask: Decimal) -> OrderBook {
         let now = Utc::now();
         OrderBook::from_levels([(bid, dec!(10))], [(ask, dec!(10))], now, now)
+    }
+
+    #[test]
+    fn prior_move_is_the_last_1_5_s_toward_the_gap() {
+        let shipped: toml::Value = toml::from_str(include_str!("../../bot.toml")).unwrap();
+        let cfg = Config::from_table(shipped["taker"].clone()).unwrap();
+        assert_eq!(cfg.markets.iter().find(|m| m.id().0 == "CASHCAT-LH").unwrap().max_prior_move_bps, Some(dec!(40)));
+        let t0 = Utc::now();
+        let at = |ms| t0 + chrono::Duration::milliseconds(ms);
+        let (sell_first, buy_first) = (Direction::SellAsterBuyLighter, Direction::SellLighterBuyAster);
+        let hedge = book(dec!(100), dec!(101));
+        let mut tops = Tops::new();
+        record_tops(&mut tops, at(0), &book(dec!(100), dec!(101)), &hedge);
+        // The first leg's touch up 50 bps: toward a sale of it, away from a purchase.
+        let up = book(dec!(100.5), dec!(101.505));
+        record_tops(&mut tops, at(1000), &up, &hedge);
+        assert_eq!(prior_move_bps(&tops, at(1000), sell_first), Some(dec!(50)));
+        assert_eq!(prior_move_bps(&tops, at(1000), buy_first), Some(dec!(0)));
+        // 1.5 s on, that move is the price at the window's start; an unchanged top is not kept.
+        assert_eq!(prior_move_bps(&tops, at(2600), sell_first), Some(dec!(0)));
+        record_tops(&mut tops, at(2600), &up, &hedge);
+        assert_eq!(tops.len(), 2);
+        // The hedge's ask down 40 bps counts toward selling the first leg; the 0 ms top is dropped.
+        record_tops(&mut tops, at(2700), &up, &book(dec!(99.6), dec!(100.596)));
+        assert_eq!(tops.len(), 2);
+        assert_eq!(prior_move_bps(&tops, at(2700), sell_first), Some(dec!(40)));
+        assert_eq!(prior_move_bps(&tops, at(2700), buy_first), Some(dec!(0)));
     }
 
     fn depth_book(

@@ -67,6 +67,9 @@ pub struct OpportunitySample {
     pub decision: String,
     pub gate_threshold_bps: Option<Decimal>,
     pub history_sample_count: usize,
+    /// The largest move toward the gap by either venue's touch in the 1.5 s before (bps).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_move_bps: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -98,6 +101,7 @@ pub struct OpportunityGateInput<'a> {
     pub buy_best_qty: Decimal,
     pub aster_book_age_ms: i64,
     pub lighter_book_age_ms: i64,
+    pub prior_move_bps: Option<Decimal>,
     pub force_record: bool,
 }
 
@@ -318,6 +322,7 @@ impl OpportunityGate {
             buy_best_px: input.buy_best_px, sell_best_qty: input.sell_best_qty, buy_best_qty: input.buy_best_qty,
             aster_book_age_ms: input.aster_book_age_ms, lighter_book_age_ms: input.lighter_book_age_ms,
             decision: decision.to_string(), gate_threshold_bps: threshold_bps, history_sample_count: sample_count,
+            prior_move_bps: input.prior_move_bps,
         };
         let next = self.sequence + 1;
         if self.tx.try_send(HistoryCommand::Sample(next, sample)).is_err() {
@@ -444,6 +449,7 @@ mod tests {
             buy_best_qty: dec!(2.00),
             aster_book_age_ms: 10,
             lighter_book_age_ms: 20,
+            prior_move_bps: None,
             force_record: true,
         }
     }
@@ -488,6 +494,7 @@ mod tests {
             decision: "would_execute".to_string(),
             gate_threshold_bps: None,
             history_sample_count: 0,
+            prior_move_bps: None,
         }
     }
 

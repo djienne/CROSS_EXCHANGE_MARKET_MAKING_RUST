@@ -123,6 +123,9 @@ desired_notional = "20"
 # IOC lands ~0.5 s after the decision, and the gaps that closed faster (Lighter moving first) lost
 # 16 bps a trade live (2026-10-27).
 confirm_ms = 500
+# A gap waits while either venue's touch moved over 40 bps toward it in the last 1.5 s: live, the
+# 7 trades of 72 recorded that followed such a move netted -10.4 bps on average (10-27 to 11-08).
+max_prior_move_bps = "40"
 
 [maker.edge]
 # The required quoted edge is 14 + 1.5 + 2 + 1 = 18.5 bps above configured

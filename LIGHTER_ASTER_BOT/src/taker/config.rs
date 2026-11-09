@@ -569,6 +569,10 @@ pub struct MarketCfg {
     /// appeared before its orders go out (0: at once).
     #[serde(default)]
     pub confirm_ms: u64,
+    /// Holds a gap while either venue's touch moved more than this many bps toward it in the
+    /// last 1.5 s, until that move is older (none: off).
+    #[serde(default)]
+    pub max_prior_move_bps: Option<Decimal>,
 }
 
 impl MarketCfg {
@@ -601,6 +605,7 @@ mod tests {
                 market_id: Some("HYPE".to_string()),
                 desired_notional: None,
                 confirm_ms: 0,
+                max_prior_move_bps: None,
             }],
         }
     }

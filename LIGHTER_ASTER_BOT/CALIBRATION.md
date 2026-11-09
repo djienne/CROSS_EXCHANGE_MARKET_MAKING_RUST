@@ -201,7 +201,9 @@ The `xemm-live` unit, $20 clips, no forced closes. To 2026-10-27 03:11 UTC: 21 t
     in the 1.5 s before netted -8.5 bps on average (4 lost), the other 29 +4.8. That threshold
     was chosen after looking, and 6 trades are too few to set a filter on. Out of sample, 11-05
     to 11-08 (37 of 55 recorded): one trade followed such a move (Lighter 92 bps) and lost 21
-    bps, the other 36 averaged +7.1.
+    bps, the other 36 averaged +7.1. Hence `max_prior_move_bps = "40"` (11-09): such a gap
+    waits until the move is 1.5 s old. Each recorded opportunity now carries its
+    `prior_move_bps`, so the filter can be judged on every trade, not only the recorded ones.
 - **Breaker halts:** each successful hedge retry counts toward the 3-an-hour limit, so a fast
   market halted live at 11:31 (4 retries, all rebalanced within 2.7 s) and the twin at 11:28.
   A halted dry run parks until restarted: the twin then sat out 11 h.

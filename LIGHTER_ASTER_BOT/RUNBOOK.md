@@ -74,7 +74,10 @@ cargo build --release --locked        # Rust 1.92; the Lighter signers exist for
   either venue. Its `desired_notional` sizes that market's orders in place of `[taker.arb]`'s,
   and its `confirm_ms` (default 0) sends them only once a hedge book the venue stamped that long
   after the gap appeared still shows it, in the same direction. Each trade report logs that
-  stamp's distance from the gap's first sight as `held_ms`.
+  stamp's distance from the gap's first sight as `held_ms`. Its `max_prior_move_bps` (default
+  off) also holds the gap while either venue's touch moved more than that toward it in the last
+  1.5 s (local clock), logging `spike guard holding the gap`. Each recorded opportunity carries
+  that move as `prior_move_bps`.
 - The taker refuses to start on a delisted Hyperliquid coin, on a coin whose legs' mids are over
   5% apart (two tokens under one name), and on one whose common size step is worth more than
   `max_position_mismatch_usd`: a partial fill could leave a residual that recovery cannot close
