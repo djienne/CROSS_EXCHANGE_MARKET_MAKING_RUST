@@ -173,6 +173,7 @@ pub fn start(
         warn!("failed to initialize book sanity state {}: {e:#}", state_path.display());
     }
     let Some(aster_books) = aster_books.filter(|_| cfg.arb.book_sanity.enabled) else {
+        info!("book_sanity off market={}: no REST cross-check of its books (Aster-Lighter markets only)", spec.market_id);
         return handle;
     };
 

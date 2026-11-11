@@ -495,7 +495,11 @@ fresher than `max_book_staleness_ms`, and the edge passes the entry gate: the gr
 90th percentile of recent samples and the required edge plus `min_extra_bps`, blocking during
 history warmup. Its Aster book is the `depth20@100ms` snapshot with the newer `bookTicker` top
 laid over it (by update id): depth alone lags the top by up to 100 ms. Aster orders are bounded
-IOC limits; Lighter uses its native market/IOC path and Hyperliquid bounded IOCs.
+IOC limits; Lighter uses its native market/IOC path and Hyperliquid bounded IOCs. The REST
+cross-check of the websocket books (`[taker.arb.book_sanity]`) runs on Aster-Lighter markets
+only (`book_sanity off` in the log elsewhere): on a Lighter-first or Hyperliquid-hedged market
+the books are guarded by Lighter's sequence gaps, the staleness limits and, on Hyperliquid, a
+top that may lead its depth snapshot by 2 s at most.
 
 An unknown submission outcome keeps its order and client ids: a missing order row or a flat
 position does not prove no fill. A known missing hedge gets one retry within
