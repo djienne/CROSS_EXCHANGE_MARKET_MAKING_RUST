@@ -501,8 +501,9 @@ An unknown submission outcome keeps its order and client ids: a missing order ro
 position does not prove no fill. A known missing hedge gets one retry within
 `hedge_retry_timeout_ms`, bounded `hedge_retry_slippage_bps` off the venue's current REST mid
 (the missed order's decision-price bound would miss again); one that ends unfilled hands over at
-once, and a filled one has another `hedge_retry_timeout_ms` to show in the positions. Recovery then closes only the same-sign net residual, and an unresolved retry or close
-stops further submissions. The ledger's `actual_net_usd` is
+once, and a filled one has another `hedge_retry_timeout_ms` to show in the positions. Recovery then
+closes only the same-sign net residual: a failed read before a close is read again until its 30 s
+deadline, and an unresolved retry or close stops further submissions. The ledger's `actual_net_usd` is
 matched spread capture minus fees, and a recovery row prices the failed execution's and its
 closes' fills the same way. It falls back to a conservative equity-delta estimate when a fill is
 unknown, and that estimate also moves with the held inventory's marks.
