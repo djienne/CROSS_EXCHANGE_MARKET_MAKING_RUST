@@ -2638,6 +2638,12 @@ pub(crate) async fn resolve_aster_evidence(
     }
 }
 
+/// The streams' fills, priced by the venue and adding up to the order's filled size: short of it
+/// a trade message was missed, and the history has them all.
+fn stream_priced(seen: &LighterFillConfirmation) -> bool {
+    seen.fill.as_ref().is_some_and(|fill| fill.fee_provenance == FeeProvenance::Venue && fill.qty == seen.filled_qty)
+}
+
 pub(crate) async fn resolve_lighter_evidence(
     spec: &MarketSpec, lighter: &impl TerminalOrders, outcome: &LighterOutcome,
     mut pending: Option<PendingFill>, side: Side, qty: Decimal, timeout: Duration,
@@ -2655,8 +2661,7 @@ pub(crate) async fn resolve_lighter_evidence(
         value.terminal_order.as_ref().is_some_and(|order| order.is_terminal())
             || (value.filled_qty == qty && value.fill.is_some())
     };
-    let needs_history = confirmation.as_ref().is_none_or(|value| !confirmed_terminal(value)
-        || value.fill.as_ref().is_none_or(|fill| fill.fee_provenance != FeeProvenance::Venue));
+    let needs_history = confirmation.as_ref().is_none_or(|value| !confirmed_terminal(value) || !stream_priced(value));
     if needs_history {
         let remaining = timeout.saturating_sub(start.elapsed());
         let history = lighter.resolve_order_terminal(&spec.market_id, client, side, reply, remaining);
@@ -2666,8 +2671,7 @@ pub(crate) async fn resolve_lighter_evidence(
             tokio::pin!(stream);
             tokio::select! {
                 value = &mut stream => {
-                    let strong = confirmed_terminal(&value) && value.fill.as_ref()
-                        .is_some_and(|fill| fill.fee_provenance == FeeProvenance::Venue);
+                    let strong = confirmed_terminal(&value) && stream_priced(&value);
                     confirmation = Some(value);
                     if !strong { if let Ok(value) = history.await { confirmation = Some(value); } }
                 }
@@ -4657,6 +4661,15 @@ mod tests {
         let sold = Flow::of(Side::Sell, fill(dec!(199), dec!(19.9), dec!(0), FeeProvenance::Unknown), dec!(4.5));
         let failed = ExecutionError::AccountingUnavailable { details: String::new(), flow: Flow::sum([bought, sold]) };
         assert_eq!(realized_recovery_loss([failed.flow()], dec!(0.0995)), Some(Decimal::ZERO));
+    }
+
+    #[test]
+    fn stream_fills_short_of_the_filled_size_need_the_history() {
+        let fill = FillSummary::from_qty_notional(dec!(100), dec!(10), dec!(0)).map(|fill| fill.with_fee_provenance(FeeProvenance::Venue));
+        let mut seen = LighterFillConfirmation { fee_evidence: Vec::new(), fill, terminal_order: None, filled_qty: dec!(100) };
+        assert!(stream_priced(&seen));
+        seen.filled_qty = dec!(214);
+        assert!(!stream_priced(&seen), "the order filled 214; the trades seen add up to 100");
     }
 
     #[test]
