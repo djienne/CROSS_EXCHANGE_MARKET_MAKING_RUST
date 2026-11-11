@@ -527,9 +527,12 @@ pub fn parse_since(raw: &str, bot_start: DateTime<Utc>) -> Result<DateTime<Utc>>
     if raw.eq_ignore_ascii_case("startup") || raw.eq_ignore_ascii_case("now") {
         return Ok(bot_start);
     }
-    DateTime::parse_from_rfc3339(raw)
+    let since = DateTime::parse_from_rfc3339(raw)
         .map(|dt| dt.with_timezone(&Utc))
-        .with_context(|| format!("parse pnl.since={raw:?} as RFC3339 timestamp"))
+        .with_context(|| format!("parse pnl.since={raw:?} as RFC3339 timestamp"))?;
+    // Until a later `since` no trade counts: the loss breaker would be off, unnoticed.
+    anyhow::ensure!(since <= bot_start, "pnl.since={raw:?} is after the start: no trade would count toward max_loss_usdc");
+    Ok(since)
 }
 
 fn load_cumulative_pnl(
@@ -709,6 +712,7 @@ mod tests {
         let start = Utc::now();
         let parsed = parse_since("2026-06-23T23:00:00Z", start).unwrap();
         assert_eq!(format_ts(parsed), "2026-06-23T23:00:00Z");
+        assert!(parse_since("2099-01-01T00:00:00Z", start).is_err(), "a future since disarms the loss breaker");
     }
 
     #[test]

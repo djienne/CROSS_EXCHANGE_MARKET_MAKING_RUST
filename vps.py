@@ -273,10 +273,17 @@ def live(action, flags=""):
                     tar.addfile(info, f)
         ssh(f"umask 077 && tar -x --no-same-owner -C {REMOTE} && chmod 600 {REMOTE}/*.env && ls -l {REMOTE}/*.env", stdin=buf.getvalue())
     elif action == "start":
-        unit = LIVE_UNIT.format(market=LIVE_MARKET, flags=flags)
-        ssh(f"cat > /etc/systemd/system/{LIVE}.service <<'EOF'\n{unit}EOF\n"
-            f"systemctl daemon-reload && if systemctl is-active -q {LIVE}; then echo already running; else systemctl start {LIVE}; fi"
-            f" && sleep 5 && systemctl --no-pager status {LIVE} | head -5")
+        def unit(flags):
+            return (f"cat > /etc/systemd/system/{LIVE}.service <<'EOF'\n{LIVE_UNIT.format(market=LIVE_MARKET, flags=flags)}EOF\n"
+                    "systemctl daemon-reload")
+        try:
+            ssh(f"{unit(flags)} && if systemctl is-active -q {LIVE}; then echo already running; else systemctl start {LIVE}; fi"
+                f" && sleep 5 && systemctl --no-pager status {LIVE} | head -5")
+        finally:
+            # The flags are this start's: left in the unit, a later plain `systemctl start` would
+            # acknowledge a new breaker unreviewed and drop the drawdown baseline.
+            if flags:
+                ssh(unit(""))
     elif action == "stop":
         ssh(f"systemctl stop {LIVE}; systemctl --no-pager status {LIVE} | head -3")
     elif action == "logs":

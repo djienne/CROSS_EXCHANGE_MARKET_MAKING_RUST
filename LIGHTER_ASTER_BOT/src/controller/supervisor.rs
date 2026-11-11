@@ -91,6 +91,16 @@ pub trait Engines {
     fn status(&self) -> impl Future<Output = Result<Value>>;
 }
 
+/// Below this much free space on the runs' disk the bot halts while it can still write: a full
+/// disk fails a journal mid-trade, and a failed write ends an execution before its legs are
+/// resolved. The live journals take a few MB a day.
+const DISK_FLOOR_BYTES: u64 = 200 << 20;
+
+/// The free bytes of `dir`'s disk when under `floor`; an unreadable disk counts as enough.
+fn disk_low(dir: &Path, floor: u64) -> Option<u64> {
+    fs2::available_space(dir).ok().filter(|free| *free < floor)
+}
+
 /// Controller files: `bot-<M>.*`. The XEMM stem `bot-<M>` names XEMM's own journal, trip latch
 /// and unclean-session marker (`bot-<M>-journal.jsonl`, `bot-<M>.trip.json`, `bot-<M>.active.json`).
 pub struct Files {
@@ -269,6 +279,9 @@ impl<E: Engines> Supervisor<E> {
     }
 
     async fn tick(&mut self) {
+        if let Some(free) = self.files.events.parent().and_then(|dir| disk_low(dir, DISK_FLOOR_BYTES)) {
+            return self.safe_halt("disk_low", json!({"free_bytes": free})).await;
+        }
         let Some(status) = self.read_status().await else {
             // Unreadable status is almost always the network: halting cannot drain or cancel
             // without it either, so pause new exposure and wait for it to come back.
@@ -509,6 +522,7 @@ mod tests {
         }
         sup.tick().await;
         assert!(!paused.load(Ordering::Acquire) && sup.halted.is_none());
+        assert!(disk_low(&dir, u64::MAX).is_some() && disk_low(&dir, 0).is_none(), "free space is read against the floor");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -66,7 +66,8 @@ python vps.py live creds|start|stop|status|logs   # the live bot (REAL orders)
 
 `sync` never restarts the live bot: `live stop`, then `live start`, puts it on the new build.
 After a breaker halt, review `runs/bot-CASHCAT-LH.breaker.json`, then `live start --ack-breaker`
-starts it once with `--ack-breaker` (add `--reset-breaker-baseline` after an equity-drawdown halt).
+starts it once with `--ack-breaker` (add `--reset-breaker-baseline` after an equity-drawdown halt);
+the unit is rewritten without the flags once started, so a later start cannot reuse them.
 `live creds` sends the Lighter and Hyperliquid env files (the live route has no Aster leg); never
 let one Lighter API key trade from two hosts at once (its nonces are per process).
 

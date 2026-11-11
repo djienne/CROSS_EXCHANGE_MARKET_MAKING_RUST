@@ -127,6 +127,9 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let _lock = match (observe_only, selected.as_slice()) {
                 (false, [market]) => {
                     let runs = std::path::Path::new(crate::controller::RUNS_DIR);
+                    // `run`'s halt latch: no controller checks it for this command.
+                    let latch = crate::controller::supervisor::Files::new(runs, &market.id().0).breaker;
+                    anyhow::ensure!(!latch.exists(), "{} is latched: review the halt, then start `run` with --ack-breaker", latch.display());
                     let legs = crate::controller::legs(market).iter().map(|leg| crate::controller::lock_market(runs, leg))
                         .collect::<anyhow::Result<Vec<_>>>()?;
                     Some((crate::controller::lock_market(runs, &market.id().0)?, legs))

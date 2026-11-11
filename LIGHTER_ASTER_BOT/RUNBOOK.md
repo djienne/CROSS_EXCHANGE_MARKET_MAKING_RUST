@@ -431,7 +431,10 @@ the simulated venues' `sim-<M>.state.json` and `sim-<M>.diag.jsonl`.
   Unverified gains never count; unverified losses do. The engines' own stops (10) normally trip
   first.
 - resting orders at startup (`startup_orders_not_clear`);
-- an engine that exits, with an error or not (`engine_exited`).
+- an engine that exits, with an error or not (`engine_exited`);
+- under 200 MB free on the disk holding `runs/` (`disk_low`): a journal write that fails
+  mid-trade ends the execution before its legs are resolved, so the bot stops while it can
+  still write.
 
 An engine that fails its drain or does not stop within 200 s makes the exit nonzero
 (`bot_stopped` carries the error).
@@ -450,7 +453,14 @@ Review `bot-<M>.events.jsonl` and the breaker, then restart with `--ack-breaker`
 archives it as `.acked.<stamp>` (on the Tokyo VPS, `python vps.py live start --ack-breaker`). An
 equity-drawdown breaker also needs `--reset-breaker-baseline` (`live start --ack-breaker
 --reset-breaker-baseline` there), which re-arms the drawdown stop on the next sample. The
-engines' own latches below are separate and each blocks its engine on its own.
+engines' own latches below are separate and each blocks its engine on its own. `taker run`
+has no controller, but refuses to trade while the latch exists.
+
+**Moving funds.** The drawdown stop compares total equity with one baseline and knows no
+deposit, withdrawal or transfer: a deposit hides losses up to its size, and a transfer between
+the venues reads as a loss while in flight (over 15 USDC it halts the bot). Stop the bot first;
+after a deposit or a withdrawal start it once with `--reset-breaker-baseline`, which re-arms the
+baseline at the new equity (a transfer that has landed needs nothing).
 
 **XEMM.**
 
@@ -478,7 +488,8 @@ marker holds complete scoped order identities:
   newest 200 rows of the account's order history: resolve that one from the venues' own records,
   then archive it by hand as XEMM's.
 - The loss breaker `circuit_breaker_<M>.json` trips when the ledger's PnL since
-  `[taker.pnl] since` reaches −`max_loss_usdc` (10), on the same terms. `reset-circuit-breaker`
+  `[taker.pnl] since` reaches −`max_loss_usdc` (10), on the same terms. A `since` later than
+  the start is refused: no trade would count. `reset-circuit-breaker`
   archives it only: it neither resolves a session nor rewrites the ledger, so the breaker returns
   at the next start while that PnL is still at or below the limit.
 - More than `max_recovered_failures_per_hour` (3) recoveries in an hour, each successful hedge
