@@ -211,7 +211,8 @@ fn confirmation(client_order_index: i64, fills: &[Value]) -> LighterFillConfirma
 }
 
 /// Fast five-level `l2Book` snapshots under a newer `bbo` top. HYPE snapshots were ~0.54 s
-/// apart on 2026-09-28; deeper levels retain their snapshot age. The IOC bound caps fill price.
+/// apart on 2026-09-28; deeper levels retain their snapshot age, which a top may lead by 2 s
+/// at most. The IOC bound caps fill price.
 #[derive(Default)]
 struct Book {
     /// The last snapshot and the newer top, if any.
@@ -237,8 +238,10 @@ impl Book {
         }
         let Some(depth) = last_depth else { return };
         let book = match last_top {
-            Some(top) => crate::taker::aster::ws::overlay(depth, top),
-            None => depth.clone(),
+            // Snapshots come ~0.54 s apart, the top at most 0.62 s ahead (CASHCAT, 2026-11-11): one
+            // over 2 s ahead means they stopped, and the book keeps their age, so it reads stale.
+            Some(top) if (top.exch_ts - depth.exch_ts).num_milliseconds() <= 2_000 => crate::taker::aster::ws::overlay(depth, top),
+            _ => depth.clone(),
         };
         self.latest.store(Some(Arc::new(book)));
         if let Some(wake) = self.wake.get() {
@@ -297,6 +300,8 @@ mod tests {
         assert_eq!(top.exch_ts.timestamp_millis(), 11);
         cell.publish(book(dec!(40), dec!(41), 12, true));
         assert_eq!(cell.latest.load_full().unwrap().best_bid().unwrap().px, dec!(40), "a newer snapshot drops the older top");
+        cell.publish_bbo(book(dec!(39.5), dec!(40.5), 2_013, false));
+        assert_eq!(cell.latest.load_full().unwrap().exch_ts.timestamp_millis(), 12, "snapshots stopped: the book keeps their age");
         cell.mark_stream_down();
         assert!(cell.latest.load().is_none());
     }
