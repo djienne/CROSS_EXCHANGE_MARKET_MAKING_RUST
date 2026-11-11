@@ -820,7 +820,7 @@ enum ExecutionError {
     #[error("{details}")]
     Unreconciled { details: String, flow: Option<Flow> },
     #[error("{details}")]
-    AccountingUnavailable { details: String },
+    AccountingUnavailable { details: String, flow: Option<Flow> },
     #[error("{details}")]
     OutcomeUnresolved { details: String },
     #[error(transparent)]
@@ -838,6 +838,11 @@ impl ExecutionError {
 
     fn is_skip(&self) -> bool {
         matches!(self, ExecutionError::Skipped { .. })
+    }
+
+    /// What a failed execution's fills did, for its recovery to price.
+    fn flow(&self) -> Option<Flow> {
+        match self { Self::Unreconciled { flow, .. } | Self::AccountingUnavailable { flow, .. } => *flow, _ => None }
     }
 }
 
@@ -1818,9 +1823,8 @@ pub async fn run(mut cfg: Config, markets: Vec<MarketCfg>, options: RunOptions, 
                     continue;
                 }
                 begin_execution(&execution_epoch);
-                let flow = match &e { ExecutionError::Unreconciled { flow, .. } => *flow, _ => None };
                 let recovery_result =
-                    recover_if_needed(&cfg, &spec, &aster, &lighter, &http, margins, flow, &session, &execution_journal).await;
+                    recover_if_needed(&cfg, &spec, &aster, &lighter, &http, margins, e.flow(), &session, &execution_journal).await;
                 let recovery = recovery_result?;
                 info!(
                     "rescue check complete action_taken={} estimated_loss=${} final_aster_pos={} final_lighter_pos={} lighter_ws={:?} aster_open_orders={} lighter_open_orders={} available_after=${}",
@@ -2827,9 +2831,12 @@ async fn execute_opportunity(
         lighter.rest_open_orders_count(&spec.market_id), reconcile_margins(aster, lighter),
         async { match aster_fees { Some(task) => task.await.ok().and_then(Result::ok), None => None } });
     let aster_fill = aster_retry_fills.into_iter().fold(priced.or(a.fill), add_fill_summary);
+    // Both legs are known to be balanced here: a booking failure still carries the fills, or its
+    // recovery would price the loss by the equity delta, marks of the whole inventory included.
+    let unavailable = |details: String| ExecutionError::AccountingUnavailable { details, flow: Flow::sum(flows.iter().copied()) };
     let economics = match (aster_fill, lighter_fill) {
-        (Some(a), Some(l)) => actual_economics(cfg, opp, a, l),
-        _ => Err(ExecutionError::AccountingUnavailable { details: "terminal fill economics incomplete".to_string() }),
+        (Some(a), Some(l)) => actual_economics(cfg, opp, a, l).map_err(|error| unavailable(error.to_string())),
+        _ => Err(unavailable("terminal fill economics incomplete".to_string())),
     };
     row["orders"] = serde_json::json!(orders);
     row["aster_fill"] = serde_json::json!(aster_fill);
@@ -2852,8 +2859,8 @@ async fn execute_opportunity(
             "residual_notional_usd": economics.residual_notional_usd});
     }
     append_execution_record(journal,row).await?;
-    if !clean_orders { return Err(ExecutionError::AccountingUnavailable { details: "open-order evidence unavailable or nonempty".to_string() }); }
-    let margin_after = margin_after.map_err(|error| ExecutionError::AccountingUnavailable { details: format!("{error:#}") })?;
+    if !clean_orders { return Err(unavailable("open-order evidence unavailable or nonempty".to_string())); }
+    let margin_after = margin_after.map_err(|error| unavailable(format!("{error:#}")))?;
     let economics = economics?;
     if unfilled {
         session.resolve_execution().await?;
@@ -2993,7 +3000,7 @@ fn actual_economics(
 ) -> std::result::Result<ActualEconomics, ExecutionError> {
     if aster_fill.fee_provenance != FeeProvenance::Venue || lighter_fill.fee_provenance != FeeProvenance::Venue {
         return Err(ExecutionError::AccountingUnavailable {
-            details: "one or both execution fees are unknown or estimated".to_string(),
+            details: "one or both execution fees are unknown or estimated".to_string(), flow: None,
         });
     }
     let fill_qty_mismatch = (aster_fill.qty - lighter_fill.qty).abs();
@@ -3005,7 +3012,7 @@ fn actual_economics(
                 lighter_fill.qty,
                 fill_qty_mismatch,
                 fill_qty_mismatch * opp.ref_px
-            ),
+            ), flow: None,
         });
     }
     let (sell_fill, buy_fill) = match opp.direction {
@@ -3421,26 +3428,43 @@ async fn recover_if_needed(
     let mut action_taken = false;
     let mut in_flight = false;
     let mut baseline = None;
+    let mut read_error = None;
     let result = tokio::time::timeout_at(deadline, async {
         for attempt in 0..=3 {
-            let (position, (a_book, l_book)) = tokio::join!(
-                reconcile_positions(&spec.market_id, aster, lighter),
-                fetch_rest_books(http, cfg, aster, lighter, spec),
-            );
-            let position = position?;
+            // No order is in flight here, so a failed read is no unknown order: it is read again
+            // until the deadline. Ending on it halted the bot with its residual still open.
+            let (position, mark, l_mark, margins) = loop {
+                let reads = async {
+                    let (position, (a_book, l_book)) = tokio::join!(
+                        reconcile_positions(&spec.market_id, aster, lighter),
+                        fetch_rest_books(http, cfg, aster, lighter, spec),
+                    );
+                    let (position, a_book, l_book) = (position?, a_book?, l_book?);
+                    let mark = a_book.mid().context("recovery Aster mark unavailable")?;
+                    let l_mark = l_book.mid().context("recovery Lighter mark unavailable")?;
+                    anyhow::ensure!(mark > Decimal::ZERO && l_mark > Decimal::ZERO
+                        && !a_book.is_crossed() && !l_book.is_crossed(), "invalid recovery books");
+                    // Recovery removes the unhedged residual only; the hedged inventory stays open.
+                    let margins = if position.net_qty().abs() * mark <= cfg.risk.max_position_mismatch_usd {
+                        let (a_open, l_open, margins) = tokio::join!(aster.open_orders_count(&spec.market_id),
+                            lighter.rest_open_orders_count(&spec.market_id), reconcile_margins(aster, lighter));
+                        anyhow::ensure!(a_open? == 0 && l_open? == 0, "recovery has unverified/live open orders");
+                        Some(margins?)
+                    } else { None };
+                    Ok::<_, anyhow::Error>((position, mark, l_mark, margins))
+                };
+                match reads.await {
+                    Ok(reads) => break reads,
+                    Err(error) => {
+                        warn!("recovery read failed; reading again: {error:#}");
+                        read_error = Some(format!("{error:#}"));
+                        // Ponytail: 3 s keeps the retries' two Lighter reads under its 60 a minute.
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                }
+            };
             if baseline.is_none() { baseline = Some(position); }
-            let (a_book, l_book) = (a_book?, l_book?);
-            let mark = a_book.mid().context("recovery Aster mark unavailable")?;
-            let l_mark = l_book.mid().context("recovery Lighter mark unavailable")?;
-            anyhow::ensure!(mark > Decimal::ZERO && l_mark > Decimal::ZERO
-                && !a_book.is_crossed() && !l_book.is_crossed(), "invalid recovery books");
-            // Recovery removes the unhedged residual only; the hedged inventory stays open.
-            let balanced = position.net_qty().abs() * mark <= cfg.risk.max_position_mismatch_usd;
-            if balanced {
-                let (a_open, l_open, margins) = tokio::join!(aster.open_orders_count(&spec.market_id),
-                    lighter.rest_open_orders_count(&spec.market_id), reconcile_margins(aster, lighter));
-                anyhow::ensure!(a_open? == 0 && l_open? == 0, "recovery has unverified/live open orders");
-                let margins = margins?;
+            if let Some(margins) = margins {
                 let loss = realized_recovery_loss([flow], mark).unwrap_or_else(|| estimated_recovery_loss(margin_before, margins));
                 return Ok::<_, anyhow::Error>(RecoveryReport { execution_id: execution_id.clone(), action_taken,
                     position, lighter_ws_qty: lighter_ws_divergence(aster, lighter, &spec.market_id, position).0,
@@ -3508,7 +3532,7 @@ async fn recover_if_needed(
         result => {
             let detail = match result {
                 Ok(Err(error)) => format!("{error:#}"),
-                Err(_) => "recovery exceeded thirty seconds".to_string(),
+                Err(_) => format!("recovery exceeded thirty seconds{}", read_error.map(|error| format!(": {error}")).unwrap_or_default()),
                 _ => unreachable!(),
             };
             let evidence = serde_json::json!({ "schema_version": 2, "economic_status": "incomplete",
@@ -4629,6 +4653,10 @@ mod tests {
         let part = Flow::of(Side::Sell, fill(dec!(190), dec!(18.9), dec!(0), FeeProvenance::Venue), dec!(0));
         assert_eq!(realized_recovery_loss([bought, part], dec!(0.1)).unwrap(), dec!(0.06418));
         assert_eq!(realized_recovery_loss([bought, None], dec!(0.1)), None);
+        // A booking failure with both legs filled (the hedge's fee unlisted) is priced by them too.
+        let sold = Flow::of(Side::Sell, fill(dec!(199), dec!(19.9), dec!(0), FeeProvenance::Unknown), dec!(4.5));
+        let failed = ExecutionError::AccountingUnavailable { details: String::new(), flow: Flow::sum([bought, sold]) };
+        assert_eq!(realized_recovery_loss([failed.flow()], dec!(0.0995)), Some(Decimal::ZERO));
     }
 
     #[test]
