@@ -154,9 +154,12 @@ account value, cost $0.165 (fees $0.072, funding ~0).
   0.09109 (+26 bps) and Hyperliquid's mid 14.6 bps lower. Venue equity values the short leg at
   the mark, so it read +$0.145 just before a close that realized -$0.165. On this route, equity
   is not liquidation value: judge it by closing prices.
-- **Funding:** Lighter's `fundings` `direction` names the side that receives (the 21:00 row
-  matched the $0.012 our short received). Over 7 days the short-Lighter, long-Hyperliquid carry
-  averaged ~0 bps/h, with Lighter's hourly rate swinging by up to ±3-9 bps.
+- **Funding:** Lighter's `fundings` `direction` names the side that pays: `long` at the base
+  +0.0012 %/h, where its signed `funding-rates` read positive (checked 11-11; this note said
+  "receives" until then). The 10-26 21:00 `short` row is $0.012 our short paid. From the VPS start
+  to 11-11 the short received ~$0.47 on Lighter (public rates on the recorded position) and the
+  long paid $0.51 on Hyperliquid (`userFunding`): a carry of ~0, as over the first 7 days, with
+  Lighter's hourly rate swinging by up to ±3-9 bps. No trade report shows funding; equity holds it.
 - A forced close mid-cycle pays the premium back; the screener's profit comes from round trips
   over days. Two hours of one-way trades test the mechanics, not the economics.
 
