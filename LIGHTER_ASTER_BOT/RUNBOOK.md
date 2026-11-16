@@ -526,8 +526,10 @@ unknown, and that estimate also moves with the held inventory's marks.
 **XEMM.** Stale books block new exposure. A timeout, a balanced position snapshot or an empty
 open-order list never proves that an order did not execute: an unresolved attempt stays
 reserved, and after 60 s new exposure freezes while late evidence is still accepted. A net
-residual is corrected reduce-only, at most twice per incident. Hyperliquid partial closes
-must meet its minimum, so sizing rounds up to the buffered minimum or the whole held position;
+residual is corrected reduce-only. Two corrections in a row that fill nothing halt the bot
+(`residual_correction_exhausted` in the journal); a filled one restarts the count, as each
+shrinks the held positions. Hyperliquid partial closes must meet its minimum, so sizing
+rounds up to the buffered minimum or the whole held position;
 any excess is corrected on the other leg after a fresh position confirmation. Aster and Lighter
 accept sub-minimum reduce-only closes in the measured cases. The margin guard reserves margin
 for resting makers and hedge obligations above the per-venue buffers ($26 shipped); reductions

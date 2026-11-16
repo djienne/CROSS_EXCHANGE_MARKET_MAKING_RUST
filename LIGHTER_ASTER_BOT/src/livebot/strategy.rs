@@ -764,7 +764,7 @@ pub struct Strategy {
     /// wired (tests without a stream).
     aster_stream: Option<Arc<super::userstream::StreamLiveness>>,
     /// Cumulative-loss circuit breaker. Cloned XEMM engine shutdown token, cancelled when the
-    /// breaker trips; set via [`Strategy::arm_circuit_breaker`].
+    /// breaker trips or a residual correction is exhausted; set via [`Strategy::arm_circuit_breaker`].
     shutdown: tokio_util::sync::CancellationToken,
     /// Where to write the persistent trip latch on a trip (set with the shutdown token).
     trip_file_path: Option<std::path::PathBuf>,
@@ -2811,6 +2811,11 @@ impl Strategy {
             let completed: Vec<String> = self.hedges.iter().filter(|(_, h)| h.market == m && h.terminal)
                 .map(|(id, _)| id.clone()).collect();
             let corrected = completed.iter().any(|id| self.hedges[id].purpose == IntentPurpose::ReduceDelta);
+            // The incident limit counts corrections that filled nothing. A filled one is reduce-only,
+            // so it strictly shrinks |aster| + |hedge| by a lot or more: resetting on it still ends.
+            if completed.iter().any(|id| self.hedges[id].purpose == IntentPurpose::ReduceDelta && self.hedges[id].filled_qty > Decimal::ZERO) {
+                self.correction_attempts.remove(&m);
+            }
             for id in completed {
                 if let Some(mut h) = self.hedges.remove(&id) {
                     h.mark_reconciled();
@@ -2867,8 +2872,17 @@ impl Strategy {
     }
 
     fn dispatch_correction(&mut self, market: &MarketId, net: Decimal, aster: Decimal, lighter: Decimal, now_ns: i64) {
-        if self.correction_attempts.get(market).copied().unwrap_or(0) >= 2 { return; }
         if self.hedges.values().any(|h| &h.market == market && !h.state.is_resolved()) { return; }
+        if self.correction_attempts.get(market).copied().unwrap_or(0) >= 2 {
+            // Two corrections in a row filled nothing: halt for review, as the taker does, rather
+            // than hold the gate closed on the residual forever.
+            if !self.shutdown.is_cancelled() {
+                error!("residual correction exhausted on {market}: net {net} after 2 unfilled attempts; halting");
+                self.journal.reason(now_ns, "residual_correction_exhausted", Some(market.0.clone()), "2 corrections filled nothing");
+                self.shutdown.cancel();
+            }
+            return;
+        }
         let Some(ctx) = self.ctx.get(market) else { return };
         let aster_step = ctx.spec.step;
         let lighter_step = ctx.spec.hl_qty_step;
@@ -3996,6 +4010,28 @@ lighter_symbol = "BTC"
         let HedgeCommand::Hedge { intent,.. }=hrx.try_recv().unwrap() else {panic!("reduce-only hedge expected")};
         assert_eq!(intent.qty,dec!(0.03));
         assert!(erx.try_recv().is_err());
+    }
+
+    #[test]
+    fn hyperliquid_overshoot_after_an_unfilled_correction_is_corrected_on_aster() {
+        // HYPE-HL 2026-11-14: correction 1 filled nothing, correction 2 rounded up to the minimum
+        // and flipped the net; the overshoot must still reach Aster, not die at the attempt limit.
+        let account=AccountState::default(); let (etx,mut erx)=tokio::sync::mpsc::channel(64); let (htx,mut hrx)=tokio::sync::mpsc::channel(16);
+        let mut strat=live_strat(etx,htx,account.clone()); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
+        let ctx=strat.ctx.get_mut(&m).unwrap();
+        ctx.spec=Arc::new(MarketSpec { hedge:HedgeVenue::Hyperliquid, hl_min_notional:dec!(10.50), ..(*ctx.spec).clone() });
+        account.publish(funded_snapshot(now,dec!(-1),dec!(1.05))); strat.adopt_reported_positions(now+1); strat.recover_orphans(now+2);
+        account.publish(funded_snapshot(now+3,dec!(-1),dec!(1.05))); strat.recover_orphans(now+4);
+        let HedgeCommand::Hedge { intent:first,.. }=hrx.try_recv().unwrap() else {panic!("correction 1 expected")};
+        strat.handle_definitive_reject(first.cloid,"IOC matched nothing".into(),false,now+5);
+        account.publish(funded_snapshot(now+6,dec!(-1),dec!(1.05))); strat.recover_orphans(now+7);
+        let HedgeCommand::Hedge { intent:second,.. }=hrx.try_recv().unwrap() else {panic!("correction 2 expected")};
+        assert!(second.qty>dec!(0.05),"rounded up to the minimum: {}",second.qty);
+        strat.apply_execution_progress(second.cloid,second.qty,Some(second.qty*dec!(100)),Some(dec!(0)),true,None,Some(1700000000000),now+8);
+        account.publish(funded_snapshot(now+9,dec!(-1),dec!(1.05)-second.qty)); strat.recover_orphans(now+10);
+        let excess=second.qty-dec!(0.05);
+        assert!(std::iter::from_fn(||erx.try_recv().ok()).any(|cmd| matches!(cmd,ExecCommand::FlattenAster { intent,.. } if intent.qty==excess && intent.hedge_side==Side::Buy && intent.purpose==IntentPurpose::ReduceDelta)),"Aster reduce-only buy of {excess} expected");
+        assert!(hrx.try_recv().is_err() && !strat.shutdown.is_cancelled());
     }
 
     #[test]
@@ -5192,10 +5228,11 @@ lighter_symbol = "BTC"
         assert!(!strat.margin_allows(&m,Side::Buy,dec!(0.13),dec!(100),now), "existing maker can still require its own hedge");
     }
 
-    #[test]
-    fn correction_dispatch_has_two_attempt_incident_limit() {
+    #[tokio::test]
+    async fn correction_dispatch_has_two_attempt_incident_limit() {
         let account=AccountState::default(); let (etx,mut erx)=tokio::sync::mpsc::channel(128); let (htx,_hrx)=tokio::sync::mpsc::channel(16);
         let mut strat=live_strat(etx,htx,account); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
+        let (journal,rx)=Journal::channel(); strat.journal=journal.clone();
         for attempt in 0..2 {
             strat.dispatch_correction(&m,dec!(0.05),dec!(0.05),dec!(0),now+attempt);
             let command=erx.try_recv().unwrap();
@@ -5204,8 +5241,14 @@ lighter_symbol = "BTC"
             // Completed rejection is reconciled before a fresh attempt; do not reset incident count.
             strat.hedges.remove(&intent.cloid.to_hex());
         }
+        assert!(!strat.shutdown.is_cancelled());
         strat.dispatch_correction(&m,dec!(0.05),dec!(0.05),dec!(0),now+3);
         assert!(erx.try_recv().is_err()); assert_eq!(strat.correction_attempts[&m],2);
+        // Exhausted: one halt with one journal entry, not a silent freeze.
+        assert!(strat.shutdown.is_cancelled()); strat.dispatch_correction(&m,dec!(0.05),dec!(0.05),dec!(0),now+4);
+        drop(strat); drop(journal); let mut bytes=Vec::new(); super::super::journal::run_journal_writer(rx,&mut bytes).await.unwrap();
+        let rows:Vec<serde_json::Value>=String::from_utf8(bytes).unwrap().lines().map(|l|serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows.iter().filter(|r|r["kind"]=="residual_correction_exhausted").count(),1);
     }
 
     #[tokio::test]
