@@ -535,6 +535,16 @@ accept sub-minimum reduce-only closes in the measured cases. The margin guard re
 for resting makers and hedge obligations above the per-venue buffers ($26 shipped); reductions
 stay possible.
 
+On a Hyperliquid-hedged market a resting Aster quote also needs a hedge book no older than
+`max_hedge_quote_staleness_ms` (2 s shipped; unset, `max_book_staleness_ms`): the gate closes,
+the quote never prices from older depth, and a queued quote lapses when its book reaches it.
+HL's feed stalls on HL's side, about 9 times a day and mostly in fast markets; on 2026-11-14 a
+HYPE-HL bid priced off a 2.4-2.8 s book filled and its hedge missed. Hedges still use any book
+within `max_book_staleness_ms`, so nothing that hedged before is refused, but one priced from a
+book older than the quote limit gets `emergency_slippage_bps` (90) instead of
+`normal_slippage_bps` (60): fresh-book slippage already reaches about 55 bps. The Aster side and
+Lighter-hedged markets keep `max_book_staleness_ms`.
+
 ## Deploy
 
 A Docker VPS does not compile (unlike the Tokyo VPS, which builds natively and runs `xemm-live`:

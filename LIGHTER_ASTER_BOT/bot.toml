@@ -183,6 +183,11 @@ max_position_mismatch_usd     = "3"
 max_account_snapshot_age_ms   = 12000        # reads every 6 s, every 2 s while a fill/hedge settles
 max_user_stream_staleness_ms  = 15000        # slow dev network
 max_book_staleness_ms         = 10000
+# Hyperliquid-hedged markets: no Aster quote rests on an HL book older than this. HL's feed stalls
+# on HL's side (~9/day, book >2 s old 0.06-0.43 % of the time, mostly in fast markets); on
+# 2026-11-14 a HYPE-HL bid priced off a 2.4-2.8 s book filled and its hedge missed. Hedges still
+# use any book within max_book_staleness_ms, at emergency_slippage_bps when older than this.
+max_hedge_quote_staleness_ms  = 2000
 cancel_all_on_gate_close      = true
 cancel_all_on_user_stream_stale = true
 

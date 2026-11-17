@@ -1640,6 +1640,7 @@ impl Strategy {
     /// Uses the monotonic `now_ns` (same clock `publish` stamps), matching the watchdog scan.
     fn market_feeds_fresh(&self, market: &MarketId, now_ns: i64) -> bool {
         let max_stale = self.cfg.live.max_book_staleness_ms;
+        let hedge_max_stale = self.hedge_quote_max_stale(market);
         let aster_fresh = self
             .cell(market, VenueTag::Aster)
             // Aster depth is still the queue/depth source, but a fresh bookTicker/BBO is
@@ -1649,8 +1650,19 @@ impl Strategy {
             .is_some_and(|c| c.quote_age_ms(now_ns) <= max_stale && !c.is_divergent() && !c.stream_down());
         let hl_fresh = self
             .cell(market, VenueTag::Hedge)
-            .is_some_and(|c| c.quote_age_ms(now_ns) <= max_stale && !c.is_divergent() && !c.stream_down());
+            .is_some_and(|c| c.quote_age_ms(now_ns) <= hedge_max_stale && !c.is_divergent() && !c.stream_down());
         aster_fresh && hl_fresh
+    }
+
+    /// Max hedge book age (ms) a resting quote may rely on: `max_hedge_quote_staleness_ms` on a
+    /// Hyperliquid-hedged market, else `max_book_staleness_ms`. Hedge selection keeps the latter.
+    fn hedge_quote_max_stale(&self, market: &MarketId) -> i64 {
+        let live = &self.cfg.live;
+        match self.ctx.get(market) {
+            Some(ctx) if ctx.spec.hedge == crate::config::HedgeVenue::Hyperliquid =>
+                live.max_hedge_quote_staleness_ms.unwrap_or(live.max_book_staleness_ms),
+            _ => live.max_book_staleness_ms,
+        }
     }
 
     fn position_context(&self, market: &MarketId, now_ns: i64) -> PositionContext {
@@ -2009,6 +2021,7 @@ impl Strategy {
         }
 
         let max_stale = self.cfg.live.max_book_staleness_ms;
+        let hedge_max_stale = self.hedge_quote_max_stale(market);
 
         // Read freshness before the ArcSwap pointers so a concurrent publish cannot
         // pair an older book Arc with a newer stamp. At worst we skip one fresh update
@@ -2036,11 +2049,11 @@ impl Strategy {
 
         let hl_l2_book = hl_l2
             .as_deref()
-            .filter(|b| hl_l2_age_ms <= max_stale && executable_quote_book(b));
+            .filter(|b| hl_l2_age_ms <= hedge_max_stale && executable_quote_book(b));
 
         let hl_bbo_book = hl_bbo
             .as_deref()
-            .filter(|b| hl_bbo_age_ms <= max_stale && executable_quote_book(b));
+            .filter(|b| hl_bbo_age_ms <= hedge_max_stale && executable_quote_book(b));
         let replace_unprof = self.cfg.live.quote.replace_immediately_if_unprofitable;
         // Evaluate the maker gate BEFORE building the position context. The gate's account-freshness
         // load must happen first so that, if the gate is open (snapshot fresh), the subsequent
@@ -2094,10 +2107,11 @@ impl Strategy {
         let (a_version, h_version) = versions.expect("production quotes carry book versions");
         let ctx = &self.ctx[market];
         let max_ms = self.cfg.live.max_book_staleness_ms;
+        let hedge_ms = self.hedge_quote_max_stale(market);
         let mut remaining_ms = max_ms;
-        for age in [ctx.aster_cell.book_age_ms(now_ns), ctx.aster_cell.bbo_age_ms(now_ns),
-            ctx.hedge_cell.book_age_ms(now_ns), ctx.hedge_cell.bbo_age_ms(now_ns)] {
-            if age <= max_ms { remaining_ms = remaining_ms.min(max_ms.saturating_sub(age)); }
+        for (age, limit) in [(ctx.aster_cell.book_age_ms(now_ns), max_ms), (ctx.aster_cell.bbo_age_ms(now_ns), max_ms),
+            (ctx.hedge_cell.book_age_ms(now_ns), hedge_ms), (ctx.hedge_cell.bbo_age_ms(now_ns), hedge_ms)] {
+            if age <= limit { remaining_ms = remaining_ms.min(limit.saturating_sub(age)); }
         }
         remaining_ms = remaining_ms.min(self.cfg.live.max_account_snapshot_age_ms.saturating_sub(self.account.age_ms(now_ns)));
         MakerPermit::new([(ctx.aster_cell.clone(), a_version), (ctx.hedge_cell.clone(), h_version)],
@@ -2398,8 +2412,12 @@ impl Strategy {
             let mut intent = HedgeIntent::with_qty(cloid, fill.market.clone(), hedge.hedge_side, qty, hedge.avg_aster_px, now_ns);
             intent.logical_id = logical_id;
             intent.arm_admission(self.cfg.live.max_unhedged_age_ms);
-            let slip = self.cfg.live.lighter.normal_slippage_bps;
             let source = self.fresh_hl_hedge_book_hot_first(&fill.market, now_ns, hedge.hedge_side, qty);
+            // Fresh-book slippage already nears the normal cap; a book past the quote limit gets the
+            // emergency one rather than a refusal (selection still allows max_book_staleness_ms).
+            let slip = if source.as_ref().is_some_and(|b| b.age_ms > self.hedge_quote_max_stale(&fill.market)) {
+                self.cfg.live.lighter.emergency_slippage_bps
+            } else { self.cfg.live.lighter.normal_slippage_bps };
             intent.book_source = source.as_ref().map(|b| b.path.as_str(b.source));
             intent.book_age_ms = source.as_ref().map(|b| b.age_ms);
             let price = source.and_then(|b| crossing_hedge_px(&b.book, hedge.hedge_side, slip));
@@ -2619,13 +2637,16 @@ impl Strategy {
         let old = h.clone();
         if retryable && old.purpose == IntentPurpose::Hedge && old.attempts < 2 {
             let slip = self.cfg.live.lighter.emergency_slippage_bps;
-            let px = self.fresh_hl_hedge_book_hot_first(&old.market, now_ns, old.hedge_side, old.remaining_qty())
-                .and_then(|b| crossing_hedge_px(&b.book, old.hedge_side, slip));
+            let source = self.fresh_hl_hedge_book_hot_first(&old.market, now_ns, old.hedge_side, old.remaining_qty());
+            let book = source.as_ref().map(|b| (b.path.as_str(b.source), b.age_ms));
+            let px = source.and_then(|b| crossing_hedge_px(&b.book, old.hedge_side, slip));
             if let Some(aggressive_px) = px {
                 let next = self.orders.next_attempt_id(&old.market);
                 let mut intent = HedgeIntent::with_qty(next, old.market.clone(), old.hedge_side, old.remaining_qty(), old.aster_fill_px, now_ns);
                 intent.logical_id = old.logical_id;
                 intent.attempts = old.attempts;
+                intent.book_source = book.map(|b| b.0);
+                intent.book_age_ms = book.map(|b| b.1);
                 intent.arm_admission(self.cfg.live.max_unhedged_age_ms);
                 intent.mark_submitted(now_ns);
                 self.hedges.insert(next.to_hex(), intent.clone());
@@ -4034,6 +4055,98 @@ lighter_symbol = "BTC"
         assert!(hrx.try_recv().is_err() && !strat.shutdown.is_cancelled());
     }
 
+    /// live_strat on `hedge`, with bot.toml's 2 s hedge quote limit.
+    fn hedge_quote_strat(etx: tokio::sync::mpsc::Sender<ExecCommand>, htx: tokio::sync::mpsc::Sender<HedgeCommand>,
+        account: AccountState, hedge: HedgeVenue) -> Strategy {
+        let mut strat=live_strat(etx,htx,account); let ctx=strat.ctx.get_mut(&"BTC".into()).unwrap();
+        ctx.spec=Arc::new(MarketSpec { hedge, ..(*ctx.spec).clone() });
+        strat.cfg.live.max_hedge_quote_staleness_ms=Some(2_000);
+        strat
+    }
+
+    fn buy_fill(strat: &mut Strategy) -> AsterFill {
+        AsterFill { market:"BTC".into(), aster_side:Side::Buy, order_id:"oid".into(), trade_id:"trade".into(),
+            client_id:strat.orders.next_client_id(&"BTC".into(),Side::Buy).unwrap(), last_fill_qty:dec!(0.2), last_fill_px:dec!(100),
+            cum_filled_qty:dec!(0.2), event_time_ms:1_700_000_000_000, reduce_only:false, commission:None, commission_asset:None }
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_quote_needs_a_hedge_book_within_the_quote_limit() {
+        // HYPE-HL 2026-11-14: an Aster bid priced off a 2.4-2.8 s Hyperliquid book filled 340 ms later.
+        // live_strat's books are `age_ms` old at the reprice; full_cfg's book limit is 5 s.
+        for (hedge,age_ms,quotes) in [(HedgeVenue::Hyperliquid,1_500,true),(HedgeVenue::Hyperliquid,2_500,false),(HedgeVenue::Lighter,2_500,true)] {
+            let account=AccountState::default(); let (etx,mut erx)=tokio::sync::mpsc::channel(128); let (htx,_hrx)=tokio::sync::mpsc::channel(16);
+            let mut strat=hedge_quote_strat(etx,htx,account.clone(),hedge); let m:MarketId="BTC".into();
+            let now=crate::hotpath::clock::mono_now_ns()+age_ms*1_000_000;
+            account.publish(funded_snapshot(now,Decimal::ZERO,Decimal::ZERO)); strat.mark_clean_start();
+            assert_eq!(strat.maker_gate_reason(&m,now)==Some("FEED_GATE_CLOSED"),!quotes,"{hedge:?} at {age_ms} ms");
+            strat.reprice_market(&m,ts()+chrono::Duration::milliseconds(age_ms),now,true).await;
+            let cmds:Vec<ExecCommand>=std::iter::from_fn(||erx.try_recv().ok()).collect();
+            let deadlines:Vec<i64>=cmds.iter().filter_map(|c| match c { ExecCommand::Place { permit,.. }=>Some(permit.admission.deadline_ns-now), _=>None }).collect();
+            assert_eq!(!deadlines.is_empty(),quotes,"{hedge:?} at {age_ms} ms: {cmds:?}");
+            // A queued quote lapses once its hedge book passes the limit it was admitted under.
+            let limit_ms=if hedge==HedgeVenue::Hyperliquid { 2_000 } else { 5_000 };
+            assert!(deadlines.iter().all(|d| *d<=(limit_ms-age_ms)*1_000_000),"{hedge:?} at {age_ms} ms: {deadlines:?}");
+            // The closed gate sweeps anything resting.
+            assert_eq!(cmds.iter().any(|c| matches!(c,ExecCommand::CancelAllBot)),!quotes,"{hedge:?} at {age_ms} ms");
+        }
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_quote_never_prices_from_hedge_depth_past_the_quote_limit() {
+        // A fresh but thin Hyperliquid top keeps the gate open; the 2.5 s-old depth behind it must
+        // not price the quote instead.
+        let account=AccountState::default(); let (etx,mut erx)=tokio::sync::mpsc::channel(128); let (htx,_hrx)=tokio::sync::mpsc::channel(16);
+        let mut strat=hedge_quote_strat(etx,htx,account.clone(),HedgeVenue::Hyperliquid); let m:MarketId="BTC".into();
+        let recv=ts()+chrono::Duration::seconds(10);
+        strat.registry.cell(&m,VenueTag::Aster).unwrap().publish(aster_bbo_at(dec!(99.50),dec!(100.50),recv));
+        strat.registry.cell(&m,VenueTag::Hedge).unwrap().publish(OrderBook::from_levels(vec![(dec!(99.95),dec!(100))],
+            vec![(dec!(100.05),dec!(100))],recv-chrono::Duration::milliseconds(2_500),recv));
+        strat.registry.cell(&m,VenueTag::Hedge).unwrap().publish_bbo(hl_bbo_at(dec!(0.01),dec!(0.01),recv));
+        let now=crate::hotpath::clock::mono_now_ns();
+        account.publish(funded_snapshot(now,Decimal::ZERO,Decimal::ZERO)); strat.mark_clean_start();
+        strat.reprice_market(&m,recv,now,true).await;
+        assert_eq!(strat.maker_gate_reason(&m,now),None);
+        let cmds:Vec<ExecCommand>=std::iter::from_fn(||erx.try_recv().ok()).collect();
+        assert!(!cmds.iter().any(|c| matches!(c,ExecCommand::Place { .. })),"{cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_hedge_on_a_book_past_the_quote_limit_gets_emergency_slippage() {
+        // A hedge still goes out on any book within max_book_staleness_ms; one older than the quote
+        // limit only widens its IOC cap from 60 to 90 bps (fresh-book slippage reaches ~55).
+        for (hedge,age_ms,px) in [(HedgeVenue::Hyperliquid,300,dec!(99.3503)),(HedgeVenue::Hyperliquid,3_000,dec!(99.05045)),
+            (HedgeVenue::Lighter,3_000,dec!(99.3503))] {
+            let account=AccountState::default(); let (etx,_erx)=tokio::sync::mpsc::channel(64); let (htx,mut hrx)=tokio::sync::mpsc::channel(16);
+            let mut strat=hedge_quote_strat(etx,htx,account,hedge);
+            strat.cfg.live.lighter.normal_slippage_bps=dec!(60); strat.cfg.live.lighter.emergency_slippage_bps=dec!(90);
+            let fill=buy_fill(&mut strat);
+            strat.handle_maker_fill(fill,crate::hotpath::clock::mono_now_ns()+age_ms*1_000_000).await;
+            let HedgeCommand::Hedge { intent,aggressive_px }=hrx.try_recv().expect("hedge sent") else {panic!("hedge expected")};
+            // Sell into the hedge bid 99.95 x (1 - 60 or 90 bps).
+            assert_eq!((intent.hedge_side,aggressive_px),(Side::Sell,px),"{hedge:?} at {age_ms} ms");
+            assert!(intent.book_age_ms.is_some_and(|a| a>=age_ms),"{:?}",intent.book_age_ms);
+        }
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_hedge_without_a_usable_book_still_takes_the_correction_path() {
+        // Past max_book_staleness_ms, or on a stream known down, the hedge is rejected and a
+        // residual correction follows, as before the quote limit.
+        for stream_down in [false,true] {
+            let account=AccountState::default(); let (etx,_erx)=tokio::sync::mpsc::channel(64); let (htx,mut hrx)=tokio::sync::mpsc::channel(16);
+            let mut strat=hedge_quote_strat(etx,htx,account,HedgeVenue::Hyperliquid); let m:MarketId="BTC".into();
+            strat.cfg.live.max_book_staleness_ms=10_000;
+            if stream_down { strat.registry.cell(&m,VenueTag::Hedge).unwrap().mark_stream_down(); }
+            let age_ms=if stream_down { 0 } else { 10_500 };
+            let fill=buy_fill(&mut strat);
+            strat.handle_maker_fill(fill,crate::hotpath::clock::mono_now_ns()+age_ms*1_000_000).await;
+            assert!(hrx.try_recv().is_err(),"stream_down={stream_down}: no hedge without a usable book");
+            assert!(strat.hedges.values().any(|h| h.state==HedgeState::Rejected));
+            assert!(strat.correction_needed.contains(&m) && strat.frozen);
+        }
+    }
+
     #[test]
     fn terminal_partial_keeps_one_executable_lot_as_a_residual() {
         let account=AccountState::default(); let (etx,_erx)=tokio::sync::mpsc::channel(16); let (htx,_hrx)=tokio::sync::mpsc::channel(16);
@@ -5269,6 +5382,7 @@ lighter_symbol = "BTC"
         strat.handle_exec_event(ExecEvent::AttemptNotSent { cloid:intent.cloid,reason:"not sent".into() },now+3);
         let HedgeCommand::Hedge { intent:retry,.. }=hrx.try_recv().unwrap() else {panic!("retry expected")};
         assert_ne!(retry.cloid,intent.cloid); assert_eq!(retry.logical_id,logical);
+        assert!(retry.book_source.is_some() && retry.book_age_ms.is_some(),"the retry journals its book too");
         drop(strat); drop(journal); let mut bytes=Vec::new(); super::super::journal::run_journal_writer(rx,&mut bytes).await.unwrap();
         let rows:Vec<serde_json::Value>=String::from_utf8(bytes).unwrap().lines().map(|l|serde_json::from_str(l).unwrap()).collect();
         let maker:Vec<_>=rows.iter().filter(|r|r["kind"]=="maker_fill").collect(); assert_eq!(maker.len(),3);

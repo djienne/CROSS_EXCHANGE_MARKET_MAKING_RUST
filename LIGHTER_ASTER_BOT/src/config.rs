@@ -222,6 +222,12 @@ pub struct LiveCfg {
     /// hedge-book selection, the feed watchdog and reconciler marks. Default 10000.
     #[serde(default = "default_max_book_staleness_ms")]
     pub max_book_staleness_ms: i64,
+    /// Max hedge book age (ms) a resting quote may rely on, on Hyperliquid-hedged markets only:
+    /// the gate, the quote's hedge book and its send deadline. Hedge selection keeps
+    /// `max_book_staleness_ms`; a hedge on an older book gets `emergency_slippage_bps`.
+    /// Unset: `max_book_staleness_ms`.
+    #[serde(default)]
+    pub max_hedge_quote_staleness_ms: Option<i64>,
     /// Cancel all Aster maker orders whenever the trading gate closes. Default true.
     #[serde(default = "default_true")]
     pub cancel_all_on_gate_close: bool,
@@ -483,6 +489,7 @@ impl Default for LiveCfg {
             max_account_snapshot_age_ms: default_max_account_snapshot_age_ms(),
             max_user_stream_staleness_ms: default_max_user_stream_staleness_ms(),
             max_book_staleness_ms: default_max_book_staleness_ms(),
+            max_hedge_quote_staleness_ms: None,
             cancel_all_on_gate_close: true,
             cancel_all_on_user_stream_stale: true,
             quote: LiveQuoteCfg::default(),
@@ -808,6 +815,10 @@ impl Config {
         if self.live.max_book_staleness_ms < 0 {
             bail!("live.max_book_staleness_ms must be non-negative");
         }
+        // Above the hedge-selection limit, a quote could rest on a book no hedge may use.
+        if self.live.max_hedge_quote_staleness_ms.is_some_and(|ms| !(0..=self.live.max_book_staleness_ms).contains(&ms)) {
+            bail!("live.max_hedge_quote_staleness_ms must be between 0 and live.max_book_staleness_ms");
+        }
         if self.capital.aster_capital_usd <= Decimal::ZERO
             || self.capital.lighter_capital_usd <= Decimal::ZERO
             || self.capital.leverage <= Decimal::ZERO
@@ -973,6 +984,10 @@ lighter_symbol = "DOGE"
         assert_eq!(cfg.live.partials.policy, PartialPolicy::AccumulateSubMin);
         assert_eq!(cfg.live.partials.lighter_min_notional, dec!(12));
         assert_eq!(cfg.live.lighter.emergency_slippage_bps, dec!(25));
+        // The hedge quote limit may tighten the book limit, never loosen it.
+        let key = |ms: i64| with_live.replace("max_book_staleness_ms = 750", &format!("max_book_staleness_ms = 750\nmax_hedge_quote_staleness_ms = {ms}"));
+        assert!(toml::from_str::<Config>(&key(750)).unwrap().validate().is_ok());
+        assert!(toml::from_str::<Config>(&key(751)).unwrap().validate().is_err());
     }
 
     #[test]
@@ -1057,6 +1072,7 @@ lighter_symbol = "DOGE"
         std::fs::write(&path, include_str!("../bot.toml")).unwrap();
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.live.margin_guard.lighter_safety_buffer_usd, dec!(26)); // bot.toml value, default is 25
+        assert_eq!(cfg.live.max_hedge_quote_staleness_ms, Some(2_000)); // bot.toml value, unset by default
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
